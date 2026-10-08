@@ -133,6 +133,19 @@ namespace GeZi
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
 
+        /// <summary>
+        /// 系统当前的双击间隔（毫秒，默认 500）。
+        ///
+        /// 用途：文件列表「单击文件夹即进入」之后，要靠它吞掉"双击的第二下"
+        /// （见 <see cref="MainWindow.EnterFolder"/>）。
+        /// 不写死毫秒数 —— 用户把双击速度调慢（辅助功能里能调到 900ms）时判据要跟着变。
+        ///
+        /// ⚠️ 不要改用 WPF 的 `SystemParameters`：它只有 `DoubleClickWidth/Height`
+        ///    （双击的**矩形容差**），**没有**时间间隔这一项（实测编译不过）。
+        /// </summary>
+        [DllImport("user32.dll")]
+        internal static extern uint GetDoubleClickTime();
+
         // ---------------- 保活：阻止系统空闲睡眠 ----------------
 
         /// <summary>

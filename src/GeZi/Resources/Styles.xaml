@@ -338,6 +338,59 @@
     </Style>
 
     <!-- ============================================================
+         面包屑（目录路径条）里**可点击的一节**。
+         静止时完全透明 —— 平时看起来就是一段普通文字，不抢视线；
+         悬停才浮出一个淡色圆角块、文字转主色。
+         与侧栏导航项（NavListItem）的悬停语言一致：同样是
+         SurfaceAltBrush 圆角块 + 主色文字，只是更紧凑（12px / 6,2 内边距）。
+         ============================================================ -->
+    <Style x:Key="BreadcrumbButton" TargetType="Button">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Padding" Value="6,2"/>
+        <Setter Property="Margin" Value="0"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <!-- 点完会拿到键盘焦点，不清掉的话会留下一个虚线焦点框（NavListItem 同理） -->
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd" CornerRadius="6"
+                            Background="{TemplateBinding Background}"
+                            Padding="{TemplateBinding Padding}"
+                            SnapsToDevicePixels="True">
+                        <ContentPresenter VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                            <Setter Property="Foreground" Value="{DynamicResource PrimaryBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource PrimaryLightBrush}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 面包屑的「当前层」：不可点，主色 + 半粗 —— 与侧栏导航的选中项是同一套语言，
+         一眼能看出"你在这里"。内边距与 BreadcrumbButton 对齐，免得整条路径高低不齐。 -->
+    <Style x:Key="BreadcrumbCurrent" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="Foreground" Value="{DynamicResource PrimaryBrush}"/>
+        <Setter Property="Padding" Value="6,2"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
+    <!-- ============================================================
          标题栏按钮（最小化/最大化/关闭，36px 高）
          ============================================================ -->
     <!-- 卡片上的小图标按钮（24×24，只有图标）。

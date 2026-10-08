@@ -561,16 +561,35 @@
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
-                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                                    <Path Data="{StaticResource IconFolder}" Stretch="Uniform" Width="15"
+                                <!-- 目录路径条（面包屑）。
+                                     外层换成 Grid 而不是 StackPanel：水平 StackPanel 会用
+                                     **无限宽**去量孩子，长路径就会溢出到右边的搜索框上，
+                                     而且溢出的部分照样能点到 —— 会挡住搜索框。
+                                     Grid 的 * 列能把宽度约束住，再由 ScrollViewer 在超出时
+                                     横向滚动（滚动条隐藏），UpdatePathText 每次都会滚到右端，
+                                     保证"当前在哪一层"始终看得见。 -->
+                                <Grid VerticalAlignment="Center">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Path Grid.Column="0" Data="{StaticResource IconFolder}"
+                                          Stretch="Uniform" Width="15"
                                           Height="15" Stroke="{DynamicResource TextTertiaryBrush}"
                                           StrokeThickness="1.8" VerticalAlignment="Center"
                                           StrokeStartLineCap="Round" StrokeEndLineCap="Round"
                                           StrokeLineJoin="Round"/>
-                                    <TextBlock x:Name="DrivePathText" Grid.Column="1" Text="根目录"
-                                               VerticalAlignment="Center" Margin="8,0,0,0"
-                                               Style="{StaticResource SecondaryText}"/>
-                                </StackPanel>
+                                    <!-- 每一节由 UpdatePathText() 动态生成 ——
+                                         祖先层是 BreadcrumbButton（悬停高亮、点击直达），
+                                         当前层是普通文字（不可点）。 -->
+                                    <ScrollViewer x:Name="DrivePathScroll" Grid.Column="1"
+                                                  Margin="8,0,0,0" Focusable="False"
+                                                  HorizontalScrollBarVisibility="Hidden"
+                                                  VerticalScrollBarVisibility="Disabled">
+                                        <StackPanel x:Name="DrivePathBar" Orientation="Horizontal"
+                                                    VerticalAlignment="Center"/>
+                                    </ScrollViewer>
+                                </Grid>
                                 <StackPanel Grid.Column="1" Orientation="Horizontal">
                                     <Border CornerRadius="8" Background="{DynamicResource SurfaceBrush}"
                                             BorderBrush="{DynamicResource BorderBrushStrong}"
@@ -627,13 +646,14 @@
                                     <!-- ⚠️ SelectionMode=Extended 本来 Shift+点击 = **连选**（整段区间）。
                                          用户要求「可以使用 shift 多选，但不是连选」——
                                          即 Shift+点击只切换**这一个**项的选中态。
-                                         做法见 OnListPreviewMouseDown（拦下 Shift 点击自己处理）。 -->
+                                         做法见 OnListPreviewMouseDown（拦下 Shift 点击自己处理）。
+                                         【2026-10-08】单击文件夹 = **直接进入**，也在这个处理器里裁决，
+                                         所以不再挂 MouseDoubleClick（双击会多进一层）。 -->
                                     <ListBox x:Name="FileList" SelectionMode="Extended"
                                              Style="{StaticResource PlainListBox}"
                                              ItemContainerStyle="{StaticResource FileListItem}"
                                              PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
-                                             MouseRightButtonUp="OnFileListRightClick"
-                                             MouseDoubleClick="OnFileListDoubleClick">
+                                             MouseRightButtonUp="OnFileListRightClick">
                                         <ListBox.ContextMenu>
                                             <ContextMenu>
                                                 <MenuItem Header="下载选中" Click="OnDownloadSelected"/>

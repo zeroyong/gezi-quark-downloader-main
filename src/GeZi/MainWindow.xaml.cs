@@ -1023,7 +1023,8 @@ namespace GeZi
                 ResetNav();
                 _curFid = info.StartFid;
                 await LoadDirAsync(_curFid);
-                Log("解析成功，双击文件夹进入子目录，或直接下载当前目录文件");
+                Log("解析成功。单击文件夹进入子目录；选中文件后点「下载选中」即可下载"
+                    + "（文件夹要先选中：Shift / Ctrl+点击，或右键该行）。");
                 NotifyIfHidden("已解析剪贴板里的分享链接",
                     _files.Count > 0
                         ? "共 " + _files.Count + " 个文件。双击托盘图标打开窗口即可下载。"
@@ -1349,19 +1350,65 @@ namespace GeZi
 
         // ---------------- 目录浏览（分享/网盘统一） ----------------
 
+        /// <summary>上一次「单击进入文件夹」的时刻（<see cref="DiagClock"/> 的单调计时）。</summary>
+        private long _lastEnterFolderTick;
+
         /// <summary>
-        /// 列表里的 **Shift+左键 = 离散多选**（只切换点中的这一项），**不做连选**。
+        /// 双击间隔，换算成 <see cref="DiagClock"/> 的刻度。
+        /// 取**系统设置**（<see cref="NativeMethods.GetDoubleClickTime"/>）而不是自己写死毫秒数
+        /// —— 用户把双击速度调慢时，判据要跟着变。
+        /// </summary>
+        private static readonly long DoubleClickTicks =
+            (long)NativeMethods.GetDoubleClickTime() * DiagClock.Frequency / 1000L;
+
+        /// <summary>
+        /// 进入文件夹（单击文件夹行触发）。
         ///
-        /// 【为什么需要自己写】WPF 的 `SelectionMode="Extended"` 里：
+        /// 【为什么是 async void】它由点击事件直接触发，没有调用方要等结果 ——
+        /// 与 <see cref="OnParseClick"/> 等既有处理器同一形态。目录请求失败已在
+        /// <see cref="LoadDirAsync"/> 内部消化（打日志），不会漏到这里。
+        /// </summary>
+        private async void EnterFolder(ShareFileItem dir)
+        {
+            // ① 目录正在加载时不响应：列表要等网络返回才刷新，这段窗口里**旧行还能点**。
+            //    不挡的话会连着推两次 _fidStack / _pathList（面包屑多一层、"上一级"错位），
+            //    两个 LoadDirAsync 还会并发赛跑，谁后回来谁覆盖。
+            if (_loadingDir) return;
+
+            // ② 吞掉"双击的第二下"。用户习惯性双击时第一下已经把目录换掉了，
+            //    第二下的落点要么还在旧行上、要么落在刷新后的新行上 ——
+            //    后者会莫名其妙再进一层（甚至进到完全无关的目录）。
+            //    判据是系统双击间隔：间隔之内算同一次双击，不算两次点击。
+            long now = DiagClock.GetTimestamp();
+            if (now - _lastEnterFolderTick < DoubleClickTicks) return;
+            _lastEnterFolderTick = now;
+
+            _fidStack.Push(_curFid);
+            _curFid = dir.Fid;
+            _pathList.Add(dir.Name);
+            UpdatePathText();
+            await LoadDirAsync(dir.Fid);
+        }
+
+        /// <summary>
+        /// 文件列表的左键点击策略（在 PreviewMouseLeftButtonDown / 隧道阶段统一裁决）：
+        ///   · **单击文件夹 = 直接进入**（2026-10-08 用户要求「单击就直接打开文件夹」）；
+        ///   · **Shift+点击 = 离散多选**（只切换点中的这一项），**不做连选**；
+        ///   · **Ctrl+点击 = 只选中这一个**，不进目录；
+        ///   · 单击**文件** = WPF 默认行为（选中）。
+        ///
+        /// 【Shift 为什么必须自己写】WPF 的 `SelectionMode="Extended"` 里：
         ///   · Ctrl+点击  = 切换单项（离散多选）
         ///   · **Shift+点击 = 连选**：把"锚点项"到当前项**整段**都选上
         /// 用户要的是「可以使用 shift 多选，但**不是连选**」——
         /// 也就是 Shift 只作用于**点中的那一个**，不拉区间。
-        /// 所以这里在 `PreviewMouseLeftButtonDown`（隧道阶段，早于 ListBoxItem 自己处理）
-        /// 把 Shift 点击**拦下来自己处理**，并 `e.Handled = true` 阻止 WPF 的连选。
-        ///
+        /// 所以在隧道阶段把它拦下来自己处理，并 `e.Handled = true` 阻止 WPF 的连选。
         /// ⚠️ 不拦的话会怎样：选中第 1 个、Shift+点第 5 个 → 1~5 全被选上（连选）。
-        /// ⚠️ Ctrl+点击**不拦**，交给 WPF 原样处理（本来就是切换单项）。
+        ///
+        /// 【单击变成"进入"之后，怎么**选中文件夹**】「下载选中 / 删除网盘文件」都要求先选中，
+        /// 而单纯单击文件夹已经变成"进入"了，所以选中文件夹改走这三条路：
+        /// Shift+点击、Ctrl+点击，或**右键**（右键会把光标下的那一行选中，
+        /// 见 <see cref="OnFileListRightClick"/>），随后菜单里就有「下载选中」。
         /// </summary>
         private void OnListPreviewMouseDown(object sender, MouseButtonEventArgs e)
         {
@@ -1380,7 +1427,8 @@ namespace GeZi
             }
 
             // ② Ctrl+点击 = **按用户要求关掉**（原来它是"切换单项"）。
-            //    现在让它表现得和普通点击完全一样：清空选择、只选这一个。
+            //    现在让它表现为"只选中这一个"，且**不进目录** ——
+            //    这是单击变"进入"之后，选中文件夹的主要入口之一。
             if ((mods & ModifierKeys.Control) != 0)
             {
                 e.Handled = true;
@@ -1390,7 +1438,18 @@ namespace GeZi
                 try { item.Focus(); } catch { }
                 return;
             }
-            // 不按修饰键：完全走 WPF 默认行为
+
+            // ③ 不按修饰键、点是文件夹 = 直接进入。
+            //    `e.Handled = true` 是刻意的：不给 WPF 默认的"选中"处理 ——
+            //    否则这一行会先高亮一下、紧接着被新目录刷掉，白闪一帧。
+            var dir = FileList.ItemContainerGenerator.ItemFromContainer(item) as ShareFileItem;
+            if (dir != null && dir.IsDir)
+            {
+                e.Handled = true;
+                EnterFolder(dir);
+                return;
+            }
+            // ④ 单击文件 / 其它情况：完全走 WPF 默认行为
         }
 
         /// <summary>从鼠标命中的可视元素往上找 ListBoxItem。</summary>
@@ -1596,17 +1655,9 @@ namespace GeZi
             }
         }
 
-        private async void OnFileListDoubleClick(object sender, MouseButtonEventArgs e)
-        {
-            var item = FileList.SelectedItem as ShareFileItem;
-            if (item == null || !item.IsDir)
-                return;
-            _fidStack.Push(_curFid);
-            _curFid = item.Fid;
-            _pathList.Add(item.Name);
-            UpdatePathText();
-            await LoadDirAsync(item.Fid);
-        }
+        // 【2026-10-08 删除】原「双击文件夹进入子目录」的处理器（OnFileListDoubleClick）。
+        // 单击进入之后它就成了重复入口，而且**会有害**：双击的第二下会把目录再进一层
+        // （第一下已经换过目录，第二下落在刷新后的新行上）。现在只剩 EnterFolder 一条路。
 
         /// <summary>
         /// 右键按下时把光标下的行选中（若该行还没被选中），
@@ -1719,9 +1770,161 @@ namespace GeZi
             }
         }
 
+        // ---------------- 目录路径条（面包屑，2026-10-08 改为可点击） ----------------
+        //
+        // 【为什么不直接用 _pathList 画】显示要的是"根 → 当前"这条链上**每一层叫什么、
+        // 对应哪个 fid**，而导航状态是分开存的：名字在 _pathList、祖先的 fid 在
+        // _fidStack（栈顶 = 上一层）。所以先换算成「层 → {名字, fid}」，再画成
+        // 可点的小节 —— 见 BuildCrumbs。
+
+        /// <summary>面包屑的一节。</summary>
+        private sealed class Crumb
+        {
+            /// <summary>显示名（第一段固定是「根目录」）。</summary>
+            public string Name;
+            /// <summary>这一层对应的 fid；点它就是要跳到这个目录。</summary>
+            public string Fid;
+            /// <summary>是不是当前所在层（当前层不做成链接）。</summary>
+            public bool IsCurrent;
+        }
+
+        /// <summary>
+        /// 把当前导航状态换算成面包屑（根 → 当前）。
+        ///
+        /// 【fid 是怎么推出来的】进子目录时 `_fidStack.Push(上一层 fid)` +
+        /// `_pathList.Add(目录名)`，于是：
+        ///   · `_fidStack.ToList()` 是"栈顶在前" = [上一层, 上上层, …, 根]；
+        ///   · **反转它** = [根, …, 上一层]，正好与 `_pathList` **逐项对齐**
+        ///     （两者永远等长：进一层各加一项）。
+        /// 所以第 0 段「根目录」用 chain[0]（没进过子目录时就是 "0"），
+        /// `_pathList[i]` 这一层用 chain[i+1]，最后一段（当前层）用 `_curFid`。
+        ///
+        /// 【分享链接带 StartFid 的情况】解析时 ResetNav 清掉了栈，只有 _curFid 指向
+        /// 子目录 → 面包屑就只剩「根目录」一节，而它的 fid 是进入点；
+        /// 点不了（本来就是当前层），要出去用「上一级」。
+        /// </summary>
+        private List<Crumb> BuildCrumbs()
+        {
+            var chain = _fidStack.ToList();   // 栈顶在前
+            chain.Reverse();                  // → 根在最前
+
+            var list = new List<Crumb>();
+            list.Add(new Crumb
+            {
+                Name = "根目录",
+                Fid = chain.Count > 0 ? chain[0] : "0",
+                IsCurrent = _pathList.Count == 0,
+            });
+            for (int i = 0; i < _pathList.Count; i++)
+            {
+                list.Add(new Crumb
+                {
+                    Name = _pathList[i],
+                    Fid = (i + 1 < chain.Count) ? chain[i + 1] : _curFid,
+                    IsCurrent = i == _pathList.Count - 1,
+                });
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// 重建目录路径条。祖先层画成可点的小按钮（悬停高亮，见 BreadcrumbButton 样式），
+        /// 当前层画成不可点的普通文字（主色 + 半粗）。
+        /// </summary>
         private void UpdatePathText()
         {
-            DrivePathText.Text = "根目录" + (_pathList.Count > 0 ? "/" + string.Join("/", _pathList) : "");
+            try
+            {
+                if (DrivePathBar == null) return;
+                DrivePathBar.Children.Clear();
+
+                var crumbs = BuildCrumbs();
+                var sepStyle = (Style)FindResource("TertiaryText");
+                for (int i = 0; i < crumbs.Count; i++)
+                {
+                    if (i > 0)
+                    {
+                        DrivePathBar.Children.Add(new TextBlock
+                        {
+                            Text = "/",
+                            Style = sepStyle,
+                            VerticalAlignment = VerticalAlignment.Center,
+                        });
+                    }
+                    DrivePathBar.Children.Add(MakeCrumbElement(crumbs[i], i));
+                }
+
+                // 路径比可用宽度长时滚到最右 —— 「当前在哪一层」比左边那几节更该看得见。
+                // ⚠️ 先 UpdateLayout：刚加完孩子时 ScrollViewer 的 Extent 还是旧的，
+                //    直接滚会滚不动（等于什么都没做）。
+                if (DrivePathScroll != null)
+                {
+                    DrivePathScroll.UpdateLayout();
+                    DrivePathScroll.ScrollToRightEnd();
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>画面包屑的一节：祖先 = 可点按钮；当前层 = 普通文字。</summary>
+        private UIElement MakeCrumbElement(Crumb crumb, int level)
+        {
+            if (crumb.IsCurrent)
+            {
+                return new TextBlock
+                {
+                    Text = crumb.Name,
+                    Style = (Style)FindResource("BreadcrumbCurrent"),
+                };
+            }
+
+            var btn = new Button
+            {
+                Content = crumb.Name,
+                Style = (Style)FindResource("BreadcrumbButton"),
+                // 存**层号**而不是 fid：跳转要重建 _fidStack / _pathList，那需要知道
+                // "跳到第几层"，而层号在 OnBreadcrumbClick 里还能重新核对一遍
+                // （重新 BuildCrumbs 比拿着可能过期的 fid 更稳）。
+                Tag = level,
+            };
+            btn.Click += OnBreadcrumbClick;
+            return btn;
+        }
+
+        /// <summary>
+        /// 点面包屑的某一节 = 直接跳到那一层。
+        /// </summary>
+        private async void OnBreadcrumbClick(object sender, RoutedEventArgs e)
+        {
+            var btn = sender as Button;
+            if (btn == null || !(btn.Tag is int))
+                return;
+
+            // 加载中不跳 —— 与 EnterFolder 同一个理由：这段窗口里旧行/旧面包屑还在，
+            // 跳一次会和正在回来的那次结果打架（栈和面包屑会被推错）。
+            if (_loadingDir) return;
+
+            int level = (int)btn.Tag;
+            if (level < 0) return;
+
+            var crumbs = BuildCrumbs();
+            if (level >= crumbs.Count) return;
+            if (crumbs[level].IsCurrent) return;   // 点的就是当前层，不用动
+
+            // 把导航状态**重建**成"停在目标层"：
+            // 祖先链 = crumbs[0..level-1]，逐层 Push 进去（最后压入的正好是最直接的上一层）；
+            // _pathList 则是去掉「根目录」那一段后的 crumbs[1..level]。
+            _fidStack.Clear();
+            for (int i = 0; i < level; i++)
+                _fidStack.Push(crumbs[i].Fid);
+            _pathList.Clear();
+            for (int i = 1; i <= level; i++)
+                _pathList.Add(crumbs[i].Name);
+            _curFid = crumbs[level].Fid;
+
+            UpdatePathText();
+            Log("已跳到目录：" + string.Join(" / ", _pathList));
+            await LoadDirAsync(_curFid);
         }
 
         // ---------------- 下载 ----------------
