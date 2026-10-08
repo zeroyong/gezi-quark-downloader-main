@@ -107,6 +107,32 @@ namespace GeZi
         internal const uint SWP_NOACTIVATE = 0x0010;
         internal const uint SWP_FRAMECHANGED = 0x0020;
 
+        // ---------------- 剪贴板变更通知 ----------------
+
+        /// <summary>剪贴板内容已变化（由系统投递给已注册的窗口）。</summary>
+        internal const int WM_CLIPBOARDUPDATE = 0x031D;
+
+        /// <summary>
+        /// 注册"剪贴板有变化请通知我"。
+        ///
+        /// 【为什么不用轮询、也不用 SetClipboardViewer】
+        ///   · 轮询（每几百毫秒读一次剪贴板）会无谓唤醒 UI 线程，还必然带上一个间隔的延迟；
+        ///   · `SetClipboardViewer` 是 Win2000 时代的老机制，要插进"剪贴板查看器链"并转发
+        ///     `WM_CHANGECBCHAIN` —— 链上任何一个程序崩掉，它后面的全都收不到通知。
+        /// `AddClipboardFormatListener`（Vista+）只登记一条 <see cref="WM_CLIPBOARDUPDATE"/>，
+        /// 由系统直接投递，不参与任何链式转发。
+        ///
+        /// ⚠️ 必须**在有窗口句柄之后**调用，且只在顶层窗口上有效。
+        /// ⚠️ 窗口隐藏到托盘时**不要**摘掉注册 —— 托盘状态下仍要能收到通知，
+        ///    这正是"窗口不可见时静默解析 + 气泡提示"这条需求的前提。
+        /// </summary>
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool AddClipboardFormatListener(IntPtr hwnd);
+
+        /// <summary>注销剪贴板变更通知。进程退出时系统也会自动清理，显式摘掉更稳妥。</summary>
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
+
         // ---------------- 保活：阻止系统空闲睡眠 ----------------
 
         /// <summary>

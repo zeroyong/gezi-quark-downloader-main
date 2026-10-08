@@ -130,6 +130,51 @@ namespace GeZi
         /// <summary>直链短时缓存（TTL 600s），避免重复取链触发夸克限流。见 LinkCache。</summary>
         private readonly LinkCache _linkCache = new LinkCache();
 
+        // ---------------- 剪贴板自动解析（2026-10-08） ----------------
+
+        /// <summary>
+        /// 剪贴板监听注册在哪个窗口句柄上（IntPtr.Zero = 没注册）。
+        ///
+        /// 【为什么记句柄而不是记一个 bool】注册是**绑在原生句柄上**的，
+        /// 而窗口隐藏→恢复之间句柄有可能被重建（见 <see cref="AttachWindowHooks"/>）。
+        /// 只记"已注册/未注册"，句柄一换就会误判成"已注册"而不再重挂。
+        /// </summary>
+        private IntPtr _clipboardHookHwnd;
+
+        /// <summary>
+        /// 「跨进程激活消息钩子 + 剪贴板监听」已经挂在哪个窗口句柄上
+        /// （IntPtr.Zero = 还没挂）。见 <see cref="AttachWindowHooks"/>。
+        /// </summary>
+        private IntPtr _hooksOnHwnd;
+
+        /// <summary>
+        /// 上一次因剪贴板自动解析处理过的分享 ID。
+        ///
+        /// 【为什么需要去重】一次"复制"并不保证只来一条 <c>WM_CLIPBOARDUPDATE</c> ——
+        /// 有些程序（浏览器扩展、剪贴板管理器）会把同一份内容分多次写剪贴板，
+        /// 于是通知会连发好几条。不去重的话每次都要重发换 stoken + 拉目录两个请求，
+        /// 白等一次，还有被夸克风控盯上的风险。
+        /// </summary>
+        private string _clipboardLastPwdId;
+
+        /// <summary>
+        /// 从剪贴板文本里圈出候选 URL 的正则。
+        ///
+        /// 只负责"把看起来像 URL 的片段切出来"，**不判断是不是夸克** ——
+        /// 域名那一步交给 <see cref="IsQuarkHost"/>。排除集与「粘贴进链接框」时用的
+        /// 保持同一份（<see cref="OnLinkBoxPasting"/>），免得两处对"URL 到哪结束"的
+        /// 理解不一致。
+        /// </summary>
+        private static readonly Regex ClipboardUrlRx =
+            new Regex(@"https?://[^\s""'<>）】\]]+", RegexOptions.Compiled);
+
+        /// <summary>
+        /// 剪贴板文本超过这么多字符就**不看**（约 2 万字符）。
+        /// 「随手复制的分享链接」撑死几百字符；一份几十万字的剪贴板内容不可能是它，
+        /// 而在 UI 线程上为它跑一遍正则纯属自找卡顿。
+        /// </summary>
+        private const int MaxClipboardScanChars = 20000;
+
         private bool ShareMode => ShareModeRadio.IsChecked == true;
 
         // ---------------- 单次处理文件数保护 ----------------
@@ -170,6 +215,14 @@ namespace GeZi
             NavList.SelectedIndex = 0;
             Tabs.SelectedIndex = 0;
             Tabs.SelectionChanged += OnTabsSelectionChanged;
+
+            // 窗口句柄一（重）建好，就把「跨进程激活消息钩子 + 剪贴板监听」挂上去。
+            //
+            // ⚠️ 用 SourceInitialized 而不是 Loaded：它正是"HWND 刚刚存在"的时刻
+            //    （项目里 ScanQrWindow 给窗口加圆角也是用这个事件），而且**只要新建了
+            //    句柄就会再触发一次** —— 窗口隐藏到托盘、再恢复时如果句柄被重建，
+            //    这里会跟着重挂，注册不会静默失效。见 AttachWindowHooks。
+            SourceInitialized += (s, e) => AttachWindowHooks();
 
             // 空状态提示：集合有变化就同步一次可见性。
             // 不改动任何业务逻辑，只是"列表为空时显示插画"这一层皮肤。
@@ -309,15 +362,9 @@ namespace GeZi
                 //    而 WPF 窗口句柄到 Loaded 才存在。
                 InitTray();
 
-                // 装上跨进程消息钩子：再点一次 exe 时，由**本进程自己**把窗口拉起来
-                // （广播消息由 App.NotifyExistingInstance 发出）。
-                try
-                {
-                    var src = System.Windows.Interop.HwndSource.FromHwnd(
-                        new System.Windows.Interop.WindowInteropHelper(this).Handle);
-                    src?.AddHook(WndProc);
-                }
-                catch { }
+                // 【2026-10-08】「再点一次 exe 把窗口拉起来」的消息钩子、以及
+                // 「剪贴板自动解析」的监听，都不在这里挂了 —— 它俩都绑在窗口句柄上，
+                // 统一交给 AttachWindowHooks（订阅在构造函数里，走 SourceInitialized）。
             };
 
             if (!string.IsNullOrEmpty(_settings.Cookie))
@@ -361,7 +408,10 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 主窗消息钩子：只处理「另一个实例请我把窗口拉起来」这一条广播消息。
+        /// 主窗消息钩子，处理两条消息：
+        ///   · <see cref="App.WmActivateMain"/>：另一个实例请我把窗口拉起来；
+        ///   · <see cref="NativeMethods.WM_CLIPBOARDUPDATE"/>：剪贴板内容变了
+        ///     （只在设置里开着「剪贴板自动解析」时才注册，见 <see cref="ApplyClipboardListener"/>）。
         ///
         /// 为什么让**收到消息的旧进程**自己激活，而不是让新进程去 SetForegroundWindow：
         /// Windows 的前台锁定不允许后台进程抢焦点，新进程调用往往只让任务栏闪一下。
@@ -373,6 +423,12 @@ namespace GeZi
             {
                 RestoreFromTray();
                 handled = true;
+            }
+            else if (msg == NativeMethods.WM_CLIPBOARDUPDATE)
+            {
+                // ⚠️ 不置 handled：这是系统的广播性质通知，本程序只是订阅者之一，
+                //    没有理由把它吃掉（也避免将来其它组件想接同一条消息时被拦）。
+                OnClipboardChanged();
             }
             return IntPtr.Zero;
         }
@@ -389,6 +445,17 @@ namespace GeZi
             //    鼠标划过去才消失（最经典的托盘 bug）。
             try { _tray?.Dispose(); _tray = null; } catch { }
             try { _mini?.Shutdown(); } catch { }
+            // 摘掉剪贴板监听：进程退出时系统也会回收这条注册，但显式摘掉更干净，
+            // 且与 SourceInitialized 里的注册成对出现（窗口在托盘常驻期间一直持有它）。
+            try
+            {
+                if (_clipboardHookHwnd != IntPtr.Zero)
+                {
+                    NativeMethods.RemoveClipboardFormatListener(_clipboardHookHwnd);
+                    _clipboardHookHwnd = IntPtr.Zero;
+                }
+            }
+            catch { }
             base.OnClosed(e);
         }
 
@@ -949,22 +1016,335 @@ namespace GeZi
                 if (string.IsNullOrEmpty(_stoken))
                 {
                     Log("获取分享凭证失败（可能需登录或提取码错误）");
+                    NotifyIfHidden("自动解析失败",
+                        "获取分享凭证失败，可能需要登录，或分享提取码不正确。");
                     return;
                 }
                 ResetNav();
                 _curFid = info.StartFid;
                 await LoadDirAsync(_curFid);
                 Log("解析成功，双击文件夹进入子目录，或直接下载当前目录文件");
+                NotifyIfHidden("已解析剪贴板里的分享链接",
+                    _files.Count > 0
+                        ? "共 " + _files.Count + " 个文件。双击托盘图标打开窗口即可下载。"
+                        : "该分享的当前目录是空的（文件可能在子目录里）。双击托盘图标打开窗口查看。");
             }
             catch (Exception ex)
             {
                 Log("解析失败: " + ex.Message);
+                NotifyIfHidden("自动解析失败", ex.Message);
             }
             finally
             {
                 SetBusy(false);
                 await EndBusyAsync(ParseBtn, t0);
             }
+        }
+
+        // ---------------- 剪贴板自动解析（2026-10-08） ----------------
+        //
+        // 需求：在**任何程序**里复制到夸克分享链接，本程序直接解析好，不用再切回窗口粘贴。
+        //   默认开；设置页「窗口与后台 → 剪贴板」可关，关掉时**根本不注册**监听（零开销）。
+        //
+        // 实现路线见 NativeMethods：AddClipboardFormatListener + WM_CLIPBOARDUPDATE，
+        // 既不用轮询，也不插队进 `SetClipboardViewer` 那条"链"。
+        // 通知由系统投递到本窗口的消息队列 → 下面这些回调**都在 UI 线程**上跑。
+
+        /// <summary>
+        /// 把两件**绑在窗口句柄上**的事挂到当前句柄上：
+        ///   ① 跨进程激活消息钩子（再点一次 exe 时由本进程自己把窗口拉起来）；
+        ///   ② 剪贴板监听（按设置，见 <see cref="ApplyClipboardListener"/>）。
+        ///
+        /// 由 <c>SourceInitialized</c> 触发（订阅在构造函数里），**幂等**：同一个句柄只挂一次。
+        ///
+        /// 【为什么不干脆在 Loaded 里挂一次了事】`HwndSource.AddHook` 和
+        /// `AddClipboardFormatListener` 都是**绑在原生窗口句柄**上的。窗口在
+        /// "隐藏到托盘 → 恢复" 的过程中句柄会不会被 WPF 重建，各版本/资料说法不一，
+        /// 赌不起：句柄一旦被换掉，两个注册就都**静默失效** —— 表现为"恢复窗口后
+        /// 复制分享链接不再自动解析"、"再点 exe 唤不醒托盘里的窗口"，
+        /// 而这两种现象都不会报错，只会让人以为功能没做对。
+        /// 所以这里按句柄判断，并在每次句柄（重）建时重挂一遍 —— 两种情况都对。
+        /// </summary>
+        private void AttachWindowHooks()
+        {
+            try
+            {
+                var h = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+                if (h == IntPtr.Zero) return;      // 句柄还没建好，等下一次事件
+                if (h == _hooksOnHwnd) return;     // 这个句柄已经挂过了
+
+                try
+                {
+                    var src = System.Windows.Interop.HwndSource.FromHwnd(h);
+                    src?.AddHook(WndProc);
+                }
+                catch { }
+
+                _hooksOnHwnd = h;
+                ApplyClipboardListener();
+            }
+            catch (Exception ex)
+            {
+                Log("窗口消息钩子安装失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 按设置挂上 / 摘掉剪贴板监听（幂等）。启动、窗口句柄重建、设置页开关都调它。
+        /// </summary>
+        private void ApplyClipboardListener()
+        {
+            try
+            {
+                // ⚠️ 注册必须**有窗口句柄之后**（HWND 存在前是 IntPtr.Zero）——
+                //    这也是它不能写在构造函数里的原因。
+                var h = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+                if (h == IntPtr.Zero) return;
+
+                bool want = _settings.ClipboardAutoParse;
+
+                // 句柄与设置都没变 → 已经是对的，什么都不用做。
+                if (want && _clipboardHookHwnd == h) return;
+                if (!want && _clipboardHookHwnd == IntPtr.Zero) return;
+
+                // 先摘掉旧注册。旧句柄若已销毁，这次摘除会失败 —— 无所谓，
+                // 注册本来就是随句柄一起消失的。
+                if (_clipboardHookHwnd != IntPtr.Zero)
+                {
+                    NativeMethods.RemoveClipboardFormatListener(_clipboardHookHwnd);
+                    _clipboardHookHwnd = IntPtr.Zero;
+                }
+                if (!want) return;
+
+                if (NativeMethods.AddClipboardFormatListener(h))
+                {
+                    _clipboardHookHwnd = h;
+                }
+                else
+                {
+                    // 基本只会在句柄无效时发生；但既然失败了就说清楚 ——
+                    // 让用户知道"复制链接没反应"不是链接的问题。
+                    Log("剪贴板监听开启失败（Win32 错误码 " + Marshal.GetLastWin32Error()
+                        + "），复制分享链接不会自动解析。");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("剪贴板监听设置失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 设置页「剪贴板」开关。
+        ///
+        /// 走独立处理器而不是 <see cref="OnSettingChanged"/>（同 <see cref="OnThemeChanged"/>
+        /// 的理由）：这个开关只影响"要不要注册一条系统通知"，与并发数/下载目录无关，
+        /// 走 ApplySettings() 会顺带 RecreateScheduler() 去重建下载调度器 ——
+        /// 为了一个开关打断在途下载，代价完全不成比例。
+        /// </summary>
+        private void OnClipboardAutoParseChanged(object sender, RoutedEventArgs e)
+        {
+            // 回填控件时也会触发 Click（走 _applyingSettings 保护，同其它设置项）
+            if (_applyingSettings) return;
+            try
+            {
+                bool on = ClipboardAutoParseCheck.IsChecked == true;
+                _settings.ClipboardAutoParse = on;
+                SettingsStore.Save(_settings);
+                ApplyClipboardListener();
+                Log(on ? "已开启剪贴板监听：复制夸克分享链接会自动解析。"
+                       : "已关闭剪贴板监听。");
+
+                // 关掉时清掉去重标记：重新打开后，用户再复制同一条链接应该能正常解析，
+                // 不该被"上次已经处理过"的记忆挡住。
+                if (!on) _clipboardLastPwdId = null;
+            }
+            catch (Exception ex)
+            {
+                Log("剪贴板设置保存失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>收到「剪贴板内容变了」的系统通知。</summary>
+        private void OnClipboardChanged()
+        {
+            try
+            {
+                // 退出流程里不再处理：这时窗口/托盘可能已经拆掉了。
+                if (_exiting) return;
+
+                // 关了开关就不再处理。一般走不到这里（关了就直接摘注册），
+                // 但"关掉的那一刻"可能已经有通知排进消息队列了 —— 补一道，免得
+                // 用户刚勾掉开关、随手复制一下，程序又自作主张解析了一次。
+                if (!_settings.ClipboardAutoParse) return;
+
+                string text = TryReadClipboardText();
+                if (string.IsNullOrEmpty(text)) return;
+
+                string url = FindQuarkShareUrl(text);
+                if (string.IsNullOrEmpty(url))
+                {
+                    // 不是夸克分享链接（含"夸克口令"）。这里**刻意什么都不做、也不弹窗**：
+                    // 剪贴板通知不是用户在本程序里发起的动作，为一句"这不能解析"打断他很粗暴
+                    // —— 何况口令在聊天记录里到处都是，复制顺手就会触发。
+                    return;
+                }
+
+                var info = ShareUrlParser.Parse(url);
+                if (string.IsNullOrEmpty(info.PwdId)) return;
+
+                if (string.Equals(info.PwdId, _clipboardLastPwdId, StringComparison.Ordinal))
+                {
+                    // 同一条分享的重复通知 → 不再重复发请求。见 _clipboardLastPwdId 的注释。
+                    // （要重新解析，直接点「解析」按钮即可 —— 手动路径不受这个标记影响。）
+                    return;
+                }
+                _clipboardLastPwdId = info.PwdId;
+
+                // 提取码从**整段文本**里取：链接自带 pwd= 的能认，文案里的
+                // 「提取码：abcd」也能认（ShareUrlParser 两种都支持）。
+                AutoParseFromClipboard(url, ShareUrlParser.Parse(text).Passcode);
+            }
+            catch (Exception ex)
+            {
+                try { Log("剪贴板自动解析失败: " + ex.Message); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 从一段文本里找出**夸克网盘**的分享链接；找不到返回 null。
+        ///
+        /// 🚨 这里必须比「粘贴进链接框」（<see cref="OnLinkBoxPasting"/>）严得多：
+        ///    · 粘贴是用户在**本程序里**的明确动作，识别宽松些最多是顺手填个框；
+        ///    · 剪贴板监听是**后台自己发起**的，认错就会把用户正在复制的别的东西
+        ///      （比如别的网盘恰好也叫 /s/ 的链接）当夸克链接去请求、还把他的界面切走。
+        /// 所以域名必须真的是夸克的，`/s/` 只是必要条件。
+        ///
+        /// 【顺带解决了"自己写剪贴板"的死循环】本程序有唯一一处 Clipboard.SetText
+        /// （诊断面板「复制诊断文本」），写的是制表符分隔的文件名 —— 不含夸克域名，
+        /// 因此不会触发自己，不需要额外的"自写抑制"标记。
+        /// </summary>
+        private static string FindQuarkShareUrl(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            if (text.Length > MaxClipboardScanChars) return null;
+
+            foreach (Match m in ClipboardUrlRx.Matches(text))
+            {
+                string u = m.Value;
+                if (u.IndexOf("/s/", StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                // URL 后面常紧跟从句标点或中文标点（"…/s/abc。以下略"、"（…/s/abc）"），
+                // 正则可列的排除集不可能全，统一在**第一个非 URL 字符**处截断，
+                // 再削掉尾部可能残留的句读（`.` `,` 在 URL 里合法，只能靠这一步收尾）。
+                int cut = 0;
+                while (cut < u.Length && IsUrlChar(u[cut])) cut++;
+                u = u.Substring(0, cut).TrimEnd('.', ',', ';', '!', '?');
+
+                if (!IsQuarkHost(u)) continue;
+                return u;
+            }
+            return null;
+        }
+
+        /// <summary>URL 里合法的字符（RFC 3986 的 unreserved + 保留字 + `%`）。</summary>
+        private static bool IsUrlChar(char c)
+        {
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+                return true;
+            return "-._~:/?#[]@!$&'()*+,;=%".IndexOf(c) >= 0;
+        }
+
+        /// <summary>URL 的主机是不是夸克自己（<c>quark.cn</c> / <c>*.quark.cn</c>）。</summary>
+        private static bool IsQuarkHost(string url)
+        {
+            try
+            {
+                Uri u;
+                if (!Uri.TryCreate(url, UriKind.Absolute, out u)) return false;
+                if (u.Scheme != Uri.UriSchemeHttp && u.Scheme != Uri.UriSchemeHttps) return false;
+                string h = u.Host;
+                return h.Equals("quark.cn", StringComparison.OrdinalIgnoreCase)
+                    || h.EndsWith(".quark.cn", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 尽力读一次剪贴板文本：不是文本、或实在抢不到剪贴板时返回 null。
+        ///
+        /// 【为什么要重试】剪贴板是**全局独占**的：写入方还没释放时
+        /// <see cref="Clipboard.GetText"/> 会抛 COMException(CLIPBRD_E_CANT_OPEN)。
+        /// `WM_CLIPBOARDUPDATE` 是"写完之后"才投递的，正常第一次就能读到；
+        /// 但 Office 之流会自己多持有几毫秒，所以留一个很短的退避重试。
+        /// 总等待上限 ~120ms，且只在真的被占用时才会发生（正常路径一次就返回）。
+        /// </summary>
+        private static string TryReadClipboardText()
+        {
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                try
+                {
+                    if (!Clipboard.ContainsText()) return null;
+                    return Clipboard.GetText();
+                }
+                catch (Exception)
+                {
+                    Thread.Sleep(20);
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 把剪贴板里发现的分享链接走一遍解析流程（复用「解析」按钮那套实现，
+        /// 包括按钮加载态与失败提示）。
+        /// </summary>
+        private void AutoParseFromClipboard(string url, string passcode)
+        {
+            try
+            {
+                // ① 必须切回「分享链接」模式 —— 这不只是"让结果看得见"：
+                //    LoadDirAsync 是**按 ShareMode 分流**的（分享走 ShareDetailAsync、
+                //    我的网盘走 ListDirAsync），停在「我的网盘」模式下解析会把
+                //    自己网盘的根目录列出来。切换本身是同步完成的
+                //    （OnModeChanged 到第一个 await 之前就做完了），并且会先把网盘那边的
+                //    导航存进快照，用户原来的浏览位置不会丢。
+                if (ShareModeRadio.IsChecked != true)
+                    ShareModeRadio.IsChecked = true;
+
+                // ② 结果只出现在「下载」页的分享面板里（NavList 顺序：0=下载 1=任务
+                //    2=设置 3=登录），所以把页面也指过去，否则用户在设置页复制的链接，
+                //    程序在背后解析完他什么也看不见。
+                //    ⚠️ 只切页签，不 Show / 不 Activate —— 窗口藏在托盘时静默解析，不抢焦点。
+                Tabs.SelectedIndex = 0;
+            }
+            catch { }
+
+            LinkBox.Text = url;
+            LinkBox.CaretIndex = url.Length;
+
+            // ③ 提取码以**本次复制的内容**为准（没有就清空）：PassBox 里可能还留着
+            //    上一条分享的码，而 OnParseClick 会优先采用 PassBox 的值 ——
+            //    留着它会"用错码"，解析失败时还完全看不出原因。
+            PassBox.Text = passcode ?? "";
+
+            Log("剪贴板里发现夸克分享链接，自动解析…");
+            OnParseClick(null, null);
+        }
+
+        /// <summary>
+        /// 窗口不可见（藏在托盘）时用托盘气泡报一句；窗口可见时不弹 ——
+        /// 界面上本来就能看到结果，再弹气泡是重复打扰。
+        /// </summary>
+        private void NotifyIfHidden(string title, string text)
+        {
+            try
+            {
+                if (IsVisible) return;
+                _tray?.ShowBalloon(title, text);
+            }
+            catch { }
         }
 
         // ---------------- 目录浏览（分享/网盘统一） ----------------
@@ -4305,6 +4685,9 @@ namespace GeZi
                 PartsRootBox.Text = _settings.PartsRoot ?? "";
                 HidePartsCheck.IsChecked = _settings.HideParts;
                 CloseActionBox.SelectedIndex = (int)_settings.OnCloseButton;
+                // 剪贴板自动解析（默认开）。注意这里**只回填控件**：真正的注册在窗口句柄
+                // 建好之后由 AttachWindowHooks→ApplyClipboardListener 做。
+                ClipboardAutoParseCheck.IsChecked = _settings.ClipboardAutoParse;
                 // 外观主题：把配置里的选择回填到三个单选（_applyingSettings 已挡掉 Checked）
                 SyncThemeRadios();
             }

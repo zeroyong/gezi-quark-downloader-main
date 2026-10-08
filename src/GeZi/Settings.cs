@@ -117,6 +117,25 @@ namespace GeZi
         public bool MiniPosSet { get; set; }
 
         /// <summary>
+        /// 复制到剪贴板的夸克分享链接是否**自动解析**（2026-10-08 新增）。默认开启。
+        /// 关掉后程序根本不注册剪贴板监听（见 <see cref="MainWindow"/> 的 ApplyClipboardListener），
+        /// 不是"监听但忽略"—— 关闭状态下零开销，也不存在"读用户剪贴板"这件事。
+        /// </summary>
+        public bool ClipboardAutoParse { get; set; } = true;
+
+        /// <summary>
+        /// <see cref="ClipboardAutoParse"/> 是否已经落过盘。
+        ///
+        /// 🚨 【为什么光有一个布尔不够】XmlSerializer 反序列化**不执行字段初始化器**：
+        ///   老配置文件里没有 ClipboardAutoParse 节点时，属性会保持 default(bool) = false ——
+        ///   也就是"老用户升级后，自动解析默认变成关闭"，与要求（默认打开）正好相反，
+        ///   而且用户会觉得"你说默认开，我什么都没动怎么是关的"。
+        ///   Theme 那边靠"0 = System"绕过了同样的坑，布尔类型没有等价的取巧办法，
+        ///   只能额外记一个"写过没有"的标记：没写过 → 按默认值「开」处理（见 SettingsStore.Load）。
+        /// </summary>
+        public bool ClipboardAutoParseSet { get; set; }
+
+        /// <summary>
         /// 外观主题（2026-10-04 新增）。Light / Dark / System。
         ///
         /// ⚠️ 默认值必须是 0 = <see cref="AppTheme.System"/>：
@@ -236,6 +255,9 @@ namespace GeZi
             if (s.Threads > GeZi.Core.Download.SegmentedDownloader.MaxRealConcurrency)
                 s.Threads = GeZi.Core.Download.SegmentedDownloader.MaxRealConcurrency;
             if (s.ConcurrentTasks <= 0) s.ConcurrentTasks = 3;
+            // 老配置（没有 ClipboardAutoParseSet 节点）→ 按默认值「开」，
+            // 而不是让 default(bool) 的 false 把功能悄悄关掉。见该属性的注释。
+            if (!s.ClipboardAutoParseSet) s.ClipboardAutoParse = true;
             return s;
         }
 
@@ -250,6 +272,10 @@ namespace GeZi
             try
             {
                 s.Cookie = SecretProtector.Protect(rawCookie);
+                // 落过盘就置位：下次 Load 才能区分"用户主动关掉了"与"老配置里没这个节点"
+                // （见 ClipboardAutoParseSet 的注释）。放在这里而不是各个调用点，
+                // 是为了覆盖所有写盘路径，避免漏一处就退回"默认关"。
+                s.ClipboardAutoParseSet = true;
 
                 // 先写临时文件再原子替换：避免写一半断电/异常留下半截 XML，
                 // 下次启动 Load 直接抛异常、用户设置全丢。

@@ -11,7 +11,7 @@
     <RootNamespace>GeZi</RootNamespace>
     <Product>鸽子下载</Product>
     <AssemblyTitle>鸽子下载</AssemblyTitle>
-    <Version>2.2.0</Version>
+    <Version>2.3.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <StartupObject>GeZi.App</StartupObject>
     <!-- 【2026-10-03】应用图标：exe 文件图标 + 任务栏/Alt-Tab 图标。
