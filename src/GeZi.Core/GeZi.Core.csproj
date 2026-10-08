@@ -1,0 +1,86 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>GeZi.Core</AssemblyName>
+    <RootNamespace>GeZi.Core</RootNamespace>
+    <Product>鸽子下载</Product>
+    <AssemblyTitle>鸽子下载</AssemblyTitle>
+    <Version>2.2.0</Version>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- 【2026-10-04】PathMap：别让编译机的绝对路径（含用户名）进产物。
+         不加 → `C:\Users\<用户名>\Desktop\GeZi\src\...\GeZi.Core.pdb` 被写进 dll
+         → 打包发给别人时泄漏本机用户名/目录（本轮实测发现）。详见 GeZi.csproj 里的说明。 -->
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 零 NuGet 依赖，可离线编译：JSON 用框架自带 JavaScriptSerializer；HTTP 用 System.Net.Http -->
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.Web.Extensions" />
+    <!-- DPAPI（ProtectedData）加密 Cookie -->
+    <Reference Include="System.Security" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      ★ 二维码解码：ZXing.Net（Apache-2.0）
+      ==================================================================
+      【为什么需要】夸克分享有时只给一张二维码图片、不给文本链接，
+      用户需要把图里的链接抠出来。解码要处理透视校正 + Reed-Solomon 纠错，
+      自己写成本远高于编码（QrEncoder 那种），所以用成熟库。
+
+      【为什么不是 PackageReference】本项目约定「零 NuGet、离线可构建」。
+      因此把 net48 版 zxing.dll（532KB，单文件零依赖）固化进 lib/ZXing/，
+      用普通 Reference 引用 —— 任何机器 clone 下来直接 build，不需联网还原。
+      详见 lib/ZXing/README.md（含版本 / 许可 / 重新获取方式）。
+
+      ⚠️ net48 下 ZXing 走 System.Drawing 路径，不需要任何 Bindings 包
+         （SkiaSharp / Windows.Compatibility 那些只对 .NET 5+ 必要）。
+      ⚠️ Private=true 确保 zxing.dll 被复制到输出目录（跟 GeZi.Core.dll 同级）。
+      ⚠️ 这里的文件名**刻意用小写 zxing.dll**（与 <AssemblyName>ZXing</AssemblyName> 的大小写不同）：
+         GeZi.exe 通过 ProjectReference 拿到它时，MSBuild 会按程序集名规范化成小写 —— 
+         源码这边跟着写小写，最终产物名才在各平台/打包工具下**完全一致**，
+         不会出现"源码是大写、输出是小写"这种大小写不敏感文件系统上才看不出来的坑。
+    -->
+    <Reference Include="ZXing">
+      <HintPath>lib\ZXing\zxing.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      换 Cookie 辅助脚本：以嵌入资源随程序集分发，运行时释放到 %TEMP% 再调用本机 Python。
+      之所以要走 Python，是因为夸克 pan.quark.cn 的 ALB 按 TLS ClientHello 指纹过滤，
+      .NET Framework 的 SChannel 必然被 RST，只有足够新的 OpenSSL 才放行。
+      嵌入资源不增加部署文件数量；脚本仅用标准库，体积可忽略。
+    -->
+    <EmbeddedResource Include="Api\quark_cookie_helper.py">
+      <LogicalName>GeZi.Core.Api.quark_cookie_helper.py</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      ★ 内置 Python 运行时（win-x64，约 20MB）
+      ==================================================================
+      为什么要内置：pan.quark.cn 的 ALB 按 TLS ClientHello 的 supported_groups
+      扩展大小过滤（阈值约 1600 字节）。.NET SChannel 只声明 X25519+P-256+P-384
+      （约 300 到 350B），必被 TCP RST；且 OpenSSL 3.0.x 也不行（约 1500B 仍被拒），
+      只有 OpenSSL 3.2+ 才放行。所以只能随身带一个足够新的 OpenSSL。
+
+      运行时来源：官方 CPython 3.13（OpenSSL 3.5.7），去掉 site-packages/test/
+      tkinter/ensurepip 等，标准库压成 python313.zip（2.4MB），核心约 20MB。
+
+      分发策略：随主程序复制到输出目录，用户机器上即使没有 Python 也能扫码登录。
+    -->
+    <None Include="Runtime\win-x64\**\*">
+      <Link>Runtime\win-x64\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

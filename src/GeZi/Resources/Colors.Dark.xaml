@@ -1,0 +1,90 @@
+﻿<!--
+    Colors.Dark.xaml —— 暗色主题设计令牌（颜色）
+    ============================================================
+    与 Colors.Light.xaml **逐键对应**（键名集合必须完全相同，见 Light 文件头说明）。
+
+    【设计原则】
+    1. **不是简单反色**。深色界面靠「明度层次」表达层级，而不是靠描边：
+       底色最暗 → 卡片提亮 → 悬停再提亮。硬加白描边会很脏。
+    2. **"浅色底"类令牌必须反转语义**：亮色下 PrimaryLight(#EEF1FE) 是"淡蓝色块"，
+       暗色下要变成"**深蓝色块**"(#232A47) —— 否则出现白底白字。
+       属于这一类的有：PrimaryLight / PrimarySoft / SuccessLight / WarningLight /
+       DangerLight / SurfaceSunken / TitleBarHover。
+    3. **主色略微提亮**（#4F6BED → #5B74F0）：同一个靛蓝在大面积深底上会显得发闷，
+       提亮约 6% 才能在深灰背景上保持"醒目但不刺眼"。
+    4. **文字对比度按 WCAG 重算**：深底上 #E8EAF0 对 #1A1D23 ≈ 13:1（远超正文 4.5:1）；
+       TextTertiary 用 #8A93A6 ≈ 5.6:1（次要说明要 ≥4.5:1，比亮色版更严一点，
+       因为深底上的灰字比白底上的灰字更"发糊"）。
+    5. **阴影用纯黑**：深色界面里 #1F2430 那种偏蓝的深色做阴影几乎是不可见的，
+       改用纯黑并依赖卡片自身提亮来区分层次。
+    6. **保持品牌色不变**：Success/Warning/Danger 三个语义色的**主色值**沿用亮色版
+       （深底上它们依然醒目），只有它们的 Light 变体反转成深色。
+-->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- ────────── 背景 / 表面（自暗到亮，形成层级） -->
+    <Color x:Key="AppBgColor">#FF1A1D23</Color>
+    <Color x:Key="SurfaceColor">#FF22262E</Color>
+    <Color x:Key="SurfaceAltColor">#FF282D36</Color>
+    <!-- Sunken = 比 AppBg 更暗（凹槽感），亮色版它是"比底色略深" → 这里更深 -->
+    <Color x:Key="SurfaceSunkenColor">#FF15181D</Color>
+
+    <!-- ────────── 主色（靛蓝，全应用唯一强调色；深底上提亮约 6%） -->
+    <Color x:Key="PrimaryColor">#FF5B74F0</Color>
+    <Color x:Key="PrimaryHoverColor">#FF6D83F3</Color>
+    <Color x:Key="PrimaryPressedColor">#FF4A61D9</Color>
+    <!-- ⚠️ 浅色底 → 深色底（语义反转）：亮色版是淡蓝色块，这里必须是深蓝色块 -->
+    <Color x:Key="PrimaryLightColor">#FF232A47</Color>
+    <Color x:Key="PrimarySoftColor">#FF2C3556</Color>
+
+    <!-- ────────── 语义色（主色值沿用；Light 变体反转为深底） -->
+    <Color x:Key="SuccessColor">#FF10B981</Color>
+    <Color x:Key="SuccessLightColor">#FF13312A</Color>
+    <Color x:Key="WarningColor">#FFF59E0B</Color>
+    <Color x:Key="WarningLightColor">#FF33280F</Color>
+    <Color x:Key="DangerColor">#FFEF4444</Color>
+    <Color x:Key="DangerLightColor">#FF3A1D1F</Color>
+
+    <!-- ────────── 文字 -->
+    <Color x:Key="TextPrimaryColor">#FFE8EAF0</Color>
+    <Color x:Key="TextSecondaryColor">#FFA8B0C0</Color>
+    <!--
+        深底上的次要说明文字。亮色版是 #7B8496（白底 4.6:1），
+        深底上要**反向提亮**才够对比：#8A93A6 对 #1A1D23 ≈ 5.6:1。
+        ⚠️ 不要直接沿用亮色版的 #7B8496 —— 它在深底只有 ≈3.7:1，会明显发糊。
+    -->
+    <Color x:Key="TextTertiaryColor">#FF8A93A6</Color>
+    <Color x:Key="TextOnPrimaryColor">#FFFFFFFF</Color>
+
+    <!-- ────────── 阴影（深色界面里偏蓝的深灰几乎不可见 → 用纯黑） -->
+    <Color x:Key="ShadowColor">#FF000000</Color>
+    <Color x:Key="ShadowStrongColor">#FF000000</Color>
+
+    <!-- ────────── 头像底色（深底上略降饱和，避免过于跳脱） -->
+    <Color x:Key="AvatarTint1Color">#FF5B74F0</Color>
+    <Color x:Key="AvatarTint2Color">#FF8B6FE8</Color>
+    <Color x:Key="AvatarTint3Color">#FF14B8B8</Color>
+    <Color x:Key="AvatarTint4Color">#FFEE9070</Color>
+    <Color x:Key="AvatarTint5Color">#FFE0698F</Color>
+
+    <!-- ────────── 容量占用率色阶（深底上略提亮，保持可辨） -->
+    <Color x:Key="CapacityLowColor">#FF10B981</Color>
+    <Color x:Key="CapacityMidColor">#FFF59E0B</Color>
+    <Color x:Key="CapacityHighColor">#FFEF4444</Color>
+
+    <!-- ────────── 描边 / 分隔（深底上用"提亮"表达边界，而不是白线） -->
+    <Color x:Key="BorderColor">#FF333844</Color>
+    <Color x:Key="BorderStrongColor">#FF454C5C</Color>
+
+    <!-- ────────── 滚动条 -->
+    <Color x:Key="ScrollThumbColor">#FF454C5C</Color>
+    <Color x:Key="ScrollThumbHoverColor">#FF5A6274</Color>
+
+    <!-- ────────── 标题栏 -->
+    <Color x:Key="TitleBarColor">#FF1E222A</Color>
+    <Color x:Key="TitleBarHoverColor">#FF2C313B</Color>
+    <!-- 关闭按钮悬停红：深色下略降亮度，避免刺眼 -->
+    <Color x:Key="TitleBarCloseHoverColor">#FFD62E3D</Color>
+
+</ResourceDictionary>

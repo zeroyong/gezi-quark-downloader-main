@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>GeZi</AssemblyName>
+    <RootNamespace>GeZi</RootNamespace>
+    <Product>鸽子下载</Product>
+    <AssemblyTitle>鸽子下载</AssemblyTitle>
+    <Version>2.2.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <StartupObject>GeZi.App</StartupObject>
+    <!-- 【2026-10-03】应用图标：exe 文件图标 + 任务栏/Alt-Tab 图标。
+         图标是"衔橄榄枝的鸽子"，与「鸽子下载」对应（用户提供）。
+         另外把 .ico 也作为 WPF Resource 发布，供窗口 Icon 使用。 -->
+    <ApplicationIcon>Resources\app.ico</ApplicationIcon>
+    <!-- 【2026-10-04】PathMap：把编译机的绝对路径映射成占位前缀。
+         ⚠️ 不加这一条，编译器会把自己的 PDB 路径
+         `C:\Users\<用户名>\Desktop\GeZi\src\...\GeZi.pdb` 原样写进 exe/dll 的
+         debug directory → 发给别人时**泄漏你的用户名和目录结构**（本轮实测发现）。
+         PathMap 只改**二进制里记录的路径**，不改实际文件位置 →
+         本机 VS 调试照常（.pdb 仍在 bin 下），只是别人看到的是 `/_/`。
+         （等价于 C++ 的 /pathmap，.NET 从 Roslyn 起支持。） -->
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 窗口图标（Window.Icon 用）。PNG 版给界面里的小尺寸 Logo 用，
+         因为 WPF 对 .ico 的解码只会取第一帧（16x16），放大到 28px 会糊。 -->
+    <Resource Include="Resources\app.ico" />
+    <Resource Include="Resources\app-logo.png" />
+    <!-- 赞赏码（从 Flet 版的 APP_REWARD_LG_B64 解出来的 360×360 PNG） -->
+    <Resource Include="Resources\reward-qr.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\GeZi.Core\GeZi.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 零 NuGet：JSON 用框架自带的 DataContractJsonSerializer（历史记录/未完成任务持久化）。
+         不要引 System.Web.Extensions —— 它依赖 System.Web，会让 WPF 的 XAML 编译器报 MC1000。 -->
+    <Reference Include="System.Runtime.Serialization" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,34 @@
+# ============================================================
+#  GeZi — .gitattributes
+#  统一换行符与二进制文件处理，避免跨平台 clone 时
+#  出现"整个文件都改了"的假 diff。
+# ============================================================
+
+# 默认：自动识别文本/二进制
+* text=auto
+
+# ---------- 文本文件：入库统一用 LF ----------
+*.cs        text
+*.xaml      text
+*.csproj    text
+*.slnx      text
+*.py        text
+*.md        text
+*.xml       text
+*.config    text
+*.manifest  text
+*.gitignore text
+*.gitattributes text
+
+# ---------- 二进制文件：绝不转换 ----------
+*.dll    binary
+*.pyd    binary
+*.exe    binary
+*.zip    binary
+*.png    binary
+*.ico    binary
+*.jpg    binary
+
+# ---------- 让 GitHub 识别语言构成 ----------
+*.cs     linguist-language=C#
+*.xaml   linguist-language=XAML

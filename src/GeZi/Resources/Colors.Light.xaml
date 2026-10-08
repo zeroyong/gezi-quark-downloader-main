@@ -1,0 +1,84 @@
+﻿<!--
+    Colors.Light.xaml —— 亮色主题设计令牌（颜色）
+    ============================================================
+    主题的**唯一色源**之一（另一份是 Colors.Dark.xaml）。所有颜色都用 Color
+    （不是 Brush），由 Brushes.xaml 转成 SolidColorBrush；界面里一律 DynamicResource 引用。
+
+    切换主题时 ThemeManager 只替换本层字典（Light ↔ Dark），
+    因为 Brushes.xaml 里每个画刷的 Color 都是 DynamicResource，
+    会自动重解析 → 273 处界面引用全部跟着变，无需重建任何画刷。
+
+    命名沿用功能语义（AppBg/Surface/Primary…），不用外观语义（不叫 Gray100 之类），
+    这样换主题时看到名字就知道用途。
+
+    ⚠️ 两份色源（Light/Dark）的 **x:Key 必须完全一致、一个不多一个不少**，
+    否则换过去会出现「找不到资源」→ 控件用系统默认色（暗色下往往是刺眼的白）。
+    verify_uia5.py 里有断言核对两边的键集合相等。
+-->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- ────────── 背景 / 表面 -->
+    <Color x:Key="AppBgColor">#FFF5F6FA</Color>
+    <Color x:Key="SurfaceColor">#FFFFFFFF</Color>
+    <Color x:Key="SurfaceAltColor">#FFF9FAFC</Color>
+    <Color x:Key="SurfaceSunkenColor">#FFF1F3F8</Color>
+
+    <!-- ────────── 主色（靛蓝，全应用唯一强调色） -->
+    <Color x:Key="PrimaryColor">#FF4F6BED</Color>
+    <Color x:Key="PrimaryHoverColor">#FF3D57D6</Color>
+    <Color x:Key="PrimaryPressedColor">#FF3348B8</Color>
+    <Color x:Key="PrimaryLightColor">#FFEEF1FE</Color>
+    <Color x:Key="PrimarySoftColor">#FFDDE3FB</Color>
+
+    <!-- ────────── 语义色 -->
+    <Color x:Key="SuccessColor">#FF10B981</Color>
+    <Color x:Key="SuccessLightColor">#FFE6F7F1</Color>
+    <Color x:Key="WarningColor">#FFF59E0B</Color>
+    <Color x:Key="WarningLightColor">#FFFEF3E0</Color>
+    <Color x:Key="DangerColor">#FFEF4444</Color>
+    <Color x:Key="DangerLightColor">#FFFDECEC</Color>
+
+    <!-- ────────── 文字 -->
+    <Color x:Key="TextPrimaryColor">#FF1F2430</Color>
+    <Color x:Key="TextSecondaryColor">#FF6B7280</Color>
+    <!--
+        TextTertiary 从 #9CA3AF 调深到 #7B8496。
+        原因：WCAG AA 要求正文 ≥4.5:1、次要说明 ≥3:1。#9CA3AF 在白底只有 ≈2.8:1，
+        连 3:1 都不到 —— "还没有内容""暂无下载任务"这类灰字在浅底上明显发虚。
+        #7B8496 在白底约 4.6:1，达标，同时仍明显弱于 TextSecondary。
+    -->
+    <Color x:Key="TextTertiaryColor">#FF7B8496</Color>
+    <Color x:Key="TextOnPrimaryColor">#FFFFFFFF</Color>
+
+    <!-- ────────── 阴影（氛围感的来源：模糊大、偏移小、透明度极低） -->
+    <Color x:Key="ShadowColor">#FF1F2430</Color>
+    <!-- 悬浮层（下拉/菜单）用稍重的阴影，表达"浮在内容之上" -->
+    <Color x:Key="ShadowStrongColor">#FF1F2430</Color>
+
+    <!-- ────────── 头像底色（无头像时用昵称首字生成，按名字散列取一个） -->
+    <Color x:Key="AvatarTint1Color">#FF4F6BED</Color>
+    <Color x:Key="AvatarTint2Color">#FF7C5CE0</Color>
+    <Color x:Key="AvatarTint3Color">#FF0EA5A5</Color>
+    <Color x:Key="AvatarTint4Color">#FFE8845C</Color>
+    <Color x:Key="AvatarTint5Color">#FFD9527E</Color>
+
+    <!-- ────────── 容量占用率色阶（状态色编码：越满越警示） -->
+    <Color x:Key="CapacityLowColor">#FF10B981</Color>
+    <Color x:Key="CapacityMidColor">#FFF59E0B</Color>
+    <Color x:Key="CapacityHighColor">#FFEF4444</Color>
+
+    <!-- ────────── 描边 / 分隔 -->
+    <Color x:Key="BorderColor">#FFE8EAF0</Color>
+    <Color x:Key="BorderStrongColor">#FFD5D9E4</Color>
+
+    <!-- ────────── 滚动条 -->
+    <Color x:Key="ScrollThumbColor">#FFCFD4E2</Color>
+    <Color x:Key="ScrollThumbHoverColor">#FFA9B0C4</Color>
+
+    <!-- ────────── 标题栏 -->
+    <Color x:Key="TitleBarColor">#FFFAFBFD</Color>
+    <Color x:Key="TitleBarHoverColor">#FFEDEFF5</Color>
+    <Color x:Key="TitleBarCloseHoverColor">#FFE81123</Color>
+
+</ResourceDictionary>

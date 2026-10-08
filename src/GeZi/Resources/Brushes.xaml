@@ -1,0 +1,72 @@
+﻿<!--
+    Brushes.xaml —— 设计令牌（画刷）
+    ============================================================
+    由 Colors.xaml 的颜色派生。界面里引用画刷（DynamicResource），
+    而不是到处写 #FFxxxxxx 硬编码。
+-->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- ────────── 背景 / 表面 -->
+    <SolidColorBrush x:Key="AppBgBrush" Color="{DynamicResource AppBgColor}"/>
+    <SolidColorBrush x:Key="SurfaceBrush" Color="{DynamicResource SurfaceColor}"/>
+    <SolidColorBrush x:Key="SurfaceAltBrush" Color="{DynamicResource SurfaceAltColor}"/>
+    <SolidColorBrush x:Key="SurfaceSunkenBrush" Color="{DynamicResource SurfaceSunkenColor}"/>
+
+    <!-- ────────── 主色 -->
+    <SolidColorBrush x:Key="PrimaryBrush" Color="{DynamicResource PrimaryColor}"/>
+    <SolidColorBrush x:Key="PrimaryHoverBrush" Color="{DynamicResource PrimaryHoverColor}"/>
+    <SolidColorBrush x:Key="PrimaryPressedBrush" Color="{DynamicResource PrimaryPressedColor}"/>
+    <SolidColorBrush x:Key="PrimaryLightBrush" Color="{DynamicResource PrimaryLightColor}"/>
+    <SolidColorBrush x:Key="PrimarySoftBrush" Color="{DynamicResource PrimarySoftColor}"/>
+
+    <!-- ────────── 语义色 -->
+    <SolidColorBrush x:Key="SuccessBrush" Color="{DynamicResource SuccessColor}"/>
+    <SolidColorBrush x:Key="SuccessLightBrush" Color="{DynamicResource SuccessLightColor}"/>
+    <SolidColorBrush x:Key="WarningBrush" Color="{DynamicResource WarningColor}"/>
+    <SolidColorBrush x:Key="WarningLightBrush" Color="{DynamicResource WarningLightColor}"/>
+    <SolidColorBrush x:Key="DangerBrush" Color="{DynamicResource DangerColor}"/>
+    <SolidColorBrush x:Key="DangerLightBrush" Color="{DynamicResource DangerLightColor}"/>
+
+    <!-- ────────── 文字 -->
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="{DynamicResource TextPrimaryColor}"/>
+    <SolidColorBrush x:Key="TextSecondaryBrush" Color="{DynamicResource TextSecondaryColor}"/>
+    <SolidColorBrush x:Key="TextTertiaryBrush" Color="{DynamicResource TextTertiaryColor}"/>
+    <SolidColorBrush x:Key="TextOnPrimaryBrush" Color="{DynamicResource TextOnPrimaryColor}"/>
+
+    <!-- ────────── 描边 / 分隔 -->
+    <SolidColorBrush x:Key="BorderBrushSoft" Color="{DynamicResource BorderColor}"/>
+    <SolidColorBrush x:Key="BorderBrushStrong" Color="{DynamicResource BorderStrongColor}"/>
+
+    <!-- ────────── 滚动条 -->
+    <SolidColorBrush x:Key="ScrollThumbBrush" Color="{DynamicResource ScrollThumbColor}"/>
+    <SolidColorBrush x:Key="ScrollThumbHoverBrush" Color="{DynamicResource ScrollThumbHoverColor}"/>
+
+    <!-- ────────── 标题栏 -->
+    <SolidColorBrush x:Key="TitleBarBrush" Color="{DynamicResource TitleBarColor}"/>
+    <SolidColorBrush x:Key="TitleBarHoverBrush" Color="{DynamicResource TitleBarHoverColor}"/>
+    <SolidColorBrush x:Key="TitleBarCloseHoverBrush" Color="{DynamicResource TitleBarCloseHoverColor}"/>
+
+    <!-- ────────── 透明 -->
+    <SolidColorBrush x:Key="TransparentBrush" Color="Transparent"/>
+
+    <!-- ────────── 阴影 -->
+    <SolidColorBrush x:Key="ShadowBrush" Color="{DynamicResource ShadowColor}"/>
+    <SolidColorBrush x:Key="ShadowStrongBrush" Color="{DynamicResource ShadowStrongColor}"/>
+
+    <!-- ────────── 头像底色 -->
+    <SolidColorBrush x:Key="AvatarTint1Brush" Color="{DynamicResource AvatarTint1Color}"/>
+    <SolidColorBrush x:Key="AvatarTint2Brush" Color="{DynamicResource AvatarTint2Color}"/>
+    <SolidColorBrush x:Key="AvatarTint3Brush" Color="{DynamicResource AvatarTint3Color}"/>
+    <SolidColorBrush x:Key="AvatarTint4Brush" Color="{DynamicResource AvatarTint4Color}"/>
+    <SolidColorBrush x:Key="AvatarTint5Brush" Color="{DynamicResource AvatarTint5Color}"/>
+
+    <!-- ────────── 容量色阶 -->
+    <SolidColorBrush x:Key="CapacityLowBrush" Color="{DynamicResource CapacityLowColor}"/>
+    <SolidColorBrush x:Key="CapacityMidBrush" Color="{DynamicResource CapacityMidColor}"/>
+    <SolidColorBrush x:Key="CapacityHighBrush" Color="{DynamicResource CapacityHighColor}"/>
+
+    <!-- 侧栏背景：从 AppBg 往白里推一点，与内容区形成"底色差"而非"硬线分隔" -->
+    <SolidColorBrush x:Key="SidebarBrush" Color="{DynamicResource SurfaceColor}"/>
+
+</ResourceDictionary>

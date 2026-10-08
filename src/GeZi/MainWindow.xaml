@@ -1,0 +1,1742 @@
+<Window x:Class="GeZi.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="鸽子下载 · 夸克网盘直链助手"
+        Icon="/Resources/app.ico"
+        Height="780" Width="1120" MinHeight="640" MinWidth="900"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource AppBgBrush}"
+        FontFamily="{StaticResource AppFontFamily}"
+        TextOptions.TextFormattingMode="Display"
+        UseLayoutRounding="True"
+        Closing="OnWindowClosing">
+
+    <!-- 自绘标题栏：去掉系统边框，改用 WindowChrome 保留拖拽/贴边/双击最大化/系统菜单 -->
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="36" ResizeBorderThickness="6"
+                            CornerRadius="0" GlassFrameThickness="0"
+                            UseAeroCaptionButtons="False"/>
+    </shell:WindowChrome.WindowChrome>
+
+    <Border BorderBrush="{DynamicResource BorderBrushStrong}" BorderThickness="1">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="36"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <!-- ================= 标题栏 ================= -->
+            <Border Grid.Row="0" x:Name="TitleBar" Background="{DynamicResource TitleBarBrush}"
+                    MouseLeftButtonDown="OnTitleBarDrag">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Column="0" Orientation="Horizontal" Margin="14,0,0,0"
+                                VerticalAlignment="Center">
+                        <!-- 【2026-10-03】按用户要求标题栏**只留文字、不要图标**：
+                             「这里我决定不要图标了只要文字」。
+                             （窗口/任务栏图标仍是应用图标，那是 Window.Icon，与这里无关。） -->
+                        <TextBlock Text="鸽子下载" FontSize="12.5" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource TextSecondaryBrush}"
+                                   VerticalAlignment="Center"/>
+                    </StackPanel>
+
+                    <!--
+                        账号 / 容量已迁到侧栏左下角（见下方 AccountCard）。
+                        标题栏只留品牌 + 窗口按钮，避免"一进程序先被一串数字糊脸"。
+                    -->
+
+                    <!-- 窗口按钮（WindowChrome.IsHitTestVisibleInChrome 让它们在可拖拽区仍可点击） -->
+                    <StackPanel Grid.Column="1" Orientation="Horizontal"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True">
+                        <Button x:Name="MinBtn" Style="{StaticResource CaptionButton}"
+                                AutomationProperties.Name="最小化"
+                                Click="OnMinimizeClick" ToolTip="最小化">
+                            <Path Data="{StaticResource IconMinimize}" Stretch="Uniform" Width="12" Height="12"
+                                  Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.4"
+                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                        </Button>
+                        <Button x:Name="MaxBtn" Style="{StaticResource CaptionButton}"
+                                AutomationProperties.Name="最大化或还原"
+                                Click="OnMaximizeClick" ToolTip="最大化 / 还原">
+                            <Path x:Name="MaxIcon" Data="{StaticResource IconMaximize}" Stretch="Uniform"
+                                  Width="11" Height="11"
+                                  Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.4"
+                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                        </Button>
+                        <Button x:Name="CloseBtn" Style="{StaticResource CaptionCloseButton}"
+                                AutomationProperties.Name="关闭窗口"
+                                Click="OnCloseClick" ToolTip="关闭">
+                            <Path Data="{StaticResource IconClose}" Stretch="Uniform" Width="12" Height="12"
+                                  Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.4"
+                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                        </Button>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- ================= 主体：左导航 + 右内容 =================
+                 侧栏从 TabControl 的 ControlTemplate 里搬出来了（原因见 Styles.xaml 注释）：
+                 模板内的 x:Name 不是类字段，账号卡必须待在真实可视树才能被 code-behind 访问。
+                 分隔方式改为「底色差」：侧栏白、内容区浅灰（AppBg），
+                 不再画 0,0,1,0 的 1px 硬线 —— 硬线正是"生硬"的来源。
+            -->
+            <Grid Grid.Row="1">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="220"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- ============ 侧栏 ============ -->
+                <Border Grid.Column="0" Background="{DynamicResource SurfaceBrush}">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>   <!-- 品牌区 -->
+                            <RowDefinition Height="*"/>      <!-- 导航 -->
+                            <RowDefinition Height="Auto"/>   <!-- 多选提示 -->
+                            <RowDefinition Height="Auto"/>   <!-- 账号卡 -->
+                        </Grid.RowDefinitions>
+
+                        <!-- 品牌区（右边带一个「?」关于按钮 —— 用户要求「在右边增加一个圆圈里边有个？的关于按钮」） -->
+                        <StackPanel Grid.Row="0" Margin="20,18,20,14">
+                            <StackPanel Orientation="Horizontal">
+                        <!-- 品牌 Logo：用真实应用图标（衔橄榄枝的鸽子）。
+                             图标本身是"浅底圆角方块 + 深色鸽子"，自带透明圆角，
+                             所以不再需要外面那层蓝色底 + 白色线稿箭头。 -->
+                        <Image Source="/Resources/app-logo.png" Width="30" Height="30"
+                               Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
+                                <StackPanel Margin="10,0,0,0" VerticalAlignment="Center">
+                                    <!-- 「鸽子下载」这一行右边紧跟一个「?」关于按钮。
+                                         ⚠️ 用户第一版把它做成了 26px 并被 Grid 推到侧栏最右边，
+                                         反馈「这个圆圈加？的图标也太大了，直接在这里的鸽子下载的
+                                         右边有一个这个图标，图标大小合适不会看着特别大也不会特别小」。
+                                         所以：**贴着标题文字放**（不再用 Grid 撑到右边缘）。
+                                         之后用户又说「还是有点大了再缩小一点」→ 圆 15→13、外层 20→18。
+                                         再之后用户指出「这个？有点偏左，你不会是自己画的吧，
+                                         在 ui 库里边找个类似的放在这里」→ 弃用「Ellipse + TextBlock」拼法
+                                         （文字按文本框居中，字形重心必然偏），
+                                         改用 Icons.xaml 里取自 Lucide 的 IconHelpCircle 矢量图标。
+                                         最后用户说「和文字对的不齐，需要向下、向左来一点」。
+
+                                         📐 **对齐是靠量像素定的，不是靠眼看**：
+                                         截图后取两团墨迹的包围盒 ——
+                                           标题「鸽子下载」墨迹 y 72..90，中心 81.0
+                                           「?」图标墨迹    y 72..87，中心 79.5
+                                         → 图标比文字**高 1.5px**；水平方向文字右缘 151、图标左缘 163
+                                         → 间隙 11px（偏大）。据此把图标下移 1.5px、左移 5px。 -->
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="鸽子下载" FontSize="15" FontWeight="SemiBold"
+                                                   Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                        <Button x:Name="AboutBtn" Click="OnAboutClick"
+                                                Style="{StaticResource IconGhostButton}"
+                                                Width="18" Height="18" Margin="3,0,0,0"
+                                                VerticalAlignment="Center"
+                                                AutomationProperties.Name="关于"
+                                                ToolTip="关于 鸽子下载 / 赞赏支持">
+                                            <Path Data="{StaticResource IconHelpCircle}"
+                                                  Stretch="Uniform" Width="13" Height="13"
+                                                  Stroke="{DynamicResource TextTertiaryBrush}"
+                                                  StrokeThickness="1.7"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                  StrokeLineJoin="Round">
+                                                <!-- ⚠️ 用 RenderTransform 而不是 Margin 做这 1.5px 的垂直微调：
+                                                     Margin 会**参与布局** —— 按钮 18 高，一旦加上下
+                                                     margin 就会把这一行从 20 顶到 21，把下面的副标题
+                                                     「夸克网盘直链助手」整行推下去。
+                                                     RenderTransform 只挪渲染，布局尺寸一点不变。 -->
+                                                <Path.RenderTransform>
+                                                    <TranslateTransform X="0" Y="1.5"/>
+                                                </Path.RenderTransform>
+                                            </Path>
+                                        </Button>
+                                    </StackPanel>
+                                    <TextBlock Text="夸克网盘直链助手" FontSize="10.5"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <!-- 导航（ListBox，与 Tabs 用 SelectedIndex 双向同步） -->
+                        <ListBox x:Name="NavList" Grid.Row="1"
+                                 Style="{StaticResource NavListBox}"
+                                 ItemContainerStyle="{StaticResource NavListItem}"
+                                 SelectionChanged="OnNavSelectionChanged"
+                                 Margin="12,4,12,0"
+                                 VerticalAlignment="Top">
+                            <ListBoxItem>
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconDownload}"
+                                          Style="{StaticResource NavItemIcon}"/>
+                                    <TextBlock Text="下载" Style="{StaticResource NavItemText}"/>
+                                </StackPanel>
+                            </ListBoxItem>
+                            <ListBoxItem>
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconActivity}"
+                                          Style="{StaticResource NavItemIcon}"/>
+                                    <TextBlock Text="任务" Style="{StaticResource NavItemText}"/>
+                                </StackPanel>
+                            </ListBoxItem>
+                            <ListBoxItem>
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconSettings}"
+                                          Style="{StaticResource NavItemIcon}"/>
+                                    <TextBlock Text="设置" Style="{StaticResource NavItemText}"/>
+                                </StackPanel>
+                            </ListBoxItem>
+                            <ListBoxItem>
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconUser}"
+                                          Style="{StaticResource NavItemIcon}"/>
+                                    <TextBlock Text="登录" Style="{StaticResource NavItemText}"/>
+                                </StackPanel>
+                            </ListBoxItem>
+                        </ListBox>
+
+                        <!-- ======== 账号卡（左下角）========
+                             对应 code-behind 的 UpdateAccountCard()。
+
+                             ⚠️ 关于"登录前后高度差太大"：
+                             之前未登录态把整块 CapacityBox 设 Collapsed，卡片只有
+                             头像+两行字；登录态多出容量条+用量文字共约 20px，
+                             于是两个状态一高一矮，切换时整张卡会跳。
+                             现在改成：**两种状态结构完全一致、高度恒定**，
+                             未登录时容量条显示为 0 值的灰色空槽 + 一句占位文案。
+                        -->
+                        <!-- 提示区（用户要求「在账号卡片的上方用好看不突兀的方式
+                                 加一句『按住 Shift 可多选文件』」，随后又要求
+                                 「在这个的上方用同样的方式写出文件右键可选择免转存下载」，
+                                 再后来要求「将上方的话放到下面因为它更长一些」，
+                                 并纠正为「我要的是文件右键不是右键文件」）。
+
+                                 → 现在是**两行**提示，都在账号卡上方（短句在上、长句在下）：
+                                   第一行（原有）：按住 Shift → 可多选文件
+                                   第二行（新增）：文件 → 右键 → 可选择免转存下载
+                                 两行共用同一套「键帽 + 说明」语言，字号 11、三级色，
+                                 比账号卡的昵称弱一档 → 是"提示"而不是"告示"，不抢视线。 -->
+                        <StackPanel Grid.Row="2" Margin="15,0,0,7">
+                            <!-- 第一行：按住 Shift 可多选文件（原有，较短句放上面） -->
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="按住" FontSize="11" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                <Border Background="{DynamicResource SurfaceSunkenBrush}"
+                                        BorderBrush="{DynamicResource BorderBrushStrong}"
+                                        BorderThickness="1" CornerRadius="4"
+                                        Padding="5,0" Margin="4,0" MinWidth="34"
+                                        VerticalAlignment="Center">
+                                    <TextBlock Text="Shift" FontSize="10" FontWeight="SemiBold"
+                                               HorizontalAlignment="Center"
+                                               Foreground="{DynamicResource TextSecondaryBrush}"/>
+                                </Border>
+                                <TextBlock Text="可多选文件" FontSize="11" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                            </StackPanel>
+
+                            <!-- 第二行：文件 右键 可选择免转存下载（较长句放下面；读作「文件 · 右键 · …」） -->
+                            <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                <TextBlock Text="文件" FontSize="11" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                <Border Background="{DynamicResource SurfaceSunkenBrush}"
+                                        BorderBrush="{DynamicResource BorderBrushStrong}"
+                                        BorderThickness="1" CornerRadius="4"
+                                        Padding="5,0" Margin="4,0" MinWidth="34"
+                                        VerticalAlignment="Center">
+                                    <TextBlock Text="右键" FontSize="10" FontWeight="SemiBold"
+                                               HorizontalAlignment="Center"
+                                               Foreground="{DynamicResource TextSecondaryBrush}"/>
+                                </Border>
+                                <TextBlock Text="可选择免转存下载" FontSize="11" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <Border x:Name="AccountCard" Grid.Row="3" Margin="12,0,12,12"
+                                Style="{StaticResource MutedCard}" Padding="11"
+                                Cursor="Hand" MouseLeftButtonUp="OnAccountCardClick"
+                                ToolTip="点击进入「登录」页">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <!-- 第 3 列：账号状态刷新按钮（用户要求「在账号卡上加一个小的刷新图标」） -->
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+
+                                    <!-- 头像：优先显示夸克账号的真实头像；拿不到就回退到"昵称首字" -->
+                                    <Border x:Name="AvatarBox" Grid.Column="0"
+                                            Style="{StaticResource AvatarBorder}"
+                                            VerticalAlignment="Center">
+                                        <Grid>
+                                            <TextBlock x:Name="AvatarText" Text="?"
+                                                       FontSize="14" FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource TextOnPrimaryBrush}"
+                                                       HorizontalAlignment="Center"
+                                                       VerticalAlignment="Center"/>
+                                            <!-- ⚠️ Border 不会把子元素裁到圆角里，头像图必须自己裁成圆形，
+                                                 否则方图会盖住圆形边框的角。34×34 → 圆心 (17,17) 半径 17。 -->
+                                            <Image x:Name="AvatarImage" Stretch="UniformToFill"
+                                                   Visibility="Collapsed">
+                                                <Image.Clip>
+                                                    <EllipseGeometry Center="17,17" RadiusX="17" RadiusY="17"/>
+                                                </Image.Clip>
+                                            </Image>
+                                        </Grid>
+                                    </Border>
+
+                                    <StackPanel Grid.Column="1" Margin="10,0,0,0"
+                                                VerticalAlignment="Center">
+                                        <TextBlock x:Name="AccountText" Text="未登录"
+                                                   FontSize="12.5" FontWeight="SemiBold"
+                                                   Foreground="{DynamicResource TextPrimaryBrush}"
+                                                   TextTrimming="CharacterEllipsis"/>
+                                        <TextBlock x:Name="AccountHintText" Text="登录后可浏览网盘"
+                                                   FontSize="10.5" Margin="0,1,0,0"
+                                                   Foreground="{DynamicResource TextTertiaryBrush}"
+                                                   TextTrimming="CharacterEllipsis"/>
+
+                                        <!-- 容量区：两种状态都占位，保证卡片高度恒定 -->
+                                        <StackPanel x:Name="CapacityBox" Margin="0,6,0,0">
+                                            <ProgressBar x:Name="CapacityBar"
+                                                         Style="{StaticResource CapacityBar}"/>
+                                            <TextBlock x:Name="CapacityText" Text=""
+                                                       FontSize="10" Margin="0,4,0,0"
+                                                       Foreground="{DynamicResource TextTertiaryBrush}"
+                                                       TextTrimming="CharacterEllipsis"/>
+                                        </StackPanel>
+                                    </StackPanel>
+
+                                    <!-- 刷新账号状态（重新校验登录 + 拉最新容量）。
+                                         ⚠️ 卡片本身绑了 MouseLeftButtonUp=进登录页，
+                                            所以这里既靠 Button 自己吃掉鼠标事件，
+                                            OnAccountCardClick 里也再挡一道。 -->
+                                    <Button x:Name="AccountRefreshBtn" Grid.Column="2"
+                                            Style="{StaticResource IconGhostButton}"
+                                            VerticalAlignment="Top" Margin="6,0,0,0"
+                                            Click="OnRefreshAccountClick"
+                                            AutomationProperties.Name="刷新账号状态"
+                                            ToolTip="刷新账号状态（昵称 / 容量）">
+                                        <Path Data="{StaticResource IconRefresh}" Stretch="Uniform"
+                                              Width="13" Height="13"
+                                              Stroke="{DynamicResource TextTertiaryBrush}"
+                                              StrokeThickness="1.8"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                              StrokeLineJoin="Round"/>
+                                    </Button>
+                                </Grid>
+                        </Border>
+                    </Grid>
+                </Border>
+
+                <!-- ============ 内容区 ============ -->
+                <TabControl x:Name="Tabs" Grid.Column="1" Style="{StaticResource NavTabControl}">
+
+                <!-- ============ 下载 ============ -->
+                <TabItem Style="{StaticResource HeadlessTabItem}">
+                    <Grid Margin="20,18,20,18">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <!-- 页头 -->
+                        <StackPanel Grid.Row="0" Margin="0,0,0,16">
+                            <TextBlock Text="下载" Style="{StaticResource PageTitleText}"/>
+                            <TextBlock Text="粘贴分享链接解析，或先登录后在「我的网盘」里选择文件"
+                                       Style="{StaticResource TertiaryText}" Margin="0,3,0,0"/>
+                        </StackPanel>
+
+                        <!-- 模式切换：分段控件 -->
+                        <Border Grid.Row="1" HorizontalAlignment="Left" CornerRadius="9"
+                                Background="{DynamicResource SurfaceSunkenBrush}" Padding="3" Margin="0,0,0,12">
+                            <StackPanel Orientation="Horizontal">
+                                <RadioButton x:Name="ShareModeRadio" Content="分享链接"
+                                             Checked="OnModeChanged" Style="{StaticResource SegmentedRadio}"
+                                             Margin="0"/>
+                                <RadioButton x:Name="DriveModeRadio" Content="我的网盘"
+                                             Checked="OnModeChanged" Style="{StaticResource SegmentedRadio}"
+                                             Margin="2,0,0,0"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- 分享面板（卡片）
+                             【2026-10-03 调整】用户反馈「这里做的 ui 总感觉很僵硬，特别是那个解析按钮」。
+                             实测出三处不协调：
+                               ① 输入框高 34px（padding 7 + 边框 1 + 文字 18），
+                                  而主按钮高 32px（padding 7 + 文字 18，无边框）
+                                  → 按钮比输入框**矮 2px**，并排时明显不齐；
+                               ② 提取码框只有 96px 宽，夹在长输入框和按钮之间显得局促；
+                               ③ 提取码标签与按钮前的间距不一致（12/10 混用），节奏乱。
+                             现在统一成：三个控件**同高 34px**、提取码框加宽到 120px、
+                             间距统一 14px，按钮 padding 放宽到 20 让它不像个"方块"。 -->
+                        <Border x:Name="SharePanel" Grid.Row="2" Style="{StaticResource Card}" Margin="0,0,0,12">
+                          <Grid>
+                            <!-- 装饰层：卡片四周的留白太空，点缀一颗星星。
+                                 ① 画在内容**之前**（在下层）→ 控件会盖住它，只在留白处露出来；
+                                 ② IsHitTestVisible=False → 绝不吃点击；
+                                 ③ 透明度压得低（0.30）→ 是水印，不是主体。
+                                 ⚠️ Margin="-18" 是**必须**的：卡片 Padding=18，装饰层若只铺
+                                 内容区，那一行控件（输入框+提取码+解析按钮）会把它整片盖住
+                                 —— 用户反馈「解析按钮右边看不到星星」就是这个原因。
+                                 ⚠️ 右边那两颗**已挪到解析按钮上**（见下面 ParseBtn 外层 Grid）：
+                                     「解析」按钮右边缘 == 卡片内容区右边缘，星星放在右边那条
+                                     18px 留白带里，会被按钮切掉一大块，看起来像"碎掉的星星"。
+                                     用户原话：「这个位置的星星我是让放你这个位置的放在按钮」。 -->
+                            <Grid IsHitTestVisible="False" Margin="-18">
+                                <Path Data="{StaticResource IconSparkle}"
+                                      Fill="{DynamicResource PrimaryBrush}"
+                                      Opacity="0.30"
+                                      Width="11" Height="11" Stretch="Uniform"
+                                      HorizontalAlignment="Left" VerticalAlignment="Bottom"
+                                      Margin="14,0,0,3"/>
+                            </Grid>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="分享链接" VerticalAlignment="Center" Margin="0,0,10,0"
+                                           Style="{StaticResource BodyText}"/>
+                                <!-- ⚠️ 高度必须是 42，不能是 34 —— 这是实测出来的下限。
+                                     AppTextBox 的模板把 Padding(10,7) 当作 ScrollViewer 的 Margin，
+                                     再加上 1px 边框，内容区需要约 26px 才放得下一行字。
+                                     34 时内容区只剩 18px → **文字和光标被裁成一条细缝**
+                                     （用户反馈「光标怎么这么小了我输入文字也看不见了」）。
+                                     离屏渲染逐档实测：34/36/38/40 都裁，**42 起完整显示**。
+                                     【2026-10-03 追根】真正的病根已找到并修掉：模板把
+                                     Padding 用了两遍（WPF 的 TextBoxView 自己也会按 Padding
+                                     缩进），天然高度因此虚高到 46.5。修完天然高度 32.5，
+                                     34 也不再裁字。这里仍保留 42，是为了和提取码框、解析
+                                     按钮同高（视觉上一排整齐），不是为了躲裁切。 -->
+                                <Grid Grid.Column="1">
+                                    <TextBox x:Name="LinkBox" Style="{StaticResource AppTextBox}"
+                                             Height="42"
+                                             Padding="10,7,58,7"
+                                             AutomationProperties.Name="分享链接输入框"
+                                             DataObject.Pasting="OnLinkBoxPasting"
+                                             ToolTip="支持含提取码的完整链接，也可只粘贴链接再单独填提取码"/>
+                                    <!-- 【2026-10-04】扫码识别：夸克分享有时只给二维码图片、不给链接。
+                                         贴在输入框右侧内缘、清空按钮的左边（所以 Padding 右内边距从 34 加到 58）。
+                                         点击后弹出取图方式（粘贴剪贴板 / 选文件 / 拖拽），解出的文本自动填进本框。
+                                         ⚠️ 必须排在 LinkClearBtn **之前**，否则会盖住清空按钮的命中区。 -->
+                                    <Button x:Name="ScanQrBtn" Click="OnScanQrClick"
+                                            HorizontalAlignment="Right" VerticalAlignment="Center"
+                                            Margin="0,0,30,0" Width="22" Height="22"
+                                            Cursor="Hand" Focusable="False"
+                                            AutomationProperties.Name="识别二维码"
+                                            ToolTip="识别二维码：把夸克分享二维码图片识别成链接（也可直接 Ctrl+V 粘贴截图）">
+                                        <Button.Style>
+                                            <Style TargetType="Button">
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="Button">
+                                                            <Border x:Name="Bd" Background="Transparent"
+                                                                    CornerRadius="5">
+                                                                <Path Data="{StaticResource IconScan}"
+                                                                      Stretch="Uniform" Width="13" Height="13"
+                                                                      HorizontalAlignment="Center"
+                                                                      VerticalAlignment="Center"
+                                                                      Stroke="{DynamicResource TextTertiaryBrush}"
+                                                                      StrokeThickness="1.8"
+                                                                      StrokeStartLineCap="Round"
+                                                                      StrokeEndLineCap="Round"
+                                                                      StrokeLineJoin="Round"/>
+                                                            </Border>
+                                                            <ControlTemplate.Triggers>
+                                                                <Trigger Property="IsMouseOver" Value="True">
+                                                                    <Setter TargetName="Bd" Property="Background"
+                                                                            Value="{DynamicResource SurfaceAltBrush}"/>
+                                                                    <Setter TargetName="Bd" Property="Opacity" Value="1"/>
+                                                                </Trigger>
+                                                            </ControlTemplate.Triggers>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                                <!-- 常年可见：这是功能入口，不能像清空按钮那样空着就藏起来 -->
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                                <Setter Property="Opacity" Value="0.85"/>
+                                            </Style>
+                                        </Button.Style>
+                                    </Button>
+                                    <!-- 一键清空：贴在输入框右侧内缘。
+                                         只在有内容时出现（空的时候显示一个点了没反应的叉很别扭）。 -->
+                                    <Button x:Name="LinkClearBtn" Click="OnClearLinkBox"
+                                            HorizontalAlignment="Right" VerticalAlignment="Center"
+                                            Margin="0,0,6,0" Width="22" Height="22"
+                                            Cursor="Hand" Focusable="False"
+                                            ToolTip="清空">
+                                        <Button.Style>
+                                            <Style TargetType="Button">
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="Button">
+                                                            <Border x:Name="Bd" Background="Transparent"
+                                                                    CornerRadius="5">
+                                                                <Path Data="{StaticResource IconClose}"
+                                                                      Stretch="Uniform" Width="9" Height="9"
+                                                                      HorizontalAlignment="Center"
+                                                                      VerticalAlignment="Center"
+                                                                      Stroke="{DynamicResource TextTertiaryBrush}"
+                                                                      StrokeThickness="1.8"
+                                                                      StrokeStartLineCap="Round"
+                                                                      StrokeEndLineCap="Round"/>
+                                                            </Border>
+                                                            <ControlTemplate.Triggers>
+                                                                <Trigger Property="IsMouseOver" Value="True">
+                                                                    <Setter TargetName="Bd" Property="Background"
+                                                                            Value="{DynamicResource SurfaceAltBrush}"/>
+                                                                </Trigger>
+                                                            </ControlTemplate.Triggers>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                                <Style.Triggers>
+                                                    <!-- 输入框为空 → 收起（避免点了没反应的死按钮） -->
+                                                    <DataTrigger Binding="{Binding Text, ElementName=LinkBox}" Value="">
+                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </Button.Style>
+                                    </Button>
+                                </Grid>
+                                <TextBlock Text="提取码" Grid.Column="2" VerticalAlignment="Center"
+                                           Margin="14,0,10,0" Style="{StaticResource BodyText}"/>
+                                <TextBox x:Name="PassBox" Grid.Column="3" Width="120" Height="42"
+                                         AutomationProperties.Name="提取码输入框"
+                                         Style="{StaticResource AppTextBox}"/>
+                                <!-- 「解析」按钮 + 按钮**表面**的装饰星星。
+                                     ⚠️ 星星必须画在 Button **之后**（同层 Grid 里后添加的在上层），
+                                        这样才是"印在按钮上"；画在之前会被按钮整块盖住。
+                                        用白色 + 低透明度：主按钮是蓝底，白星才看得见。
+                                        用户明确要求：「这个位置的星星我是让放你这个位置的放在按钮」。 -->
+                                <Grid Grid.Column="4" Margin="14,0,0,0">
+                                    <Button x:Name="ParseBtn" Content="解析"
+                                            Click="OnParseClick"
+                                            Height="42" Padding="20,0" VerticalAlignment="Center"
+                                            Style="{StaticResource PrimaryButton}"/>
+                                    <Grid IsHitTestVisible="False">
+                                        <Path Data="{StaticResource IconSparkle}"
+                                              Fill="White"
+                                              Opacity="0.55"
+                                              Width="12" Height="12" Stretch="Uniform"
+                                              HorizontalAlignment="Right" VerticalAlignment="Top"
+                                              Margin="0,5,7,0"/>
+                                        <Path Data="{StaticResource IconSparkle}"
+                                              Fill="White"
+                                              Opacity="0.38"
+                                              Width="9" Height="9" Stretch="Uniform"
+                                              HorizontalAlignment="Left" VerticalAlignment="Bottom"
+                                              Margin="8,0,0,6"/>
+                                    </Grid>
+                                </Grid>
+                            </Grid>
+                          </Grid>
+                        </Border>
+
+                        <!-- 目录导航（分享/网盘通用） -->
+                        <Grid x:Name="DrivePanel" Grid.Row="3" Margin="0,0,0,10">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <!--
+                                    ⚠️ 这里必须是 *，不能是 Auto。
+                                    Auto 会让文件列表区"有多高算多高"，列表为空时
+                                    只剩空状态那一小条，下面留一大片死白（用户截图反馈）。
+                                    * 让它吃掉剩余空间，空状态也能在正中间居中。
+                                -->
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <Grid Grid.Row="0" Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                    <Path Data="{StaticResource IconFolder}" Stretch="Uniform" Width="15"
+                                          Height="15" Stroke="{DynamicResource TextTertiaryBrush}"
+                                          StrokeThickness="1.8" VerticalAlignment="Center"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                          StrokeLineJoin="Round"/>
+                                    <TextBlock x:Name="DrivePathText" Grid.Column="1" Text="根目录"
+                                               VerticalAlignment="Center" Margin="8,0,0,0"
+                                               Style="{StaticResource SecondaryText}"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <Border CornerRadius="8" Background="{DynamicResource SurfaceBrush}"
+                                            BorderBrush="{DynamicResource BorderBrushStrong}"
+                                            BorderThickness="1" Height="32" Width="190" Margin="0,0,8,0">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <Path Grid.Column="0" Data="{StaticResource IconSearch}"
+                                                  Stretch="Uniform" Width="13" Height="13" Margin="9,0,0,0"
+                                                  VerticalAlignment="Center"
+                                                  Stroke="{DynamicResource TextTertiaryBrush}"
+                                                  StrokeThickness="2"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                            <TextBox x:Name="FileFilterBox" Grid.Column="1"
+                                                     TextChanged="OnFileFilterChanged" BorderThickness="0"
+                                                     Background="Transparent" Padding="6,0,7,0"
+                                                     VerticalContentAlignment="Center"
+                                                     FontSize="12.5"
+                                                     CaretBrush="{DynamicResource PrimaryBrush}"
+                                                     ToolTip="按名称筛选当前目录的文件/文件夹"/>
+                                        </Grid>
+                                    </Border>
+                                    <Button x:Name="DriveUpBtn" Click="OnUp" Style="{StaticResource ToolButton}"
+                                            ToolTip="返回上级目录">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Path Data="{StaticResource IconArrowUp}" Stretch="Uniform"
+                                                  Width="13" Height="13" VerticalAlignment="Center"
+                                                  Stroke="{DynamicResource TextSecondaryBrush}"
+                                                  StrokeThickness="2"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                  StrokeLineJoin="Round"/>
+                                            <TextBlock Text="上级" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                    <Button x:Name="DriveRefreshBtn" Click="OnRefresh"
+                                            Style="{StaticResource ToolButton}" Margin="0">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Path Data="{StaticResource IconRefresh}" Stretch="Uniform"
+                                                  Width="13" Height="13" VerticalAlignment="Center"
+                                                  Stroke="{DynamicResource TextSecondaryBrush}"
+                                                  StrokeThickness="2"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                            <TextBlock Text="刷新" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                </StackPanel>
+                            </Grid>
+
+                            <!-- 文件列表 -->
+                            <Border Grid.Row="1" Style="{StaticResource Card}" Padding="0">
+                                <Grid>
+                                    <!-- ⚠️ SelectionMode=Extended 本来 Shift+点击 = **连选**（整段区间）。
+                                         用户要求「可以使用 shift 多选，但不是连选」——
+                                         即 Shift+点击只切换**这一个**项的选中态。
+                                         做法见 OnListPreviewMouseDown（拦下 Shift 点击自己处理）。 -->
+                                    <ListBox x:Name="FileList" SelectionMode="Extended"
+                                             Style="{StaticResource PlainListBox}"
+                                             ItemContainerStyle="{StaticResource FileListItem}"
+                                             PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
+                                             MouseRightButtonUp="OnFileListRightClick"
+                                             MouseDoubleClick="OnFileListDoubleClick">
+                                        <ListBox.ContextMenu>
+                                            <ContextMenu>
+                                                <MenuItem Header="下载选中" Click="OnDownloadSelected"/>
+                                                <!-- 【2026-10-03 新增】免转存下载：不往自己网盘写中转文件，
+                                                     直接从分享取链。登录状态下默认走「转存→取直链」，
+                                                     所以需要这个显式入口。只在分享模式有意义，
+                                                     由 OnFileListRightClick 按模式控制可见性。
+                                                     【2026-10-06】括号内容改为「无法续传」——
+                                                     免转存取链依赖分享的 stoken，而续传时**不会重新换 stoken**
+                                                     （全代码只在解析时取一次），stoken 过期就取不到新链，
+                                                     中途断了只能重新解析分享、从头再来。必须让用户在点之前就知道。 -->
+                                                <MenuItem x:Name="NoSaveDownloadMenuItem"
+                                                          Header="免转存下载（无法续传）"
+                                                          ToolTip="不往自己网盘写中转文件，省网盘空间。&#x0a;但中断后无法续传 —— 分享凭证过期就取不到新链，只能重新解析分享从头下。"
+                                                          Click="OnDownloadSelectedNoSave"/>
+                                                <MenuItem Header="获取直链…" Click="OnFetchLinks"/>
+                                                <Separator Style="{StaticResource MenuSeparator}"/>
+                                                <MenuItem Header="全选" Click="OnFileListSelectAll"/>
+                                                <Separator Style="{StaticResource MenuSeparator}"/>
+                                                <MenuItem Header="删除网盘文件…（仅我的网盘）" Click="OnDeleteCloudSelected"/>
+                                                <!-- 【2026-10-03】原「创建分享链接…」已删 —— 用户反馈「没有用」。
+                                                     连处理函数 OnCreateShareSelected 一并删除，不留死代码。 -->
+                                            </ContextMenu>
+                                        </ListBox.ContextMenu>
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <!-- 目录/文件图标 -->
+                                                    <Path Grid.Column="0" Stretch="Uniform" Width="16" Height="16"
+                                                          VerticalAlignment="Center" Margin="0,0,10,0"
+                                                          StrokeThickness="1.8"
+                                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                          StrokeLineJoin="Round">
+                                                        <Path.Style>
+                                                            <Style TargetType="Path">
+                                                                <Setter Property="Data"
+                                                                        Value="{StaticResource IconFile}"/>
+                                                                <Setter Property="Stroke"
+                                                                        Value="{DynamicResource TextTertiaryBrush}"/>
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding IsDir}" Value="True">
+                                                                        <Setter Property="Data"
+                                                                                Value="{StaticResource IconFolder}"/>
+                                                                        <Setter Property="Stroke"
+                                                                                Value="{DynamicResource WarningBrush}"/>
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </Path.Style>
+                                                    </Path>
+                                                    <TextBlock Grid.Column="1" Text="{Binding Name}"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               VerticalAlignment="Center" Margin="0,0,16,0"
+                                                               Style="{StaticResource BodyText}"/>
+                                                    <TextBlock Grid.Column="2" Text="{Binding SizeText}"
+                                                               VerticalAlignment="Center"
+                                                               Style="{StaticResource TertiaryText}"/>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+
+                                    <!-- ===== 非内容状态：三态互斥（加载中 / 空 / 有内容） =====
+                                         之前只有"空"一种，加载目录的几百毫秒里空状态会跳出来
+                                         喊"还没有内容"，误导用户。现在拆开，由
+                                         code-behind 的 UpdateFileStates() 统一裁决可见性。 -->
+
+                                    <!-- 加载中 -->
+                                    <StackPanel x:Name="FileLoadingState" IsHitTestVisible="False"
+                                                HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                Visibility="Collapsed">
+                                        <Path Data="{StaticResource IconSpinner}"
+                                              Style="{StaticResource LoadingSpinner}"
+                                              HorizontalAlignment="Center">
+                                            <Path.RenderTransform>
+                                                <RotateTransform Angle="0"/>
+                                            </Path.RenderTransform>
+                                            <Path.Triggers>
+                                                <EventTrigger RoutedEvent="Path.Loaded">
+                                                    <BeginStoryboard>
+                                                        <Storyboard RepeatBehavior="Forever">
+                                                            <DoubleAnimation
+                                                                Storyboard.TargetProperty="(UIElement.RenderTransform).(RotateTransform.Angle)"
+                                                                From="0" To="360" Duration="0:0:0.9"/>
+                                                        </Storyboard>
+                                                    </BeginStoryboard>
+                                                </EventTrigger>
+                                            </Path.Triggers>
+                                        </Path>
+                                        <TextBlock Text="正在加载…" Margin="0,10,0,0"
+                                                   HorizontalAlignment="Center"
+                                                   Style="{StaticResource TertiaryText}"/>
+                                    </StackPanel>
+
+                                    <!-- 空 -->
+                                    <StackPanel x:Name="FileEmptyState" IsHitTestVisible="False"
+                                                HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                Visibility="Collapsed">
+                                        <!-- 【2026-10-03】图标按用户指定从「收纳盒」换成「云+斜杠」，
+                                             颜色与描边粗细保持不变（用户原话「颜色不变只改图标样式」）。 -->
+                                        <Path Data="{StaticResource IconCloudOff}" Stretch="Uniform" Width="40"
+                                              Height="40" HorizontalAlignment="Center"
+                                              Stroke="{DynamicResource BorderBrushStrong}" StrokeThickness="1.5"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                              StrokeLineJoin="Round"/>
+                                        <TextBlock x:Name="FileEmptyText" Text="还没有内容"
+                                                   Margin="0,10,0,0" HorizontalAlignment="Center"
+                                                   Style="{StaticResource TertiaryText}"/>
+                                        <TextBlock Text="粘贴分享链接解析，或切到「我的网盘」选择文件"
+                                                   Margin="0,4,0,0" HorizontalAlignment="Center"
+                                                   Style="{StaticResource TertiaryText}" FontSize="11"/>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </Grid>
+
+                        <!-- 操作按钮 -->
+                        <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,12,0,0">
+                            <Button x:Name="DownloadSelBtn" Click="OnDownloadSelected"
+                                    Style="{StaticResource PrimaryButton}" Margin="0,0,8,0">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconDownload}" Stretch="Uniform" Width="14"
+                                          Height="14" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextOnPrimaryBrush}" StrokeThickness="2"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                          StrokeLineJoin="Round"/>
+                                    <TextBlock Text="下载选中" Margin="7,0,0,0" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                            <Button x:Name="DownloadAllBtn" Click="OnDownloadAll"
+                                    Style="{StaticResource SecondaryButton}" Margin="0,0,8,0">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconDownload}" Stretch="Uniform" Width="14"
+                                          Height="14" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.9"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                          StrokeLineJoin="Round"/>
+                                    <TextBlock Text="下载全部" Margin="7,0,0,0" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                            <Button x:Name="FetchLinksBtn" Click="OnFetchLinks"
+                                    Style="{StaticResource SecondaryButton}">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconLink}" Stretch="Uniform" Width="14"
+                                          Height="14" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.9"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                          StrokeLineJoin="Round"/>
+                                    <TextBlock Text="获取直链" Margin="7,0,0,0" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                            <!-- 【用户要求】「标红的是后方括号内的字」——
+                                 curl / aria2c / Motrix 界面 三种格式会把**登录凭证（UA + Cookie）**一起写进
+                                 导出文件，属于敏感内容 → 红色标在**括号里的说明文字**上
+                                 （「（后三者自带 UA 与 Cookie）」），而不是命令名本身。 -->
+                            <TextBlock VerticalAlignment="Center" Margin="12,0,0,0"
+                                       Style="{StaticResource TertiaryText}">
+                                <Run Text="获取直链后可导出为 纯直链 / curl 命令 / aria2c 命令 / Motrix 界面 "/><Run
+                                    Text="（后三者自带 UA 与 Cookie）"
+                                    Foreground="{DynamicResource DangerBrush}"/>
+                            </TextBlock>
+                        </StackPanel>
+                    </Grid>
+                </TabItem>
+
+                <!-- ============ 任务 ============ -->
+                <TabItem Style="{StaticResource HeadlessTabItem}">
+                    <Grid Margin="20,18,20,18">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <StackPanel Grid.Row="0" Margin="0,0,0,14">
+                            <TextBlock Text="任务" Style="{StaticResource PageTitleText}"/>
+                            <!-- 副标题一行：左边是操作说明（原有），右边小字补一句
+                                 「文件需下载部分才可播放」（用户要求「在这个的右边，
+                                 用美观的方式增加一行小字」）。
+                                 用一条同色系极淡的竖分隔符「·」隔开，字号 11 比说明再弱一档，
+                                 做到"补充说明"而不是并列信息。 -->
+                            <StackPanel Orientation="Horizontal" Margin="0,3,0,0">
+                                <TextBlock Text="右键任务行可单独暂停 / 恢复 / 取消 / 删除本地文件"
+                                           Style="{StaticResource TertiaryText}"/>
+                                <TextBlock Text="·" Margin="7,0"
+                                           FontSize="11" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"
+                                           Opacity="0.6"/>
+                                <TextBlock Text="文件需下载部分才可播放"
+                                           FontSize="11" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"
+                                           Opacity="0.85"/>
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,12">
+                            <!-- 【2026-10-03】「暂停全部 / 恢复全部」合并成一个按钮：
+                                 图标与文案按当前任务状态自动切换（有在跑的就显示"暂停全部"，
+                                 否则显示"恢复全部"），由 UpdatePauseAllButton() 在代码里维护。
+                                 「取消全部」按钮按用户要求移除 —— 单个任务的「取消」仍在右键菜单里。 -->
+                            <Button x:Name="PauseAllBtn" Click="OnPauseAllOrResume"
+                                    Style="{StaticResource ToolButton}"/>
+                            <Button x:Name="ClearDoneBtn" Content="清空已完成" Click="OnClearDone"
+                                    Style="{StaticResource ToolButton}"/>
+                            <Button x:Name="HistoryBtn" Click="OnOpenHistory" Style="{StaticResource ToolButton}">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconHistory}" Stretch="Uniform" Width="12"
+                                          Height="12" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                    <TextBlock Text="下载历史" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                            <Button x:Name="DiagBtn" Click="OnOpenDiagnostics" Style="{StaticResource ToolButton}">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconDiagnostics}" Stretch="Uniform" Width="12"
+                                          Height="12" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                    <TextBlock Text="诊断面板" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                            <!-- 【2026-10-03 新增】用户要求任务页也能直接打开下载目录（原来只有设置页有） -->
+                            <Button x:Name="OpenTaskDirBtn" Click="OnOpenOutDir" Style="{StaticResource ToolButton}"
+                                    Margin="0" ToolTip="在资源管理器中打开下载目录">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconFolder}" Stretch="Uniform" Width="12"
+                                          Height="12" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                          StrokeLineJoin="Round"/>
+                                    <TextBlock Text="打开下载目录" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                        </StackPanel>
+
+                        <Grid Grid.Row="2">
+                            <!-- 任务列表原来是默认的 SelectionMode=Single（根本多选不了），
+                                 改成 Extended + 同一套 Shift 处理，和文件列表行为一致。 -->
+                            <ListBox x:Name="TaskList" SelectionMode="Extended"
+                                     Style="{StaticResource PlainListBox}"
+                                     ItemContainerStyle="{StaticResource TaskListItem}"
+                                     PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
+                                     MouseRightButtonUp="OnTaskListRightClick"
+                                     MouseDoubleClick="OnTaskListDoubleClick">
+                                <ListBox.ContextMenu>
+                                    <ContextMenu>
+                                        <MenuItem Header="暂停" Click="OnTaskPause"/>
+                                        <MenuItem Header="恢复" Click="OnTaskResume"/>
+                                        <MenuItem Header="取消" Click="OnTaskCancel"/>
+                                        <Separator Style="{StaticResource MenuSeparator}"/>
+                                        <MenuItem Header="播放文件" Click="OnOpenTaskFile"/>
+                                        <MenuItem Header="在资源管理器中定位" Click="OnLocateTaskFile"/>
+                                        <Separator Style="{StaticResource MenuSeparator}"/>
+                                        <MenuItem Header="删除本地文件…" Click="OnTaskDeleteLocal"/>
+                                        <MenuItem Header="仅移除记录" Click="OnTaskRemoveRecord"/>
+                                    </ContextMenu>
+                                </ListBox.ContextMenu>
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid>
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto"/>
+                                                <RowDefinition Height="Auto"/>
+                                            </Grid.RowDefinitions>
+                                            <Grid Grid.Row="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel Grid.Column="0" Orientation="Horizontal"
+                                                            VerticalAlignment="Center">
+                                                    <Ellipse Width="7" Height="7" VerticalAlignment="Center"
+                                                             Margin="0,0,9,0">
+                                                        <Ellipse.Style>
+                                                            <Style TargetType="Ellipse">
+                                                                <Setter Property="Fill"
+                                                                        Value="{DynamicResource TextTertiaryBrush}"/>
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding State}"
+                                                                                 Value="Downloading">
+                                                                        <Setter Property="Fill"
+                                                                                Value="{DynamicResource PrimaryBrush}"/>
+                                                                    </DataTrigger>
+                                                                    <DataTrigger Binding="{Binding State}"
+                                                                                 Value="Completed">
+                                                                        <Setter Property="Fill"
+                                                                                Value="{DynamicResource SuccessBrush}"/>
+                                                                    </DataTrigger>
+                                                                    <DataTrigger Binding="{Binding State}"
+                                                                                 Value="Failed">
+                                                                        <Setter Property="Fill"
+                                                                                Value="{DynamicResource DangerBrush}"/>
+                                                                    </DataTrigger>
+                                                                    <DataTrigger Binding="{Binding State}"
+                                                                                 Value="Paused">
+                                                                        <Setter Property="Fill"
+                                                                                Value="{DynamicResource WarningBrush}"/>
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </Ellipse.Style>
+                                                    </Ellipse>
+                                                    <TextBlock Text="{Binding Name}"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               FontWeight="SemiBold"
+                                                               Style="{StaticResource BodyText}"
+                                                               VerticalAlignment="Center"/>
+                                                </StackPanel>
+                                                <TextBlock Grid.Column="1" Text="{Binding DetailText}"
+                                                           Margin="10,0,0,0" TextWrapping="Wrap" MaxWidth="380"
+                                                           VerticalAlignment="Center"
+                                                           Style="{StaticResource SecondaryText}"/>
+                                                <!-- 行内「播放/暂停」切换按钮（纯图标，图标随状态互换）。
+                                                     控制的是**这个下载任务**的暂停/恢复，
+                                                     不是控制外部播放器（那做不到）。 -->
+                                                <Button Grid.Column="2" Click="OnTaskTogglePause"
+                                                        Tag="{Binding}" Style="{StaticResource TaskPauseButton}"
+                                                        Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                                <!-- 「播放」= 交给系统默认程序打开（装了 VLC 就用 VLC）。
+                                                     【2026-10-03】按用户要求：只有**能播**的时候才显示这个按钮
+                                                     （见 TaskItem.CanPlay）——
+                                                       · 独立分片+边合并 → 目标文件从 0 连续增长，未下完也能边下边播 ✓
+                                                       · 共写同一文件 → 预分配的满尺寸空洞文件，播放器打不开 ✗
+                                                       · 已完成 → 文件完整，两种模式都能播 ✓
+                                                     不能播时整个按钮收起（Collapsed），不留一个点了没用的入口。 -->
+                                                <Button Grid.Column="3" Content="播放" Click="OnOpenTaskFile"
+                                                        Tag="{Binding}" Margin="4,0,0,0" VerticalAlignment="Center"
+                                                        ToolTip="用系统默认程序打开播放。">
+                                                    <Button.Style>
+                                                        <Style TargetType="Button" BasedOn="{StaticResource GhostButton}">
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding CanPlay}" Value="False">
+                                                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </Button.Style>
+                                                </Button>
+                                                <Button Grid.Column="4" Content="定位" Click="OnLocateTaskFile"
+                                                        Tag="{Binding}" Style="{StaticResource GhostButton}"
+                                                        Margin="2,0,0,0" VerticalAlignment="Center"
+                                                        ToolTip="在资源管理器中选中该文件。"/>
+                                            </Grid>
+                                            <Grid Grid.Row="1" Margin="16,8,0,0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <ProgressBar Style="{StaticResource SlimProgressBar}"
+                                                             Value="{Binding Percent}"
+                                                             VerticalAlignment="Center"/>
+                                                <TextBlock Grid.Column="1" Text="{Binding SpeedText}"
+                                                           Margin="12,0,0,0" FontWeight="SemiBold"
+                                                           VerticalAlignment="Center" MinWidth="72"
+                                                           Foreground="{DynamicResource PrimaryBrush}"
+                                                           Style="{StaticResource NumericText}"/>
+                                                <TextBlock Grid.Column="2" Text="{Binding DoneText}"
+                                                           Margin="12,0,0,0" VerticalAlignment="Center"
+                                                           Style="{StaticResource TertiaryText}"/>
+                                                <TextBlock Grid.Column="3" Text="{Binding PercentText}"
+                                                           Margin="12,0,0,0" VerticalAlignment="Center"
+                                                           MinWidth="48" TextAlignment="Right"
+                                                           Style="{StaticResource NumericText}"/>
+                                            </Grid>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+
+                            <StackPanel x:Name="TaskEmptyState" IsHitTestVisible="False"
+                                        HorizontalAlignment="Center" VerticalAlignment="Center"
+                                        Visibility="Visible">
+                                <Path Data="{StaticResource IconActivity}" Stretch="Uniform" Width="40"
+                                      Height="40" HorizontalAlignment="Center"
+                                      Stroke="{DynamicResource BorderBrushStrong}" StrokeThickness="1.5"
+                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                      StrokeLineJoin="Round"/>
+                                <TextBlock Text="暂无下载任务" Margin="0,10,0,0" HorizontalAlignment="Center"
+                                           Style="{StaticResource TertiaryText}"/>
+                                <TextBlock Text="在「下载」页解析链接并选择文件后，任务会出现在这里"
+                                           Margin="0,4,0,0" HorizontalAlignment="Center"
+                                           Style="{StaticResource TertiaryText}" FontSize="11"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- 运行日志（从「下载」页迁来：日志讲的是任务跑得怎么样，放任务页更贴）
+                             高度固定 132px，不出内容时也占位，避免切换任务多寡时整页跳动。 -->
+                        <Grid Grid.Row="3" Margin="0,14,0,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="132"/>
+                            </Grid.RowDefinitions>
+                            <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,6">
+                                <TextBlock Text="运行日志" Style="{StaticResource SectionLabel}"
+                                           Margin="0"/>
+                                <TextBlock Text="下载 / 解析 / 报错都会打在这里" Margin="8,0,0,0"
+                                           FontSize="11" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                            </StackPanel>
+                            <TextBox x:Name="LogBox" Grid.Row="1" Style="{StaticResource LogTextBox}"/>
+                        </Grid>
+                    </Grid>
+                </TabItem>
+
+                <!-- ============ 设置 ============ -->
+                <TabItem Style="{StaticResource HeadlessTabItem}">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0">
+                        <StackPanel Margin="20,18,20,24" MaxWidth="900" HorizontalAlignment="Left">
+
+                            <TextBlock Text="设置" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
+                            <TextBlock Text="所有改动即时生效，无需保存"
+                                       Style="{StaticResource TertiaryText}" Margin="0,0,0,18"/>
+
+                            <!-- ========== 外观：个性化（2026-10-04 新增） ==========
+                                 放最上方：换主题是"一眼就想试"的设置，用户一进设置页就能看到。
+                                 三选一分段控件，与下载页「分享/我的网盘」同一个 SegmentedRadio 样式，
+                                 视觉一致。切换即时生效（ThemeManager 原位替换 Colors 字典）。 -->
+                            <Border Style="{StaticResource PrimaryCard}" Margin="0,0,0,18">
+                                <StackPanel>
+                                    <TextBlock Text="个性化" Style="{StaticResource CardTitleText}"
+                                               FontSize="15" Margin="0,0,0,4"/>
+                                    <TextBlock Text="界面外观。切换后立即生效"
+                                               Style="{StaticResource TertiaryText}" Margin="0,0,0,14"/>
+
+                                    <Border HorizontalAlignment="Left" CornerRadius="9"
+                                            Background="{DynamicResource SurfaceSunkenBrush}"
+                                            Padding="3">
+                                        <StackPanel Orientation="Horizontal">
+                                            <RadioButton x:Name="ThemeLightRadio" Content="浅色"
+                                                         GroupName="AppTheme"
+                                                         Checked="OnThemeChanged"
+                                                         Style="{StaticResource SegmentedRadio}"
+                                                         AutomationProperties.Name="浅色主题"
+                                                         Margin="0"/>
+                                            <RadioButton x:Name="ThemeDarkRadio" Content="深色"
+                                                         GroupName="AppTheme"
+                                                         Checked="OnThemeChanged"
+                                                         Style="{StaticResource SegmentedRadio}"
+                                                         AutomationProperties.Name="深色主题"
+                                                         Margin="2,0,0,0"/>
+                                            <RadioButton x:Name="ThemeSystemRadio" Content="跟随系统"
+                                                         GroupName="AppTheme"
+                                                         Checked="OnThemeChanged"
+                                                         Style="{StaticResource SegmentedRadio}"
+                                                         AutomationProperties.Name="跟随系统主题"
+                                                         Margin="2,0,0,0"/>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- 说明行：跟随系统时要让用户看懂"为什么我没选它却变了" -->
+                                    <TextBlock x:Name="ThemeHintText"
+                                               Style="{StaticResource TertiaryText}"
+                                               TextWrapping="Wrap"
+                                               Margin="0,10,0,0"
+                                               Text="跟随系统时，Windows 切换深色/浅色，本程序会自动跟着变。"/>
+
+                                    <!-- 主题版预览（三张小色块）：让用户不用切来切去也能看到效果 -->
+                                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                                        <Border x:Name="ThemeSwatchBg" Width="34" Height="22" CornerRadius="5"
+                                                Background="{DynamicResource AppBgBrush}"
+                                                BorderBrush="{DynamicResource BorderBrushSoft}"
+                                                BorderThickness="1"/>
+                                        <Border x:Name="ThemeSwatchSurface" Width="34" Height="22" CornerRadius="5"
+                                                Margin="6,0,0,0"
+                                                Background="{DynamicResource SurfaceBrush}"
+                                                BorderBrush="{DynamicResource BorderBrushSoft}"
+                                                BorderThickness="1"/>
+                                        <Border x:Name="ThemeSwatchPrimary" Width="34" Height="22" CornerRadius="5"
+                                                Margin="6,0,0,0"
+                                                Background="{DynamicResource PrimaryBrush}"/>
+                                        <TextBlock Text="当前配色的底色、卡片色、主色"
+                                                   Style="{StaticResource TertiaryText}"
+                                                   VerticalAlignment="Center" Margin="10,0,0,0"/>
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- ========== 主卡：下载与网络（最常用，视觉最重） ========== -->
+                            <Border Style="{StaticResource PrimaryCard}" Margin="0,0,0,18">
+                                <StackPanel>
+                                    <TextBlock Text="下载与网络" Style="{StaticResource CardTitleText}"
+                                               FontSize="15" Margin="0,0,0,4"/>
+                                    <TextBlock Text="决定下载速度与磁盘占用，日常只会改这里"
+                                               Style="{StaticResource TertiaryText}" Margin="0,0,0,18"/>
+
+                                    <TextBlock Text="并发与任务" Style="{StaticResource SectionLabel}"/>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="单文件并发连接数" Style="{StaticResource FieldLabel}"/>
+                                        <ComboBox x:Name="ThreadsBox" Grid.Column="1" MaxWidth="340"
+                                                  HorizontalAlignment="Left"
+                                                  Style="{StaticResource AppComboBox}"
+                                                  ItemContainerStyle="{StaticResource AppComboBoxItem}"
+                                                  SelectionChanged="OnSettingChanged">
+                                            <ComboBoxItem Content="16  — 省网保守"/>
+                                            <ComboBoxItem Content="32  — 保守，够用"/>
+                                            <!-- 【2026-10-03】用户要求「默认线程调为 64」——
+                                                 Settings.Threads 的默认值本来就是 64，这里把下拉项
+                                                 的标注也改成"默认"，避免"标注写 32 是默认、代码却是 64"的错位。 -->
+                                            <ComboBoxItem Content="64  — 默认，跑满多数家宽"/>
+                                            <ComboBoxItem Content="128 — 激进，大文件更快"/>
+                                            <ComboBoxItem Content="256 — 很激进"/>
+                                            <ComboBoxItem Content="512 — 上限，需路由器支持"/>
+                                        </ComboBox>
+                                    </Grid>
+
+                                    <Grid Margin="0,0,0,16">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="同时下载任务数" Style="{StaticResource FieldLabel}"/>
+                                        <TextBox x:Name="ConcurrentBox" Grid.Column="1" MaxWidth="120"
+                                                 HorizontalAlignment="Left"
+                                                 Style="{StaticResource AppTextBox}"
+                                                 LostFocus="OnSettingChanged"
+                                                 KeyDown="OnSettingKeyDown"/>
+                                    </Grid>
+
+                                    <TextBlock Text="窗口与后台" Style="{StaticResource SectionLabel}"/>
+                                    <!-- 【2026-10-03 新增】关闭按钮行为 + 悬浮小窗入口。
+                                         用户要求：第一次点 × 时询问「最小化到托盘 / 直接退出」，
+                                         弹窗里可勾「此后不再提示」，之后在**这里**还能改。 -->
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="关闭按钮行为" Style="{StaticResource FieldLabel}"/>
+                                        <ComboBox x:Name="CloseActionBox" Grid.Column="1" MaxWidth="340"
+                                                  HorizontalAlignment="Left"
+                                                  Style="{StaticResource AppComboBox}"
+                                                  ItemContainerStyle="{StaticResource AppComboBoxItem}"
+                                                  SelectionChanged="OnSettingChanged">
+                                            <ComboBoxItem Content="每次询问"/>
+                                            <ComboBoxItem Content="最小化到托盘（后台继续下载）"/>
+                                            <ComboBoxItem Content="直接退出程序"/>
+                                        </ComboBox>
+                                    </Grid>
+
+
+                                    <TextBlock Text="存储与写入" Style="{StaticResource SectionLabel}"/>
+                                    <!-- 下载目录：标签 / 输入框 / 「浏览…」/「打开下载目录」
+                                         四个元素全部排在同一行。
+                                         【2026-10-02 改】原先是 [150][*][Auto] 两行布局，
+                                         「浏览…」在上、「打开下载目录」在下叠放 —— 用户反馈
+                                         「把这三个框弄在同一行不要这样分开」。现在改成
+                                         [150][*][Auto][Auto] 单行，两个按钮并排在输入框右侧。 -->
+                                    <Grid Margin="0,0,0,16">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+
+                                        <TextBlock Text="下载目录" Style="{StaticResource FieldLabel}"
+                                                   Grid.Column="0"/>
+                                        <TextBox x:Name="OutDirBox" Grid.Column="1"
+                                                 Style="{StaticResource AppTextBox}"
+                                                 LostFocus="OnSettingChanged"
+                                                 KeyDown="OnSettingKeyDown"/>
+                                        <Button Grid.Column="2" Content="浏览…"
+                                                Click="OnBrowseOutDir"
+                                                Style="{StaticResource SecondaryButton}"
+                                                Margin="8,0,0,0"/>
+                                        <Button x:Name="OpenOutDirBtn" Click="OnOpenOutDir"
+                                                Grid.Column="3"
+                                                Style="{StaticResource SecondaryButton}"
+                                                Margin="8,0,0,0">
+                                            <StackPanel Orientation="Horizontal">
+                                                <Path Data="{StaticResource IconFolder}" Stretch="Uniform"
+                                                      Width="14" Height="14" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource TextSecondaryBrush}"
+                                                      StrokeThickness="1.8"
+                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                      StrokeLineJoin="Round"/>
+                                                <TextBlock Text="打开下载目录" Margin="7,0,0,0"
+                                                           VerticalAlignment="Center"/>
+                                            </StackPanel>
+                                        </Button>
+                                    </Grid>
+
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="分片写入方式" Style="{StaticResource FieldLabel}"/>
+                                        <!-- 【2026-10-03 用户要求】下拉框删掉 —— 直接点下面两个方块选。
+                                             留一行提示说明交互方式（没有下拉箭头了，得让人知道能点）。 -->
+                                        <TextBlock Grid.Column="1" Text="点击下面的方块选择"
+                                                   Style="{StaticResource TertiaryText}"
+                                                   VerticalAlignment="Center"/>
+                                    </Grid>
+                                    <!-- 【2026-10-03 重做】原来是一大块「推荐/可边看 + 三行格式对照表
+                                         + 一行结论」，信息密度太高、给小白看像说明书（用户反馈
+                                         「太过繁琐太过复杂…我是要发给小白用户的，写简单一点，
+                                         排版好看一点、符合画风一点」）。
+                                         现在改成**两张并排的小卡片**：各一句话说清「怎么做 + 代价」，
+                                         格式细节压成卡片下面一行小字。 -->
+                                    <Border Style="{StaticResource InfoBanner}" Margin="150,0,0,14">
+                                        <StackPanel>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+
+                                                <!-- 左：推荐（整块可点，选中态 = 主色描边加粗） -->
+                                                <RadioButton x:Name="WriteModeSharedRadio"
+                                                             GroupName="WriteMode"
+                                                             Checked="OnSettingChanged"
+                                                             Style="{StaticResource WriteModeCard}"
+                                                             Margin="0,0,5,0">
+                                                    <StackPanel>
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <TextBlock Text="共写同一文件" FontSize="12.5"
+                                                                       FontWeight="SemiBold"
+                                                                       Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                                            <Border Margin="6,0,0,0" CornerRadius="4"
+                                                                    Padding="5,0,5,1"
+                                                                    VerticalAlignment="Center"
+                                                                    Background="{DynamicResource SuccessLightBrush}">
+                                                                <TextBlock Text="推荐" FontSize="10"
+                                                                           Foreground="{DynamicResource SuccessBrush}"/>
+                                                            </Border>
+                                                        </StackPanel>
+                                                        <TextBlock Text="边下边写同一个文件，不多占空间。"
+                                                                   Style="{StaticResource ProseText}"
+                                                                   FontSize="11.5" Margin="0,5,0,0"
+                                                                   TextWrapping="Wrap"/>
+                                                        <TextBlock Text="下载时无法进行边下边看。"
+                                                                   Style="{StaticResource TertiaryText}"
+                                                                   FontSize="11" Margin="0,3,0,0"
+                                                                   TextWrapping="Wrap"/>
+                                                    </StackPanel>
+                                                </RadioButton>
+
+                                                <!-- 右：可选 -->
+                                                <RadioButton x:Name="WriteModeSegmentedRadio"
+                                                             Grid.Column="1" GroupName="WriteMode"
+                                                             Checked="OnSettingChanged"
+                                                             Style="{StaticResource WriteModeCard}"
+                                                             Margin="5,0,0,0">
+                                                    <StackPanel>
+                                                        <TextBlock Text="独立分片 + 边合并" FontSize="12.5"
+                                                                   FontWeight="SemiBold"
+                                                                   Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                                        <TextBlock Text="每片先下成小文件，再按顺序拼成完整文件。"
+                                                                   Style="{StaticResource ProseText}"
+                                                                   FontSize="11.5" Margin="0,5,0,0"
+                                                                   TextWrapping="Wrap"/>
+                                                        <TextBlock Text="临时多占一份空间，但能边下边看。"
+                                                                   Style="{StaticResource TertiaryText}"
+                                                                   FontSize="11" Margin="0,3,0,0"
+                                                                   TextWrapping="Wrap"/>
+                                                    </StackPanel>
+                                                </RadioButton>
+                                            </Grid>
+
+                                            <TextBlock Style="{StaticResource TertiaryText}" FontSize="11"
+                                                       Margin="1,8,0,0" TextWrapping="Wrap"
+                                                       Text="两种方式下载速度一样快。想下完再看的，选「共写同一文件」就够了；想边下边看，选「独立分片」。"/>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <CheckBox x:Name="AutoCleanCheck"
+                                              Content="下载完成后自动清理云盘转存文件"
+                                              Style="{StaticResource AppCheckBox}"
+                                              Click="OnSettingChanged"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- ========== 次卡：分片与缓存（并列的辅助项，视觉更轻） ========== -->
+                            <Grid Margin="0,0,0,14">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+
+                                <Border Grid.Column="0" Style="{StaticResource MutedCard}" Margin="0,0,7,0">
+                                    <StackPanel>
+                                        <TextBlock Text="分片与缓存" Style="{StaticResource CardTitleText}"
+                                                   Margin="0,0,0,12"/>
+
+                                        <TextBlock Text="分片/缓存根目录" Style="{StaticResource BodyText}"
+                                                   Margin="0,0,0,6"/>
+                                        <!-- 【2026-10-04 用户要求】除「浏览…」外，再加一个「打开目录」按钮，
+                                             与上方「下载目录」行保持一致的操作入口。 -->
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBox x:Name="PartsRootBox" Grid.Column="0"
+                                                     Style="{StaticResource AppTextBox}"
+                                                     LostFocus="OnSettingChanged"
+                                                     KeyDown="OnSettingKeyDown"
+                                                     ToolTip="留空 = 分片与目标文件同目录（默认）。指定后可把分片集中到另一块盘（如 SSD）。"/>
+                                            <Button Grid.Column="1" Content="浏览…" Click="OnBrowsePartsRoot"
+                                                    Style="{StaticResource SecondaryButton}" Margin="8,0,0,0"/>
+                                            <Button x:Name="OpenPartsRootBtn" Click="OnOpenPartsRoot"
+                                                    Grid.Column="2"
+                                                    Style="{StaticResource SecondaryButton}"
+                                                    Margin="8,0,0,0"
+                                                    ToolTip="在资源管理器中打开分片/缓存根目录。">
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Path Data="{StaticResource IconFolder}" Stretch="Uniform"
+                                                          Width="14" Height="14" VerticalAlignment="Center"
+                                                          Stroke="{DynamicResource TextSecondaryBrush}"
+                                                          StrokeThickness="1.8"
+                                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                          StrokeLineJoin="Round"/>
+                                                    <TextBlock Text="打开" Margin="7,0,0,0"
+                                                               VerticalAlignment="Center"/>
+                                                </StackPanel>
+                                            </Button>
+                                        </Grid>
+                                        <TextBlock Style="{StaticResource ProseText}" Margin="0,8,0,12"
+                                                   Text="留空 = 分片与目标文件同目录（默认）。指定后可把分片集中到另一块盘。"/>
+
+                                        <CheckBox x:Name="HidePartsCheck"
+                                                  Content="隐藏分片目录"
+                                                  Style="{StaticResource AppCheckBox}"
+                                                  Click="OnSettingChanged"
+                                                  ToolTip="只影响新建的分片目录是否隐藏，不影响下载功能。默认勾选。"/>
+                                    </StackPanel>
+                                </Border>
+
+                                <Border Grid.Column="1" Style="{StaticResource MutedCard}" Margin="7,0,0,0">
+                                    <StackPanel>
+                                        <TextBlock Text="播放器（边下边播用）"
+                                                   Style="{StaticResource CardTitleText}"
+                                                   Margin="0,0,0,10"/>
+                                        <TextBlock x:Name="PlayerStatusText" TextWrapping="Wrap"
+                                                   Style="{StaticResource ProseText}" Margin="0,0,0,10"/>
+                                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                            <Button x:Name="GetVlcBtn" Content="打开 VLC 下载页" Click="OnGetVlc"
+                                                    Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
+                                            <Button x:Name="RecheckPlayerBtn" Content="重新检测"
+                                                    Click="OnRecheckPlayer" Style="{StaticResource SecondaryButton}"/>
+                                        </StackPanel>
+                                        <TextBlock Style="{StaticResource ProseText}"
+                                                   Text="GeZi 不内置播放器（内置会让安装包大几十 MB）。推荐 VLC：免费、开源、格式全，而且它以共享模式打开文件，不会干扰我们继续写盘。没装 VLC 时，「打开」按钮会回退到系统默认程序。"/>
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabItem>
+
+                <!-- ============ 登录 ============ -->
+                <TabItem Style="{StaticResource HeadlessTabItem}">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0">
+                        <StackPanel Margin="20,18,20,24" MaxWidth="960" HorizontalAlignment="Left">
+
+                            <TextBlock Text="登录" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
+                            <TextBlock Text="登录后可浏览「我的网盘」、转存分享文件；不登录也能用直链下载"
+                                       Style="{StaticResource TertiaryText}" Margin="0,0,0,18"/>
+
+                            <!-- 左右分栏：左=扫码（主操作，视觉最重），右=状态/导入导出/账号管理
+                                 之前是单列 640 宽，屏幕大时右侧大片空白，内容全挤在左边。 -->
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+
+                                <!-- ============ 左列：扫码登录 ============
+                                     用 Grid 三行（标题 Auto / 二维码 * / 按钮+状态 Auto），
+                                     整卡 VerticalAlignment=Stretch 与右列等高；
+                                     二维码行用 * 吸收多余高度并垂直居中 —— 这样无论
+                                     登录前后、窗口多大，左右两列外轮廓都是同一个矩形。 -->
+                                <Border Grid.Column="0" Style="{StaticResource PrimaryCard}"
+                                        Width="304" VerticalAlignment="Stretch">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="*"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+
+                                        <StackPanel Grid.Row="0">
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                                <Path Data="{StaticResource IconQr}" Stretch="Uniform"
+                                                      Width="16" Height="16" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource PrimaryBrush}"
+                                                      StrokeThickness="1.8"
+                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                                <TextBlock Text="扫码登录"
+                                                           Style="{StaticResource CardTitleText}"
+                                                           Margin="7,0,0,0" FontSize="15"/>
+                                            </StackPanel>
+                                            <TextBlock Text="用手机「夸克 App」扫描二维码并在手机上确认"
+                                                       Style="{StaticResource TertiaryText}"
+                                                       TextWrapping="Wrap" Margin="0,0,0,14"/>
+                                        </StackPanel>
+
+                                        <!-- 二维码：固定 264×264 占位框，未生成时显示提示，避免高度跳变 -->
+                                        <Grid Grid.Row="1" Height="264" Margin="0,0,0,14"
+                                              VerticalAlignment="Center">
+                                            <!-- ⚠️ Background="White" 是**故意硬编码**的，不要改成 DynamicResource：
+                                                 二维码必须是"深色模块 + 白色静默区"才能被手机扫出来。
+                                                 深色主题下若跟着变深，扫码会直接失败（不是审美问题）。
+                                                 容器保持纯白 + 一圈描边，在深色界面上反而更醒目、
+                                                 等于给二维码加了个"白卡底座"。 -->
+                                            <Border x:Name="QrImageBox" Width="264" Height="264"
+                                                    Background="White"
+                                                    BorderBrush="{DynamicResource BorderBrushStrong}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="10" Padding="8"
+                                                    Visibility="Collapsed">
+                                                <Image x:Name="QrImage" Stretch="Uniform"
+                                                       RenderOptions.BitmapScalingMode="NearestNeighbor"/>
+                                            </Border>
+                                            <Border x:Name="QrPlaceholderBox"
+                                                    Background="{DynamicResource SurfaceSunkenBrush}"
+                                                    BorderBrush="{DynamicResource BorderBrushSoft}"
+                                                    BorderThickness="1" CornerRadius="10">
+                                                <StackPanel HorizontalAlignment="Center"
+                                                            VerticalAlignment="Center">
+                                                    <Path Data="{StaticResource IconQr}" Stretch="Uniform"
+                                                          Width="42" Height="42"
+                                                          HorizontalAlignment="Center"
+                                                          Stroke="{DynamicResource BorderBrushStrong}"
+                                                          StrokeThickness="1.4"
+                                                          StrokeStartLineCap="Round"
+                                                          StrokeEndLineCap="Round"/>
+                                                    <TextBlock Text="点下方按钮获取二维码"
+                                                               Margin="0,10,0,0"
+                                                               HorizontalAlignment="Center"
+                                                               Foreground="{DynamicResource TextTertiaryBrush}"
+                                                               FontSize="11.5"/>
+                                                </StackPanel>
+                                            </Border>
+                                        </Grid>
+
+                                        <!-- 按钮 + 状态：
+                                             ⚠️ 这里必须是**两行 Grid**，不能把按钮与状态框
+                                             直接叠在同一个 Grid 里 —— 叠放时 QrStatusBox 会
+                                             压在按钮上（用户反馈「提示遮住了按钮，上方明明有空位」）。
+                                             Row0=按钮（Auto）、Row1=状态框（Auto），
+                                             状态框自然落在按钮下方，上方二维码区的空位也吃得到。 -->
+                                        <Grid Grid.Row="2">
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto"/>
+                                                <RowDefinition Height="Auto"/>
+                                            </Grid.RowDefinitions>
+
+                                            <StackPanel Grid.Row="0" Orientation="Horizontal">
+                                                <Button x:Name="QrLoginBtn" Click="OnQrLogin"
+                                                        Style="{StaticResource PrimaryButton}">
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <Path Data="{StaticResource IconQr}"
+                                                              Stretch="Uniform"
+                                                              Width="14" Height="14"
+                                                              VerticalAlignment="Center"
+                                                              Stroke="{DynamicResource TextOnPrimaryBrush}"
+                                                              StrokeThickness="1.8"
+                                                              StrokeStartLineCap="Round"
+                                                              StrokeEndLineCap="Round"/>
+                                                        <TextBlock Text="获取二维码" Margin="7,0,0,0"
+                                                                   VerticalAlignment="Center"/>
+                                                    </StackPanel>
+                                                </Button>
+                                                <!-- 【2026-10-03】原来这里还有一个「刷新二维码」按钮，
+                                                     用户反馈「这里刷新二维码的按键多余了」——
+                                                     确实多余：它和「获取二维码」绑的是**同一个处理函数**
+                                                     （都是 OnQrLogin），点哪个都是重新取一张。
+                                                     现在只留一个按钮，二维码过期时提示用户再点一次即可。 -->
+                                            </StackPanel>
+
+                                            <!-- 状态提示：随扫码进度实时变化（等待扫码 → 已扫码待确认 → 成功/过期）
+                                                 ⚠️ 图标/颜色都由 code-behind 的 SetQrStatus() 按语义给：
+                                                 「等待扫码」是正常流程，配黄三角会让用户以为坏了。
+                                                 进行中=中性信息图标，成功=绿对勾，失败/过期=红叉。 -->
+                                            <Border x:Name="QrStatusBox" Grid.Row="1"
+                                                    Margin="0,12,0,0"
+                                                    Padding="12,10"
+                                                    CornerRadius="10" Visibility="Collapsed"
+                                                    Background="{DynamicResource SurfaceSunkenBrush}">
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Path x:Name="QrStatusIcon"
+                                                          Data="{StaticResource IconClock}"
+                                                          Stretch="Uniform" Width="15" Height="15"
+                                                          VerticalAlignment="Center" Margin="0,0,8,0"
+                                                          Stroke="{DynamicResource TextSecondaryBrush}"
+                                                          StrokeThickness="1.8"
+                                                          StrokeStartLineCap="Round"
+                                                          StrokeEndLineCap="Round"
+                                                          StrokeLineJoin="Round"/>
+                                                    <TextBlock x:Name="QrStatusText" Text=""
+                                                               TextWrapping="Wrap"
+                                                               Style="{StaticResource SecondaryText}"
+                                                               VerticalAlignment="Center"/>
+                                                </StackPanel>
+                                            </Border>
+                                        </Grid>
+                                    </Grid>
+                                </Border>
+
+                                <!-- ============ 右列：状态 / 导入导出 / 账号管理 / 提示 ============
+                                     三行：状态 Auto / 导入 Cookie Auto / 小贴士 *。
+                                     最后一行用 * 吸收剩余高度，右列上下沿与左列严格对齐。 -->
+                                <Grid Grid.Column="1" Margin="16,0,0,0">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="*"/>
+                                    </Grid.RowDefinitions>
+
+                                    <!-- 当前登录状态 -->
+                                    <Border Grid.Row="0" Style="{StaticResource Card}"
+                                            Margin="0,0,0,14">
+                                        <StackPanel>
+                                            <TextBlock Text="当前状态" Style="{StaticResource CardTitleText}"
+                                                       Margin="0,0,0,10"/>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Border x:Name="LoginAvatarBox" Grid.Column="0"
+                                                        Style="{StaticResource AvatarBorder}"
+                                                        VerticalAlignment="Center">
+                                                    <Grid>
+                                                        <TextBlock x:Name="LoginAvatarText" Text="?"
+                                                                   FontSize="14" FontWeight="SemiBold"
+                                                                   Foreground="{DynamicResource TextOnPrimaryBrush}"
+                                                                   HorizontalAlignment="Center"
+                                                                   VerticalAlignment="Center"/>
+                                                        <Image x:Name="LoginAvatarImage" Stretch="UniformToFill"
+                                                               Visibility="Collapsed">
+                                                            <Image.Clip>
+                                                                <EllipseGeometry Center="17,17" RadiusX="17" RadiusY="17"/>
+                                                            </Image.Clip>
+                                                        </Image>
+                                                    </Grid>
+                                                </Border>
+                                                <StackPanel Grid.Column="1" Margin="10,0,0,0"
+                                                            VerticalAlignment="Center">
+                                                    <TextBlock x:Name="LoginWhoText" Text="未登录"
+                                                               FontSize="13.5" FontWeight="SemiBold"
+                                                               Foreground="{DynamicResource TextPrimaryBrush}"
+                                                               TextTrimming="CharacterEllipsis"/>
+                                                    <TextBlock x:Name="LoginSubText"
+                                                               Text="扫码或导入 Cookie 即可登录"
+                                                               FontSize="11" Margin="0,2,0,0"
+                                                               Foreground="{DynamicResource TextTertiaryBrush}"
+                                                               TextWrapping="Wrap"/>
+                                                </StackPanel>
+                                            </Grid>
+
+                                            <StackPanel x:Name="LoginActionRow" Orientation="Horizontal"
+                                                        Margin="0,14,0,0">
+                                                <Button x:Name="LoginBtn" Content="登录" Click="OnLoginClick"
+                                                        Style="{StaticResource SecondaryButton}"
+                                                        Margin="0,0,8,0"/>
+                                                <Button x:Name="AccountsBtn" Content="切换账号"
+                                                        Click="OnOpenAccounts"
+                                                        Style="{StaticResource SecondaryButton}"
+                                                        Visibility="Collapsed"/>
+                                                <!-- 【2026-10-03】「登出」按钮按用户要求删除（觉得多余）。
+                                                     退出登录的能力没丢：挪进了「切换账号」窗口里，
+                                                     那里才是账号管理的地方。 -->
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- 导入 Cookie -->
+                                    <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,0,0,14">
+                                        <StackPanel>
+                                            <TextBlock Text="导入 Cookie" Style="{StaticResource CardTitleText}"
+                                                       Margin="0,0,0,6"/>
+                                            <TextBlock Text="扫码不方便时，可从浏览器复制夸克网盘的 Cookie 粘贴进来登录；也可以直接从 Cookie 文件导入。"
+                                                       Style="{StaticResource TertiaryText}"
+                                                       TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                            <TextBox x:Name="CookieImportBox" Height="72"
+                                                     Style="{StaticResource AppTextBoxMultiline}"/>
+                                            <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                                                <Button x:Name="ImportCookieBtn" Content="导入并登录"
+                                                        Click="OnImportCookie"
+                                                        Style="{StaticResource PrimaryButton}"
+                                                        Margin="0,0,8,0"/>
+                                                <!-- 【2026-10-03 新增】从文件导入 Cookie（用户反馈缺这个入口）。
+                                                     支持 .txt（原始 Cookie 串）与 .json（浏览器扩展导出的格式）。 -->
+                                                <Button x:Name="ImportCookieFileBtn" Click="OnImportCookieFile"
+                                                        Style="{StaticResource SecondaryButton}"
+                                                        Margin="0,0,8,0"
+                                                        ToolTip="从文件读取 Cookie 并直接登录。&#10;支持 .txt（原始 Cookie 串）和 .json（浏览器扩展导出）。">
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <Path Data="{StaticResource IconFolder}"
+                                                              Stretch="Uniform" Width="14" Height="14"
+                                                              VerticalAlignment="Center"
+                                                              Stroke="{DynamicResource TextSecondaryBrush}"
+                                                              StrokeThickness="1.8"
+                                                              StrokeStartLineCap="Round"
+                                                              StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"/>
+                                                        <TextBlock Text="从文件导入"
+                                                                   Margin="7,0,0,0"
+                                                                   VerticalAlignment="Center"/>
+                                                    </StackPanel>
+                                                </Button>
+                                                <!-- 【2026-10-03 改】原来是「复制当前 Cookie」→ 只往剪贴板塞。
+                                                     用户要求「无论是导出直链还是导出 cookie 都不要复制到
+                                                     粘贴板上」，所以改成**写文件**，按钮文案与图标同步改。 -->
+                                                <Button x:Name="ExportCookieBtn" Click="OnExportCookie"
+                                                        Style="{StaticResource SecondaryButton}"
+                                                        ToolTip="把当前登录 Cookie 导出成桌面上的 txt 文件（不占用剪贴板）。">
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <Path Data="{StaticResource IconFile}"
+                                                              Stretch="Uniform" Width="14" Height="14"
+                                                              VerticalAlignment="Center"
+                                                              Stroke="{DynamicResource TextSecondaryBrush}"
+                                                              StrokeThickness="1.8"
+                                                              StrokeStartLineCap="Round"
+                                                              StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"/>
+                                                        <TextBlock Text="导出 Cookie 文件"
+                                                                   Margin="7,0,0,0"
+                                                                   VerticalAlignment="Center"/>
+                                                    </StackPanel>
+                                                </Button>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- 小贴士：填满右列剩余高度（Grid.Row=2 是 * 行），
+                                         让右列底沿与左列严格平齐，也让新用户少踩坑 -->
+                                    <Border Grid.Row="2" Style="{StaticResource InfoBanner}"
+                                            VerticalAlignment="Stretch">
+                                      <Grid>
+                                        <!-- 装饰层：小贴士的文字只占左边一小块，右侧一大片空着
+                                             （用户反馈「这个地方感觉右边也有点太空了」）。
+                                             点缀几颗星星填充右侧，画在文字**之前**（在下层），
+                                             不吃点击、透明度压低，不与正文抢注意力。 -->
+                                        <Grid IsHitTestVisible="False">
+                                            <Path Data="{StaticResource IconSparkle}"
+                                                  Fill="{DynamicResource PrimaryBrush}"
+                                                  Opacity="0.62"
+                                                  Width="30" Height="30" Stretch="Uniform"
+                                                  HorizontalAlignment="Right" VerticalAlignment="Center"
+                                                  Margin="0,0,18,0"/>
+                                            <Path Data="{StaticResource IconSparkle}"
+                                                  Fill="{DynamicResource PrimaryBrush}"
+                                                  Opacity="0.46"
+                                                  Width="16" Height="16" Stretch="Uniform"
+                                                  HorizontalAlignment="Right" VerticalAlignment="Top"
+                                                  Margin="0,14,60,0"/>
+                                            <Path Data="{StaticResource IconSparkle}"
+                                                  Fill="{DynamicResource PrimaryBrush}"
+                                                  Opacity="0.36"
+                                                  Width="11" Height="11" Stretch="Uniform"
+                                                  HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                                                  Margin="0,0,16,18"/>
+                                        </Grid>
+                                        <StackPanel>
+                                            <TextBlock Text="小贴士" FontSize="12" FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource PrimaryBrush}"
+                                                       Margin="0,0,0,6"/>
+                                            <TextBlock Style="{StaticResource ProseText}"
+                                                       Text="· 登录信息经系统加密后存在本地配置里，不会上传到任何服务器。"/>
+                                            <!-- 【2026-10-03 再改】上一版写的是
+                                                 「登录状态过期时不用重新扫码，再点一次「获取二维码」即可」——
+                                                 这句是**错的**：它把「二维码本身过期」和「登录态过期」
+                                                 混为一谈了。
+                                                 · 二维码过期（还没扫就超时）→ 确实只要再点一次「获取二维码」
+                                                   换一张新的（这是原作者想说的）；
+                                                 · 登录态过期（Cookie 失效）→ **必须重新扫码**，
+                                                   只点「获取二维码」只会得到一张新码，不扫不登录。
+                                                 按用户给的措辞改掉，避免误导。 -->
+                                            <TextBlock Style="{StaticResource ProseText}" Margin="0,4,0,0"
+                                                       Text="· 登录状态过期时可以重新扫码，点击「获取二维码」即可。"/>
+                                            <TextBlock Style="{StaticResource ProseText}" Margin="0,4,0,0"
+                                                       Text="· 扫码得到的是网页版登录态，和手机 App 端互不影响、可同时使用。"/>
+                                        </StackPanel>
+                                      </Grid>
+                                    </Border>
+                                </Grid>
+                            </Grid>
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabItem>
+                </TabControl>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>

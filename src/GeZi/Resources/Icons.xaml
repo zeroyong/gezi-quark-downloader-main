@@ -1,0 +1,146 @@
+﻿<!--
+    Icons.xaml —— 图标（Path Geometry）
+    ============================================================
+    规格要求：图标用 Path 的 Data 属性内嵌 Geometry，不引图标字体库
+    （引字体库会额外增加体积，而且 net48 下字体回退容易出问题）。
+
+    用法：
+      <Path Data="{StaticResource IconDownload}" Fill="{DynamicResource TextSecondaryBrush}"
+            Width="18" Height="18" Stretch="Uniform"/>
+
+    所有路径都按 24×24 视图设计，配合 Stretch="Uniform" 可任意缩放。
+-->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- 下载：向下的箭头 + 托盘横线 -->
+    <Geometry x:Key="IconDownload">M12,3 L12,15 M6.5,9.5 L12,15 L17.5,9.5 M4,19 H20</Geometry>
+
+    <!-- 文件夹 -->
+    <Geometry x:Key="IconFolder">M3,6.5 A1.5,1.5 0 0 1 4.5,5 H9 L11,7.5 H19.5 A1.5,1.5 0 0 1 21,9 V18 A1.5,1.5 0 0 1 19.5,19.5 H4.5 A1.5,1.5 0 0 1 3,18 Z</Geometry>
+
+    <!-- 时钟（历史记录） -->
+    <Geometry x:Key="IconHistory">M12,3 A9,9 0 1 0 21,12 M12,3 A9,9 0 0 1 21,12 M12,3 V3 M12,7 V12 L16,14.5</Geometry>
+
+    <!-- 齿轮（设置） -->
+    <Geometry x:Key="IconSettings">M12,8.5 A3.5,3.5 0 1 1 12,15.5 A3.5,3.5 0 1 1 12,8.5 M19.4,15 A1.6,1.6 0 0 0 19.7,16.8 L19.8,16.9 A2,2 0 1 1 17,19.7 L16.9,19.6 A1.6,1.6 0 0 0 15.1,19.3 A1.6,1.6 0 0 0 14.2,20.7 V21 A2,2 0 1 1 10.2,21 V20.9 A1.6,1.6 0 0 0 9.2,19.5 A1.6,1.6 0 0 0 7.4,19.8 L7.3,19.9 A2,2 0 1 1 4.5,17.1 L4.6,17 A1.6,1.6 0 0 0 4.9,15.2 A1.6,1.6 0 0 0 3.5,14.3 H3.2 A2,2 0 1 1 3.2,10.3 H3.3 A1.6,1.6 0 0 0 4.7,9.3 A1.6,1.6 0 0 0 4.4,7.5 L4.3,7.4 A2,2 0 1 1 7.1,4.6 L7.2,4.7 A1.6,1.6 0 0 0 9,5 A1.6,1.6 0 0 0 9.9,3.6 V3.3 A2,2 0 1 1 13.9,3.3 V3.4 A1.6,1.6 0 0 0 14.8,4.8 A1.6,1.6 0 0 0 16.6,4.5 L16.7,4.4 A2,2 0 1 1 19.5,7.2 L19.4,7.3 A1.6,1.6 0 0 0 19.1,9.1 A1.6,1.6 0 0 0 20.5,10 H20.8 A2,2 0 1 1 20.8,14 H20.7 A1.6,1.6 0 0 0 19.4,15 Z</Geometry>
+
+    <!-- 用户（账号） -->
+    <Geometry x:Key="IconUser">M12,4 A4,4 0 1 1 12,12 A4,4 0 1 1 12,4 M4.5,20.5 C4.5,16.9 7.9,14 12,14 C16.1,14 19.5,16.9 19.5,20.5</Geometry>
+
+    <!-- 链接 / 分享 -->
+    <Geometry x:Key="IconLink">M10,13.5 A4,4 0 0 0 15.7,13.5 L18.5,10.7 A4,4 0 0 0 12.8,5 L11.4,6.4 M14,10.5 A4,4 0 0 0 8.3,10.5 L5.5,13.3 A4,4 0 0 0 11.2,19 L12.6,17.6</Geometry>
+
+    <!-- 文件 -->
+    <Geometry x:Key="IconFile">M6,3.5 H14 L18.5,8 V20.5 H6 Z M14,3.5 V8 H18.5</Geometry>
+
+    <!-- 进度 / 活动 -->
+    <Geometry x:Key="IconActivity">M3,12 H7 L9.5,6 L14.5,18 L17,12 H21</Geometry>
+
+    <!-- 诊断（心电图 / 脉冲） -->
+    <Geometry x:Key="IconDiagnostics">M4,12 H8 M12,4 V8 M12,16 V20 M12,12 m-1.2,0 a1.2,1.2 0 1 0 2.4,0 a1.2,1.2 0 1 0 -2.4,0 M8,12 H16</Geometry>
+
+    <!-- 空状态：收件箱 -->
+
+    <!-- 搜索 -->
+    <Geometry x:Key="IconSearch">M10.5,4.5 A6,6 0 1 1 10.5,16.5 A6,6 0 1 1 10.5,4.5 M15,15 L20,20</Geometry>
+
+    <!-- 扫码 / 取景框（Lucide scan，24×24、圆头圆角、stroke-width 2 规格）
+         四角折线 + 中央一条扫描线。用于「识别二维码」入口。
+         ⚠️ 只用 Stroke 描边（不 Fill），与 IconFolder / IconRefresh 同规格。 -->
+    <Geometry x:Key="IconScan">M3,7 V5 A2,2 0 0 1 5,3 H7 M17,3 H19 A2,2 0 0 1 21,5 V7 M21,17 V19 A2,2 0 0 1 19,21 H17 M7,21 H5 A2,2 0 0 1 3,19 V17 M3,12 H21</Geometry>
+
+    <!-- 刷新 -->
+    <Geometry x:Key="IconRefresh">M20,11 A8,8 0 1 1 17.7,5.6 M20,4 V10 H14</Geometry>
+
+    <!-- 返回上级 -->
+    <Geometry x:Key="IconArrowUp">M12,19 V5 M6,11 L12,5 L18,11</Geometry>
+
+    <!-- 关闭 -->
+    <Geometry x:Key="IconClose">M6,6 L18,18 M18,6 L6,18</Geometry>
+
+    <!-- 最小化 -->
+    <Geometry x:Key="IconMinimize">M6,12 H18</Geometry>
+
+    <!-- 最大化 -->
+    <Geometry x:Key="IconMaximize">M6,6 H18 V18 H6 Z</Geometry>
+
+    <!-- 还原 -->
+    <Geometry x:Key="IconRestore">M8,8 H18 V18 H8 Z M6,4 H16 V6 M4,6 V16 H6</Geometry>
+
+    <!-- 暂停 -->
+    <Geometry x:Key="IconPause">M9,5 V19 M15,5 V19</Geometry>
+
+    <!-- 播放 / 继续 -->
+    <Geometry x:Key="IconPlay">M7,5 L19,12 L7,19 Z</Geometry>
+
+    <!-- 复制 -->
+
+    <!-- 对勾 -->
+    <Geometry x:Key="IconCheck">M5,12.5 L10,17.5 L19,7</Geometry>
+
+    <!-- 定位（目录） -->
+
+    <!-- 二维码 -->
+    <Geometry x:Key="IconQr">M4,4 H10 V10 H4 Z M14,4 H20 V10 H14 Z M4,14 H10 V20 H4 Z M14,14 H16 V16 H14 Z M18,14 H20 V16 H18 Z M14,18 H16 V20 H14 Z M18,18 H20 V20 H18 Z</Geometry>
+
+    <!-- 警告 -->
+    <Geometry x:Key="IconWarning">M12,4 L21,19.5 H3 Z M12,10 V14 M12,16.5 V17</Geometry>
+
+    <!-- 云（容量 / 网盘存储） -->
+    <!-- 「云 + 斜杠」：空状态用的图标（用户从参考图里指定，替代原来的收纳盒 IconInbox）。
+         斜杠从左上贯到右下，两端略微伸出云外 —— 与参考图一致。 -->
+    <!--
+        以下两个图标**不是手绘的**，取自 Lucide 图标库（ISC 许可，可自由嵌入）：
+          · cloud-off —— https://lucide.dev/icons/cloud-off
+          · sparkles  —— https://lucide.dev/icons/sparkles
+        24×24 viewBox、stroke-width 2、圆头圆角 —— 与本文件其它图标的用法完全一致
+        （用 Stroke 描边，不要用 Fill）。
+
+        ⚠️ 用户明确要求：「我不是说让你画一个，我是让你在 ui 库里边找一个类似的弄上来，
+        你画的太丑了」。**以后需要新图标，先去图标库找现成的，不要手写 path。**
+        SVG 的相对指令（h/v/l/a）已换算成绝对坐标，便于核对。
+    -->
+    <Geometry x:Key="IconCloudOff">M10.94,5.274 A7,7 0 0 1 15.71,10 L17.5,10 A4.5,4.5 0 0 1 21.722,16.057 M18.796,18.81 A4.5,4.5 0 0 1 17.5,19 L9,19 A7,7 0 0 1 5.79,5.78 M2,2 L22,22</Geometry>
+    <Geometry x:Key="IconSparkle">M12.000,0.400 C13.276,8.172 15.828,10.724 23.600,12.000 C15.828,13.276 13.276,15.828 12.000,23.600 C10.724,15.828 8.172,13.276 0.400,12.000 C8.172,10.724 10.724,8.172 12.000,0.400 Z M19.600,0.700 C20.030,3.710 20.890,4.570 23.900,5.000 C20.890,5.430 20.030,6.290 19.600,9.300 C19.170,6.290 18.310,5.430 15.300,5.000 C18.310,4.570 19.170,3.710 19.600,0.700 Z M4.600,15.400 C5.220,17.540 6.460,18.780 8.600,19.400 C6.460,20.020 5.220,21.260 4.600,23.400 C3.980,21.260 2.740,20.020 0.600,19.400 C2.740,18.780 3.980,17.540 4.600,15.400 Z</Geometry>
+
+    <!-- 资料库 / 硬盘 -->
+
+    <!-- 加载中（环形缺口，配合旋转动画用） -->
+    <Geometry x:Key="IconSpinner">M12,3.5 A8.5,8.5 0 1 0 20.5,12</Geometry>
+
+    <!--
+        信息（圆圈 + i）：用于"等待/进行中"等中性状态。
+        ⚠️ 别拿 IconWarning 当万能状态图标 —— 黄三角的语义是"出问题了"，
+        可"正在等待扫码"是正常流程，配黄三角会让用户以为程序坏了。
+    -->
+    <Geometry x:Key="IconInfo">M12,3.5 A8.5,8.5 0 1 1 12,20.5 A8.5,8.5 0 1 1 12,3.5 M12,11 V16.5 M12,7.6 V7.9</Geometry>
+
+    <!-- 时钟：等待类状态（扫码等待、排队中） -->
+    <Geometry x:Key="IconClock">M12,3.5 A8.5,8.5 0 1 1 12,20.5 A8.5,8.5 0 1 1 12,3.5 M12,7.5 V12.3 L15.6,14.4</Geometry>
+
+    <!-- 对勾圆圈：成功态（比裸 IconCheck 更适合做状态提示） -->
+    <Geometry x:Key="IconCheckCircle">M12,3.5 A8.5,8.5 0 1 1 12,20.5 A8.5,8.5 0 1 1 12,3.5 M8.2,12.3 L10.9,15 L15.9,9.6</Geometry>
+
+    <!-- 叉圆圈：失败态 -->
+    <Geometry x:Key="IconXCircle">M12,3.5 A8.5,8.5 0 1 1 12,20.5 A8.5,8.5 0 1 1 12,3.5 M9.2,9.2 L14.8,14.8 M14.8,9.2 L9.2,14.8</Geometry>
+
+    <!--
+        帮助（圆圈 + 问号）：品牌区「?」关于按钮用。
+        取自 Lucide 图标库 circle-help（ISC 许可，可自由嵌入）：
+          https://lucide.dev/icons/circle-help
+        24×24 viewBox、stroke-width 2、圆头圆角 —— 与 IconCloudOff / IconSparkle 同源同规格。
+
+        ⚠️ 原来这里是**手拼**的（一个 Ellipse + 一个 TextBlock "?"），
+        用户一眼看出「有点偏左，你不会是自己画的吧」—— 因为 TextBlock 是按**文本框**
+        居中的，而 "?" 字形的左右侧边距不对称、行框还含上下伸部，视觉重心必然偏。
+        矢量图标是几何居中的，不会有这个问题。**别再退回 TextBlock 拼法。**
+
+        SVG 原始写法（相对指令已换算成绝对坐标，便于核对）：
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+          <path d="M12 17h.01"/>   ← 末尾那 0.01 长的短线段靠圆头线帽渲染成一个"点"
+    -->
+    <Geometry x:Key="IconHelpCircle">M12,2 A10,10 0 1 1 12,22 A10,10 0 1 1 12,2 M9.09,9 A3,3 0 0 1 14.92,10 C14.92,12 11.92,13 11.92,13 M12,17 L12.01,17</Geometry>
+
+</ResourceDictionary>
