@@ -8,10 +8,10 @@
   <img src="src/GeZi/Resources/app-logo.png" width="120" alt="鸽子下载">
 </p>
 <p align="center">
-  <img src="https://img.shields.io/github/repo-size/huaotem-bot/gezi-quark-downloader?style=social" alt="Repo Size">
-  <img src="https://visitor-badge.laobi.icu/badge?page_id=huaotem-bot.gezi-quark-downloader&radius=12" alt="Visitors">
-  <img src="https://img.shields.io/github/license/huaotem-bot/gezi-quark-downloader?style=social" alt="License">
-  <img src="https://img.shields.io/github/stars/huaotem-bot/gezi-quark-downloader?style=social" alt="Stars">
+  <img src="https://img.shields.io/github/repo-size/zeroyong/gezi-quark-downloader-main?style=social" alt="Repo Size">
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=zeroyong.gezi-quark-downloader-main&radius=12" alt="Visitors">
+  <img src="https://img.shields.io/github/license/zeroyong/gezi-quark-downloader-main?style=social" alt="License">
+  <img src="https://img.shields.io/github/stars/zeroyong/gezi-quark-downloader-main?style=social" alt="Stars">
 </p>
 
 ---
@@ -30,12 +30,22 @@
 
 ### 解析与登录
 - **分享链接解析**：支持夸克分享链接（含带口令的链接）
+- **剪贴板自动解析**：在任何程序里复制到夸克分享链接，本程序就自动解析并载入文件列表
+  （默认开启，设置页「剪贴板」可关）
+- **解析历史**：按 `h`（或点文件区工具栏的「解析历史」）唤出居中面板，按 今天 / 昨天 / 更早
+  分组，点一条即可重新打开那个分享；右键条目可**置顶 / 删除**
 - **免转存直链**：文件右键可选「免转存下载」，不占用网盘空间
 - **二维码识别**：分享页只给二维码图片时，可截图识别（Ctrl+V / 选文件 / 拖拽）
 - **扫码登录**：内置 Python 桥完成扫码登录与账号信息获取
 - **多账号**：可保存多个账号，一键切换
 
 ### 体验
+- **键盘快捷键**：`1/2/3` 切到下载/任务/登录、`q` 设置、`6` 关于、`h` 解析历史；
+  `a` 返回上级、`d` 免转存下载、`x` 下载选中、`g` 获取直链
+  （完整列表在设置页最下方「快捷键」一节）
+- **大目录不卡**：目录按页加载 —— 一次只渲染 10 条，滑到底部自动续上；
+  进过的目录会缓存，按 `a` 返回**不会**再重新请求
+- **顺手的目录操作**：单击文件夹即进入；顶部路径条每一节都能点击跳转
 - **边下边播**：未下完也能用 VLC 播放已下载部分
 - **深色模式**：亮色 / 深色 / 跟随系统
 - **托盘常驻 + 悬浮小窗**：关掉主窗口也继续下载
@@ -62,7 +72,7 @@
 
 ### 方式一：下载发行版（推荐）
 
-1. 从 [Releases](https://github.com/huaotem-bot/gezi-quark-downloader/releases) 下载 `GeZi-v2.2.0-win64.zip` 并解压到任意目录
+1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.6.0-win64.zip` 并解压到任意目录
 2. 双击 `GeZi.exe` 即可运行
 3. 若系统缺少 .NET Framework 4.8，Windows 会弹窗提示，按引导安装即可
 
@@ -72,15 +82,18 @@
 
 ```bash
 # 1. 克隆仓库
-git clone <仓库地址>
-cd GeZi
+git clone https://github.com/zeroyong/gezi-quark-downloader-main.git
+cd gezi-quark-downloader-main
 
 # 2. 构建（Release）
-dotnet build GeZi.slnx -c Release
+dotnet build src/GeZi/GeZi.csproj -c Release
 
 # 3. 运行
 src/GeZi/bin/Release/net48/GeZi.exe
 ```
+
+> ⚠️ 建议直接编 `src/GeZi/GeZi.csproj`。仓库里的 `GeZi.slnx` 是新的 XML 解决方案格式，
+> 需要 **.NET SDK 9.0.200+**；用较老的 SDK 或只装了 MSBuild 的机器会打不开它。
 
 **无需 `nuget restore`** —— 本项目零 NuGet 依赖，所有第三方库以固化 DLL 形式随仓库分发，
 任何机器 clone 下来即可直接构建（需已安装 .NET Framework 4.8 开发包 / MSBuild）。
@@ -158,6 +171,9 @@ GNU General Public License for more details.
 感谢 [ZXing.Net](https://github.com/micjahn/ZXing.Net/) 提供的二维码解码能力，
 以及 [Python](https://www.python.org/) 社区。
 
+本项目基于 [huaotem-bot/gezi-quark-downloader](https://github.com/huaotem-bot/gezi-quark-downloader)
+二次开发（GPL-3.0 允许，原版权与许可声明见 [LICENSE](LICENSE)）。
+
 开发过程中参考了若干开源下载器的公开文档与设计思路（未复制其源代码），
 在此一并致谢，详见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) 第 5 节。
 
@@ -170,4 +186,3 @@ GNU General Public License for more details.
 <p align="center">
   <img src="xiaozhou.png" width="260" alt="赞赏码">
 </p>
-
