@@ -31,13 +31,13 @@ namespace GeZi
     /// 带品牌行、B 站链接、应用简介、功能特性、赞赏支持。这里按当前 C# 版的实际情况
     /// **重写了介绍内容**（Flet 版那套功能描述已经对不上了）。
     ///
-    /// ⚠️ 赞赏码用的是 Flet 版里那份 `APP_REWARD_LG_B64`（360×360）解出来的
-    /// `Resources/reward-qr.png` —— 同一张码，没有重画。
+    /// ⚠️ 赞赏码是用户 2026-10-09 换成的新图（「躬行小舟」的赞赏码），
+    /// 资源名 `Resources/reward-xiaozhou.png`，放大弹窗用的是同一张。
     /// </summary>
     public partial class AboutWindow : Window
     {
-        /// <summary>作者 B 站主页（沿用 Flet 版那个短链）。</summary>
-        private const string BiliUrl = "https://b23.tv/gIoEfQM";
+        /// <summary>作者 B 站主页（用户 2026-10-09 给的新短链）。</summary>
+        private const string BiliUrl = "https://b23.tv/txZtz98";
 
         /// <summary>
         /// 项目开源地址（GitHub）。
@@ -180,7 +180,7 @@ namespace GeZi
 
             var img = new Image
             {
-                Source = new BitmapImage(new Uri("pack://application:,,,/Resources/reward-qr.png")),
+                Source = new BitmapImage(new Uri("pack://application:,,,/Resources/reward-xiaozhou.png")),
                 Width = 340,
                 Height = 340,
             };
@@ -199,7 +199,7 @@ namespace GeZi
             var panel = new StackPanel { Margin = new Thickness(16) };
             panel.Children.Add(new TextBlock
             {
-                Text = "七十鸽 的赞赏码",
+                Text = "躬行小舟的赞赏码",
                 FontSize = 14,
                 FontWeight = FontWeights.SemiBold,
                 HorizontalAlignment = HorizontalAlignment.Center,

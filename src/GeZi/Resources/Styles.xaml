@@ -1577,6 +1577,32 @@
     </Style>
 
     <!-- 稀疏说明文字：收窄行宽到 ≤75 字符等效宽度，长段落不再横贯整屏 -->
+    <!-- ============================================================
+         设置页「快捷键」里的按键小方块（看起来像键帽）。
+         底色比卡片**更沉**（SurfaceSunken）+ 描边，和周围的文字拉开层次，
+         字母用等宽字体（MonoFontFamily）—— 一行里几个键帽宽度才会一致、对得齐。
+         ============================================================ -->
+    <Style x:Key="KeyCap" TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource SurfaceSunkenBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushStrong}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="CornerRadius" Value="5"/>
+        <Setter Property="Padding" Value="7,2"/>
+        <Setter Property="MinWidth" Value="26"/>
+        <Setter Property="HorizontalAlignment" Value="Left"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+    </Style>
+
+    <Style x:Key="KeyCapText" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource MonoFontFamily}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="HorizontalAlignment" Value="Center"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
     <Style x:Key="ProseText" TargetType="TextBlock">
         <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
         <Setter Property="FontSize" Value="12"/>

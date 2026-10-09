@@ -74,7 +74,7 @@
                             HorizontalAlignment="Left" Margin="0,10,0,0"
                             Cursor="Hand" Background="Transparent" BorderThickness="0"
                             Padding="0">
-                        <TextBlock x:Name="BiliText" Text="作者 B 站：b23.tv/gIoEfQM（点击跳转）"
+                        <TextBlock x:Name="BiliText" Text="作者 B 站：b23.tv/txZtz98（点击跳转）"
                                    FontSize="11.5" TextDecorations="Underline"
                                    Foreground="{DynamicResource PrimaryBrush}"/>
                     </Button>
@@ -124,7 +124,7 @@
                             <Border BorderBrush="{DynamicResource BorderBrushSoft}"
                                     BorderThickness="1" CornerRadius="8" Padding="6"
                                     Background="{DynamicResource SurfaceBrush}">
-                                <Image Source="/Resources/reward-qr.png" Width="150" Height="150"
+                                <Image Source="/Resources/reward-xiaozhou.png" Width="150" Height="150"
                                        RenderOptions.BitmapScalingMode="HighQuality"/>
                             </Border>
                         </Button>
@@ -132,7 +132,7 @@
                                    FontSize="10.5" Margin="0,8,0,0"
                                    HorizontalAlignment="Center"
                                    Foreground="{DynamicResource TextTertiaryBrush}"/>
-                        <TextBlock Text="七十鸽 的赞赏码" FontSize="12.5" FontWeight="SemiBold"
+                        <TextBlock Text="躬行小舟的赞赏码" FontSize="12.5" FontWeight="SemiBold"
                                    Margin="0,3,0,0" HorizontalAlignment="Center"
                                    Foreground="{DynamicResource TextPrimaryBrush}"/>
                     </StackPanel>

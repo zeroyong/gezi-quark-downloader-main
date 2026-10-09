@@ -10,6 +10,7 @@
         FontFamily="{StaticResource AppFontFamily}"
         TextOptions.TextFormattingMode="Display"
         UseLayoutRounding="True"
+        PreviewKeyDown="OnShortcutKeyDown"
         Closing="OnWindowClosing">
 
     <!-- 自绘标题栏：去掉系统边框，改用 WindowChrome 保留拖拽/贴边/双击最大化/系统菜单 -->
@@ -1437,6 +1438,99 @@
                                     </StackPanel>
                                 </Border>
                             </Grid>
+
+                            <!-- ============ 快捷键 ============
+                                 【2026-10-08 新增】放在设置页最下面 —— 它是"查一下"的东西，
+                                 不该插在会被经常改的并发/存储设置中间。
+                                 实现在 OnShortcutKeyDown（窗口级 PreviewKeyDown，单键，不带修饰键）。 -->
+                            <TextBlock Text="快捷键" Style="{StaticResource SectionLabel}" Margin="0,22,0,10"/>
+                            <Border Style="{StaticResource MutedCard}" Margin="0,0,0,4">
+                                <StackPanel>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+
+                                        <!-- 1 / 2 / 3：三个数字键共用一行说明（分开写三行太占地方） -->
+                                        <StackPanel Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Center">
+                                            <Border Style="{StaticResource KeyCap}">
+                                                <TextBlock Text="1" Style="{StaticResource KeyCapText}"/>
+                                            </Border>
+                                            <Border Style="{StaticResource KeyCap}" Margin="4,0,0,0">
+                                                <TextBlock Text="2" Style="{StaticResource KeyCapText}"/>
+                                            </Border>
+                                            <Border Style="{StaticResource KeyCap}" Margin="4,0,0,0">
+                                                <TextBlock Text="3" Style="{StaticResource KeyCapText}"/>
+                                            </Border>
+                                        </StackPanel>
+                                        <TextBlock Grid.Row="0" Grid.Column="1" Margin="12,0,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="分别切换到「下载」「任务」「登录」页"/>
+
+                                        <Border Grid.Row="1" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="q" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="1" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="打开「设置」页"/>
+
+                                        <Border Grid.Row="2" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="6" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="2" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="关于本程序"/>
+
+                                        <Border Grid.Row="3" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="a" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="3" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="后退：返回上一级目录（「分享链接」与「我的网盘」通用）"/>
+
+                                        <Border Grid.Row="4" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="d" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="4" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="免转存下载（不往自己网盘写中转文件；仅「分享链接」模式，且无法续传）"/>
+
+                                        <Border Grid.Row="5" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="x" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="5" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="下载选中"/>
+
+                                        <Border Grid.Row="6" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="g" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="6" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="获取直链…"/>
+                                    </Grid>
+
+                                    <TextBlock Style="{StaticResource ProseText}" Margin="0,14,0,0"
+                                               Text="都是单键，不需要按 Ctrl/Alt。切页在任何页面都可用；a / d / x / g 作用于文件列表，只在「下载」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件用 Shift+点击（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
+                                </StackPanel>
+                            </Border>
                         </StackPanel>
                     </ScrollViewer>
                 </TabItem>

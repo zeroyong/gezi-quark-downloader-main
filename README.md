@@ -168,6 +168,6 @@ GNU General Public License for more details.
 如果这个项目对你有帮助，欢迎请作者喝杯咖啡 ☕
 
 <p align="center">
-  <img src="GeZi.png" width="260" alt="赞赏码">
+  <img src="xiaozhou.png" width="260" alt="赞赏码">
 </p>
 

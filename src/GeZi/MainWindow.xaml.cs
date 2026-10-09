@@ -1927,6 +1927,95 @@ namespace GeZi
             await LoadDirAsync(_curFid);
         }
 
+        // ---------------- 键盘快捷键（2026-10-08） ----------------
+        //
+        // 单键操作，不带 Ctrl 组合：
+        //   · 切页：1 下载 / 2 任务 / 3 登录 / q 设置 / 6 关于本程序；
+        //   · 文件列表：a 后退 / d 免转存下载 / x 下载选中 / g 获取直链。
+        // 文案在设置页最下面的「快捷键」一节，两边要一起改。
+        //
+        // ⚠️ 单键方案唯一的坑是**抢输入**：这些字符在链接框、提取码、筛选框里就是普通字符，
+        //    必须照常能敲进去。所以第一步先看焦点在不在输入控件上（IsTypingTarget）。
+        // 🚨 只认**无修饰键**的按键：带 Ctrl/Alt/Win 的一律放过 —— Ctrl+C、Alt+Tab 这些
+        //    是系统和编辑器的，截胡了会很难查。
+
+        /// <summary>窗口级快捷键。挂在 Window 的 PreviewKeyDown 上（XAML 里）。</summary>
+        private void OnShortcutKeyDown(object sender, KeyEventArgs e)
+        {
+            // 光标在输入框里 → 这些字符是文字，不是快捷键
+            if (IsTypingTarget(Keyboard.FocusedElement)) return;
+            if ((Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Windows)) != 0)
+                return;
+
+            // ① 切换页面：任何页面都能用。
+            //    1/2/3 = 下载 / 任务 / 登录（设置那页给了 q，不让数字键去占位），
+            //    6 = 关于本程序。小键盘上的同名键（NumPad）一并认，免得用户按了没反应。
+            switch (e.Key)
+            {
+                case Key.D1:
+                case Key.NumPad1:
+                    e.Handled = true;
+                    Tabs.SelectedIndex = 0;   // 侧栏顺序：0 下载 / 1 任务 / 2 设置 / 3 登录
+                    return;
+                case Key.D2:
+                case Key.NumPad2:
+                    e.Handled = true;
+                    Tabs.SelectedIndex = 1;
+                    return;
+                case Key.D3:
+                case Key.NumPad3:
+                    e.Handled = true;
+                    Tabs.SelectedIndex = 3;
+                    return;
+                case Key.Q:
+                    e.Handled = true;
+                    Tabs.SelectedIndex = 2;
+                    return;
+                case Key.D6:
+                case Key.NumPad6:
+                    e.Handled = true;
+                    OnAboutClick(null, null);   // 与侧栏品牌区那个「?」同一条路径
+                    return;
+            }
+
+            // ② 以下都作用于「下载」页的文件列表。在任务页/设置页按 x 却把文件列表里
+            //    的选中项下掉，既看不见也想不到，所以先判页面。
+            if (Tabs.SelectedIndex != 0) return;
+
+            switch (e.Key)
+            {
+                case Key.A:   // 后退（上一级）—— 分享链接 / 我的网盘 是同一套实现
+                    e.Handled = true;
+                    OnUp(null, null);
+                    break;
+                case Key.D:   // 免转存下载
+                    e.Handled = true;
+                    OnDownloadSelectedNoSave(null, null);
+                    break;
+                case Key.X:   // 下载选中
+                    e.Handled = true;
+                    OnDownloadSelected(null, null);
+                    break;
+                case Key.G:   // 获取直链…
+                    e.Handled = true;
+                    OnFetchLinks(null, null);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 焦点是不是落在"要打字"的控件上（文本框 / 密码框 / 可编辑下拉框）。
+        /// 是的话快捷键必须让路 —— 否则链接框里连字母都敲不进去。
+        /// </summary>
+        private static bool IsTypingTarget(IInputElement focused)
+        {
+            if (focused == null) return false;
+            if (focused is TextBoxBase) return true;     // TextBox / RichTextBox
+            if (focused is PasswordBox) return true;
+            var cb = focused as ComboBox;
+            return cb != null && cb.IsEditable;          // 只读下拉框不算（在那儿按字母本来没反应）
+        }
+
         // ---------------- 下载 ----------------
 
         private async void OnDownloadSelected(object sender, RoutedEventArgs e)
