@@ -87,4 +87,7 @@
     <!-- 关闭按钮悬停红：深色下略降亮度，避免刺眼 -->
     <Color x:Key="TitleBarCloseHoverColor">#FFD62E3D</Color>
 
+    <!-- ────────── 模态遮罩（居中浮层背后的压暗层，如解析历史面板） -->
+    <Color x:Key="OverlayColor">#A6000000</Color>
+
 </ResourceDictionary>

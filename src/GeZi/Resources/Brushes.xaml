@@ -69,4 +69,7 @@
     <!-- 侧栏背景：从 AppBg 往白里推一点，与内容区形成"底色差"而非"硬线分隔" -->
     <SolidColorBrush x:Key="SidebarBrush" Color="{DynamicResource SurfaceColor}"/>
 
+    <!-- 模态遮罩：居中浮层（解析历史面板）背后的压暗层。深浅两套值见 Colors.*.xaml -->
+    <SolidColorBrush x:Key="OverlayBrush" Color="{DynamicResource OverlayColor}"/>
+
 </ResourceDictionary>

@@ -430,6 +430,88 @@ namespace GeZi.Core.Api
             return merged;
         }
 
+        /// <summary>目录的**一页**：条目 + 接口那边还有没有下一页。</summary>
+        public sealed class DirPage
+        {
+            public readonly List<QuarkFileEntry> Items = new List<QuarkFileEntry>();
+            public bool HasMore;
+        }
+
+        /// <summary>一次向接口要多少条。与原循环里写死的 50 一致。</summary>
+        private const int DirPageSize = 50;
+
+        /// <summary>
+        /// 取分享目录的**一页**（page 从 1 开始）。
+        ///
+        /// 【为什么要有它】<see cref="ShareDetailAsync"/> 是"从第 1 页循环到第 200 页、
+        /// 把整个目录攒完再返回"—— 一个几千项的分享点进去要等十几秒（用户实测反馈
+        /// 「一开始点击加载会很卡顿」）。这个只取一页，由上层按需一页页地取。
+        /// </summary>
+        public async Task<DirPage> ShareDetailPageAsync(string pwdId, string stoken,
+            string pdirFid, int page)
+        {
+            var query = new Dictionary<string, string>
+            {
+                { "pr", "ucpro" }, { "fr", "pc" },
+                { "pwd_id", pwdId }, { "stoken", stoken }, { "pdir_fid", pdirFid },
+                { "force", "0" }, { "_page", page.ToString() }, { "_size", DirPageSize.ToString() },
+                { "_fetch_banner", "0" }, { "_fetch_share", "0" }, { "_fetch_total", "1" },
+                { "_sort", "file_type:asc,updated_at:desc" },
+                { "ver", "2" }, { "fetch_share_full_path", "0" },
+            };
+            var res = await RequestAsync(HttpMethod.Get,
+                QuarkConstants.ApiBase + "/1/clouddrive/share/sharepage/detail", query);
+            Check(res, "读取分享列表");
+            var one = new DirPage();
+            var list = AsArray(Get(AsDict(Get(AsDict(res), "data")), "list"));
+            if (list != null)
+            {
+                foreach (var it in list)
+                    one.Items.Add(Normalize(it, share: true));
+            }
+            one.HasMore = PageHasMore(AsLong(Get(AsDict(Get(AsDict(res), "metadata")), "_total")),
+                page, one.Items.Count);
+            return one;
+        }
+
+        /// <summary>取自己网盘目录的一页（对应 <see cref="ListDirAsync"/> 的第 page 页）。</summary>
+        public async Task<DirPage> ListDirPageAsync(string pdirFid, int page)
+        {
+            var query = new Dictionary<string, string>
+            {
+                { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" },
+                { "pdir_fid", pdirFid }, { "_page", page.ToString() }, { "_size", DirPageSize.ToString() },
+                { "_fetch_total", "1" }, { "_fetch_sub_dirs", "0" },
+                { "_sort", "file_type:asc,updated_at:desc" },
+                { "_fetch_full_path", "0" }, { "fetch_all_file", "1" },
+                { "fetch_risk_file_name", "1" },
+            };
+            var res = await RequestAsync(HttpMethod.Get,
+                QuarkConstants.ApiBase + "/1/clouddrive/file/sort", query);
+            Check(res, "读取网盘列表");
+            var one = new DirPage();
+            var list = AsArray(Get(AsDict(Get(AsDict(res), "data")), "list"));
+            if (list != null)
+            {
+                foreach (var it in list)
+                    one.Items.Add(Normalize(it, share: false));
+            }
+            one.HasMore = PageHasMore(AsLong(Get(AsDict(Get(AsDict(res), "metadata")), "_total")),
+                page, one.Items.Count);
+            return one;
+        }
+
+        /// <summary>
+        /// 这一页之后还有没有：空页肯定没有；接口给了 _total 就按它判
+        /// （已取条数 + 本页条数 是否达到总数）；没给 _total 时退化成"整页取满就当还有"。
+        /// </summary>
+        private static bool PageHasMore(long total, int page, int added)
+        {
+            if (added <= 0) return false;
+            if (total > 0) return (long)(page - 1) * DirPageSize + added < total;
+            return added >= DirPageSize;
+        }
+
         public async Task<string> SaveShareAsync(IList<string> fidList, IList<string> tokenList,
             string toPdirFid, string pwdId, string stoken)
         {

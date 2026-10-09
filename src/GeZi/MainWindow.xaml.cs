@@ -226,7 +226,15 @@ namespace GeZi
 
             // 空状态提示：集合有变化就同步一次可见性。
             // 不改动任何业务逻辑，只是"列表为空时显示插画"这一层皮肤。
-            _files.CollectionChanged += (s, e) => UpdateEmptyStates();
+            // ⚠️ 走**合并**版（RequestUpdateEmptyStates）：分页铺列表时会连着变很多次，
+            //    每次都在里面整表数一遍是 O(n²)，几千项的目录会直接卡死。
+            _files.CollectionChanged += (s, e) => RequestUpdateEmptyStates();
+
+            // 文件列表快滑到底部时继续加载下一页（分页逻辑见 LoadDirAsync / LoadMoreItems）。
+            // 用 AddHandler 挂 ScrollChanged：不必去可视树里翻 ListBox 模板生成的那个
+            // ScrollViewer —— 事件里的 OriginalSource 就是它。
+            FileList.AddHandler(System.Windows.Controls.ScrollViewer.ScrollChangedEvent,
+                new System.Windows.Controls.ScrollChangedEventHandler(OnFileListScrollChanged));
             _tasks.CollectionChanged += (s, e) =>
             {
                 UpdateEmptyStates();
@@ -1002,6 +1010,9 @@ namespace GeZi
                 PassBox.Text = info.Passcode;
             _pwdId = info.PwdId;
             _linkCache.Clear();   // 换分享后旧 fid 的直链不再适用
+            // 目录缓存与大小缓存同理：fid 是分享内的编号，换了分享再留着会张冠李戴。
+            _dirCache.Clear();
+            _dirSizeCache.Clear();
 
             _client?.Dispose();
             _client = new QuarkClient(_settings.Cookie);
@@ -1025,6 +1036,7 @@ namespace GeZi
                 await LoadDirAsync(_curFid);
                 Log("解析成功。单击文件夹进入子目录；选中文件后点「下载选中」即可下载"
                     + "（文件夹要先选中：Shift / Ctrl+点击，或右键该行）。");
+                RecordShareHistory(info.PwdId, passcode, info.StartFid);
                 NotifyIfHidden("已解析剪贴板里的分享链接",
                     _files.Count > 0
                         ? "共 " + _files.Count + " 个文件。双击托盘图标打开窗口即可下载。"
@@ -1204,7 +1216,7 @@ namespace GeZi
 
                 // 提取码从**整段文本**里取：链接自带 pwd= 的能认，文案里的
                 // 「提取码：abcd」也能认（ShareUrlParser 两种都支持）。
-                AutoParseFromClipboard(url, ShareUrlParser.Parse(text).Passcode);
+                FillAndParse(url, ShareUrlParser.Parse(text).Passcode);
             }
             catch (Exception ex)
             {
@@ -1298,10 +1310,10 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 把剪贴板里发现的分享链接走一遍解析流程（复用「解析」按钮那套实现，
-        /// 包括按钮加载态与失败提示）。
+        /// 把一条分享链接**填进界面并解析**（复用「解析」按钮那套实现，包括按钮加载态与失败提示）。
+        /// 两个入口：剪贴板监听到链接、以及历史面板里点某一条。
         /// </summary>
-        private void AutoParseFromClipboard(string url, string passcode)
+        private void FillAndParse(string url, string passcode)
         {
             try
             {
@@ -1344,6 +1356,286 @@ namespace GeZi
             {
                 if (IsVisible) return;
                 _tray?.ShowBalloon(title, text);
+            }
+            catch { }
+        }
+
+        // ---------------- 解析历史面板（2026-10-09，按 h 唤起） ----------------
+        //
+        // 数据在 HistoryStore（GeZi.state.json 里的 Shares），这里只管画与开关。
+        // 布局照选定稿：整窗压暗 + **居中**卡片，列表按 今天 / 昨天 / 更早 分组，
+        // 一行 = 文件夹图标 + 名称 + 「时间 · 分享 ID · 提取码」，悬停整行高亮。
+
+        /// <summary>历史面板是不是开着（快捷键分支与开关都看它）。</summary>
+        private bool HistoryOpen
+        {
+            get { return HistoryOverlay != null && HistoryOverlay.Visibility == Visibility.Visible; }
+        }
+
+        private void ShowHistoryPanel()
+        {
+            try
+            {
+                RebuildHistoryPanel();   // 每次打开都重建：这中间可能又解析过新分享
+                if (HistoryOverlay == null) return;
+                HistoryOverlay.Visibility = Visibility.Visible;
+                // 把焦点收到浮层自己身上：否则之后随手敲的字母会钻进底下那个**看不见的**
+                // 链接框（把链接改脏），或者变成文件列表的首字母跳转。
+                HistoryOverlay.Focus();
+            }
+            catch (Exception ex)
+            {
+                Log("打开解析历史失败: " + ex.Message);
+            }
+        }
+
+        private void HideHistoryPanel()
+        {
+            try { if (HistoryOverlay != null) HistoryOverlay.Visibility = Visibility.Collapsed; } catch { }
+        }
+
+        /// <summary>点遮罩（面板外的暗色区域）= 关闭。面板本身是它的兄弟节点，不会误触。</summary>
+        private void OnHistoryOverlayClick(object sender, MouseButtonEventArgs e)
+        {
+            HideHistoryPanel();
+        }
+
+        private void OnHistoryClearClick(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                HistoryStore.ClearShareHistory();
+                RebuildHistoryPanel();
+                Log("已清空解析历史。");
+            }
+            catch (Exception ex)
+            {
+                Log("清空解析历史失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>重建列表：分组标题 + 可点行（都动态生成，见 MakeHistoryRow）。</summary>
+        private void RebuildHistoryPanel()
+        {
+            if (HistoryListPanel == null) return;
+            HistoryListPanel.Children.Clear();
+
+            var items = HistoryStore.GetShareHistory();
+            if (HistoryCountText != null)
+                HistoryCountText.Text = items.Count > 0 ? "共 " + items.Count + " 条" : "";
+
+            if (items.Count == 0)
+            {
+                HistoryListPanel.Children.Add(new TextBlock
+                {
+                    Text = "还没有解析记录。\n解析过的分享会留在这里，下次点一下就能重新打开。",
+                    Style = (Style)FindResource("HistoryEmptyText"),
+                });
+                return;
+            }
+
+            string lastGroup = null;
+            foreach (var it in items)
+            {
+                // 置顶的单独成组排在最前（GetShareHistory 已经把置顶的排到前面了）
+                string g = it.Pinned ? "置顶" : HistoryGroupOf(it.Time);
+                if (!string.Equals(g, lastGroup, StringComparison.Ordinal))
+                {
+                    HistoryListPanel.Children.Add(new TextBlock
+                    {
+                        Text = g,
+                        Style = (Style)FindResource("HistoryGroupLabel"),
+                    });
+                    lastGroup = g;
+                }
+                HistoryListPanel.Children.Add(MakeHistoryRow(it));
+            }
+        }
+
+        /// <summary>分组标签：按"距今天多久"给粗粒度分组（今天 / 昨天 / 更早）。</summary>
+        private static string HistoryGroupOf(string raw)
+        {
+            DateTime t;
+            if (!DateTime.TryParse(raw, out t)) return "更早";
+            DateTime today = DateTime.Today;
+            if (t.Date == today) return "今天";
+            if (t.Date == today.AddDays(-1)) return "昨天";
+            return "更早";
+        }
+
+        /// <summary>行里的时间：「今天 11:58」/「昨天 21:03」/「10-06 17:20」。</summary>
+        private static string FormatHistoryTime(string raw)
+        {
+            DateTime t;
+            if (!DateTime.TryParse(raw, out t)) return raw ?? "";
+            DateTime today = DateTime.Today;
+            if (t.Date == today) return "今天 " + t.ToString("HH:mm");
+            if (t.Date == today.AddDays(-1)) return "昨天 " + t.ToString("HH:mm");
+            return t.ToString("MM-dd HH:mm");
+        }
+
+        /// <summary>行里的副行：「今天 11:58 · /s/1f842a86 · 提取码 4k3p」。</summary>
+        private static string HistoryMetaOf(ShareHistoryEntry it)
+        {
+            var sb = new StringBuilder(FormatHistoryTime(it.Time));
+            if (!string.IsNullOrEmpty(it.PwdId))
+            {
+                sb.Append(" · /s/");
+                sb.Append(it.PwdId.Length > 8 ? it.PwdId.Substring(0, 8) : it.PwdId);
+            }
+            if (!string.IsNullOrEmpty(it.Passcode))
+                sb.Append(" · 提取码 ").Append(it.Passcode);
+            return sb.ToString();
+        }
+
+        /// <summary>造一行历史。整行是个 Button，点 = 重新解析那条分享。</summary>
+        private UIElement MakeHistoryRow(ShareHistoryEntry it)
+        {
+            // 图标：文件夹用"警示色的文件夹"（与文件列表里的文件夹图标同一套语言）；
+            // 没有文件夹的（根目录只有散文件）用文件图标 + 次要色。
+            var icon = new Border
+            {
+                Width = 34, Height = 34,
+                CornerRadius = new CornerRadius(9),
+                BorderThickness = new Thickness(1),
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            icon.SetResourceReference(System.Windows.Controls.Border.BackgroundProperty,
+                "SurfaceSunkenBrush");
+            icon.SetResourceReference(System.Windows.Controls.Border.BorderBrushProperty,
+                "BorderBrushSoft");
+
+            var glyph = new ShapePath
+            {
+                Data = (Geometry)FindResource(it.IsFolder ? "IconFolder" : "IconFile"),
+                Stretch = Stretch.Uniform,
+                Width = 17, Height = 17,
+                StrokeThickness = 1.8,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeLineJoin = PenLineJoin.Round,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            glyph.SetResourceReference(System.Windows.Shapes.Shape.StrokeProperty,
+                it.IsFolder ? "WarningBrush" : "TextTertiaryBrush");
+            icon.Child = glyph;
+
+            var meta = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            meta.Children.Add(new TextBlock
+            {
+                Text = it.Name ?? "",
+                Style = (Style)FindResource("HistoryNameText"),
+            });
+            meta.Children.Add(new TextBlock
+            {
+                Text = HistoryMetaOf(it),
+                Style = (Style)FindResource("HistoryMetaText"),
+            });
+
+            // ⚠️ 外层用 Grid 而不是横向 StackPanel：名称那个省略号只在**宽度被约束**时才生效，
+            //    StackPanel 会用无限宽去量孩子，长名字就直接撑出去、不截断。
+            var row = new Grid { VerticalAlignment = VerticalAlignment.Center };
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            row.ColumnDefinitions.Add(new ColumnDefinition
+            {
+                Width = new GridLength(1, GridUnitType.Star),
+            });
+            meta.Margin = new Thickness(12, 0, 0, 0);
+            Grid.SetColumn(icon, 0);
+            Grid.SetColumn(meta, 1);
+            row.Children.Add(icon);
+            row.Children.Add(meta);
+
+            var btn = new Button
+            {
+                Content = row,
+                Style = (Style)FindResource("HistoryRowButton"),
+                Tag = it,     // 点击时取回这一条（见 OnHistoryItemClick）
+                ToolTip = "重新解析：" + (it.Name ?? ""),
+            };
+            btn.Click += OnHistoryItemClick;
+            btn.ContextMenu = MakeHistoryMenu(it);
+            return btn;
+        }
+
+        /// <summary>行上右键：置顶 / 取消置顶、删除这条记录。</summary>
+        private ContextMenu MakeHistoryMenu(ShareHistoryEntry it)
+        {
+            // ⚠️ 菜单项是**每次重建行时新建**的，所以 Header 直接按当前状态定；
+            //    操作完都会 RebuildHistoryPanel()，标签跟着刷新（不用做双向绑定）。
+            var menu = new ContextMenu();
+
+            var pin = new MenuItem { Header = it.Pinned ? "取消置顶" : "置顶" };
+            pin.Click += (s, e) =>
+            {
+                try
+                {
+                    HistoryStore.SetSharePinned(it.PwdId, !it.Pinned);
+                    RebuildHistoryPanel();
+                    Log(it.Pinned ? "已取消置顶：" + it.Name : "已置顶：" + it.Name);
+                }
+                catch (Exception ex) { Log("置顶操作失败: " + ex.Message); }
+            };
+
+            var del = new MenuItem { Header = "删除这条记录" };
+            del.Click += (s, e) =>
+            {
+                try
+                {
+                    HistoryStore.RemoveShareHistory(it.PwdId);
+                    RebuildHistoryPanel();
+                    Log("已从解析历史里删除：" + it.Name);
+                }
+                catch (Exception ex) { Log("删除记录失败: " + ex.Message); }
+            };
+
+            menu.Items.Add(pin);
+            menu.Items.Add(del);
+            return menu;
+        }
+
+        /// <summary>
+        /// 文件区工具栏上那个「解析历史」按钮（h 键之外看得见的入口）。
+        /// ⚠️ 别和任务页的「下载历史」（<c>HistoryBtn</c> / OnOpenHistory）搞混 ——
+        /// 那个是**本地下载记录**，这个是**解析过的分享**。
+        /// </summary>
+        private void OnShareHistoryButtonClick(object sender, RoutedEventArgs e)
+        {
+            ShowHistoryPanel();
+        }
+
+        /// <summary>点历史里的一条 = 重新解析那条分享。</summary>
+        private void OnHistoryItemClick(object sender, RoutedEventArgs e)
+        {
+            var btn = sender as Button;
+            var it = btn != null ? btn.Tag as ShareHistoryEntry : null;
+            if (it == null || string.IsNullOrEmpty(it.PwdId)) return;
+
+            HideHistoryPanel();
+
+            // 原来那条链接指向某个子目录时，把 fid 也拼回去：OnParseClick 会把它当成
+            // start_fid，于是回到上次看的那个目录，而不是分享根目录。
+            string url = "https://pan.quark.cn/s/" + it.PwdId;
+            if (!string.IsNullOrEmpty(it.StartFid) && it.StartFid != "0")
+                url += "/" + it.StartFid;
+
+            Log("从解析历史打开：「" + (it.Name ?? it.PwdId) + "」");
+            FillAndParse(url, it.Passcode);
+        }
+
+        /// <summary>解析成功后记一条历史（供 h 面板）。</summary>
+        private void RecordShareHistory(string pwdId, string passcode, string startFid)
+        {
+            try
+            {
+                // 名字取"解析后看到的第一个文件夹" —— 这正是用户认这条记录的依据；
+                // 分享根目录只有散文件时退化成「（根目录）· N 个文件」。
+                var firstDir = _files.FirstOrDefault(f => f.IsDir);
+                string name = firstDir != null
+                    ? firstDir.Name
+                    : "（根目录）· " + _files.Count + " 个文件";
+                HistoryStore.AddShareHistory(pwdId, passcode, startFid, name, firstDir != null);
             }
             catch { }
         }
@@ -1470,6 +1762,198 @@ namespace GeZi
             try { _filesView?.Refresh(); } catch { }
         }
 
+        // ---------------- 目录分页 / 缓存（2026-10-09） ----------------
+        //
+        // 【要解决的问题】一个分享目录可能有几千项，原来的做法有三处叠加的卡：
+        //   ① LoadDirAsync 走 ShareDetailAsync / ListDirAsync —— 那是"从第 1 页循环到
+        //      第 200 页、把整个目录攒完才返回"，点进去要等十几秒才有东西；
+        //   ② 攒完再一次性 Add 几千条进 _files，而集合每变一次都会走 UpdateEmptyStates
+        //      （里面 _filesView.Cast<object>().Count() 是**整表枚举**）→ O(n²)；
+        //   ③ 退出再进（按 a 返回）把这套重跑一遍。
+        // 现在：
+        //   · 只取**一页**就先显示，界面里一次只"露" <see cref="DirRevealSize"/> 条；
+        //   · 快滑到底部再取下一页（用户要求「每次只加载 10 个，滑到底部再继续加载」）；
+        //   · 取到的按 fid 缓存，返回上一层再进来**一个请求都不发**（点「刷新」才重取）；
+        //   · UpdateEmptyStates 合并调用。
+
+        /// <summary>界面里一次"露"多少条（用户要求 10）。</summary>
+        private const int DirRevealSize = 10;
+
+        /// <summary>一个目录已取到的内容 + 分页游标（缓存里存的就是它）。</summary>
+        private sealed class DirCacheEntry
+        {
+            /// <summary>已取到的条目（已按"目录在前、文件在后"排好）。</summary>
+            public List<ShareFileItem> Items = new List<ShareFileItem>();
+            /// <summary>下一批要取接口的第几页。</summary>
+            public int NextPage = 2;
+            /// <summary>接口那边还有没有下一页。</summary>
+            public bool HasMore;
+            /// <summary>已经放进 <c>_files</c> 的条数。</summary>
+            public int RevealCount;
+        }
+
+        /// <summary>目录缓存：缓存键 → 已取内容。返回上一层/重进时直接铺开，不再请求。</summary>
+        private readonly Dictionary<string, DirCacheEntry> _dirCache =
+            new Dictionary<string, DirCacheEntry>();
+
+        /// <summary>当前目录对应的那一份缓存（没加载过时为 null）。</summary>
+        private DirCacheEntry _curDir;
+
+        /// <summary>目录加载的"代"：切目录后，旧的异步结果要作废（否则会覆盖新目录）。</summary>
+        private int _dirLoadToken;
+
+        /// <summary>正在取下一批（防重入：滚动事件会连发好几条）。</summary>
+        private bool _dirLoadingMore;
+
+        /// <summary>
+        /// 缓存键。**必须带上模式**：分享的根 fid 和自己网盘的根 fid 都是 "0"，
+        /// 不带前缀两个模式会串台（切过去会看到另一个模式的目录）。
+        /// </summary>
+        private string DirCacheKey(string fid)
+        {
+            return (ShareMode ? "s:" : "d:") + (fid ?? "");
+        }
+
+        /// <summary>取一页目录（分享模式 / 网盘模式走各自接口）。</summary>
+        private Task<QuarkClient.DirPage> FetchDirPageAsync(string fid, int page)
+        {
+            return ShareMode
+                ? _client.ShareDetailPageAsync(_pwdId, _stoken, fid, page)
+                : _client.ListDirPageAsync(fid, page);
+        }
+
+        /// <summary>目录在前、文件在后，同类按名称排序 —— 与 Python Flet 版一致。</summary>
+        private static List<ShareFileItem> SortDirEntries(IList<QuarkFileEntry> items)
+        {
+            return items
+                .OrderBy(it => it.IsDir ? 0 : 1)
+                .ThenBy(it => it.Name, StringComparer.CurrentCultureIgnoreCase)
+                .Select(it => new ShareFileItem
+                {
+                    Fid = it.Fid, Name = it.Name, Size = it.Size,
+                    IsDir = it.IsDir, Token = it.Token,
+                })
+                .ToList();
+        }
+
+        /// <summary>把一份目录内容铺到界面上：清列表 → 露第一批 → 重起大小求和。</summary>
+        private void ApplyDirView(DirCacheEntry entry)
+        {
+            _curDir = entry;
+
+            // 换目录时清掉上一次的筛选词，避免用户以为"新目录是空的"
+            if (!string.IsNullOrEmpty(_fileFilter))
+            {
+                _fileFilter = "";
+                try { FileFilterBox.Text = ""; } catch { }
+            }
+
+            _files.Clear();
+            entry.RevealCount = 0;
+            ResetDirSizeScan();     // 换目录了：上一轮没算完的不再算
+            RevealNextBatch();
+            UpdateDirMoreHint();
+        }
+
+        /// <summary>把下一批（<see cref="DirRevealSize"/> 条）放进列表。</summary>
+        private void RevealNextBatch()
+        {
+            if (_curDir == null) return;
+            int from = _curDir.RevealCount;
+            int to = Math.Min(from + DirRevealSize, _curDir.Items.Count);
+            if (to <= from) return;
+
+            var freshDirs = new List<ShareFileItem>();
+            for (int i = from; i < to; i++)
+            {
+                var it = _curDir.Items[i];
+                _files.Add(it);
+                if (it.IsDir) freshDirs.Add(it);
+            }
+            _curDir.RevealCount = to;
+
+            // 只给"刚露出来这几个文件夹"算大小：几千个目录不可能都算，
+            // 而且用户还没滚到的那些他根本看不见。
+            QueueDirSizeScan(freshDirs);
+        }
+
+        /// <summary>
+        /// 滑到底部时继续加载：缓冲里还有没露的直接露，取完了才去要下一页。
+        /// </summary>
+        private async void LoadMoreItems()
+        {
+            if (_dirLoadingMore || _curDir == null) return;
+
+            if (_files.Count < _curDir.Items.Count)
+            {
+                RevealNextBatch();
+                UpdateDirMoreHint();
+                return;
+            }
+            if (!_curDir.HasMore) return;      // 真到底了
+
+            _dirLoadingMore = true;
+            int token = _dirLoadToken;
+            string fid = _curFid;
+            try
+            {
+                var page = await FetchDirPageAsync(fid, _curDir.NextPage);
+                if (token != _dirLoadToken) return;   // 期间又切了目录 → 作废
+                _curDir.Items.AddRange(SortDirEntries(page.Items));
+                _curDir.NextPage++;
+                _curDir.HasMore = page.HasMore;
+                RevealNextBatch();
+                Log("继续加载：本页 " + page.Items.Count + " 项（已取 "
+                    + _curDir.Items.Count + " 项）");
+            }
+            catch (Exception ex)
+            {
+                Log("加载更多失败: " + ex.Message);
+            }
+            finally
+            {
+                _dirLoadingMore = false;
+                UpdateDirMoreHint();
+            }
+        }
+
+        /// <summary>列表底部那行提示：还有没加载完的就说清楚。</summary>
+        private void UpdateDirMoreHint()
+        {
+            try
+            {
+                if (FileMoreHint == null) return;
+                bool more = _curDir != null
+                    && (_curDir.HasMore || _files.Count < _curDir.Items.Count);
+                if (!more)
+                {
+                    FileMoreHint.Visibility = Visibility.Collapsed;
+                    return;
+                }
+                FileMoreHint.Text = "已显示 " + _files.Count + " 项 · 下面还有，下滑继续加载";
+                FileMoreHint.Visibility = Visibility.Visible;
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 文件列表滚动：快到底部就继续加载。
+        /// ⚠️ 只在**往下滚**（或内容变高）时判，否则往上滚回顶部也会触发一遍。
+        /// </summary>
+        private void OnFileListScrollChanged(object sender, ScrollChangedEventArgs e)
+        {
+            try
+            {
+                var sv = e.OriginalSource as ScrollViewer;
+                if (sv == null) return;
+                if (e.VerticalChange < 0) return;
+                // 距底部还剩不到一屏就不算"到底"：一屏的高度 ≈ 视口高度，够宽松了
+                if (sv.ScrollableHeight - sv.VerticalOffset > sv.ViewportHeight) return;
+                LoadMoreItems();
+            }
+            catch { }
+        }
+
         private async Task LoadDirAsync(string fid)
         {
             SetBusy(true);
@@ -1477,37 +1961,33 @@ namespace GeZi
             // 就出现，而不是等 SetBusy 的按钮禁用生效后才补上（会闪一下空状态）。
             _loadingDir = true;
             UpdateEmptyStates();
+            int token = ++_dirLoadToken;
             try
             {
-                List<QuarkFileEntry> items = ShareMode
-                    ? await _client.ShareDetailAsync(_pwdId, _stoken, fid)
-                    : await _client.ListDirAsync(fid);
-                _files.Clear();
-                // 换目录时清掉上一次的筛选词，避免用户以为"新目录是空的"
-                if (!string.IsNullOrEmpty(_fileFilter))
+                // ① 缓存命中 → 直接铺开，**一个请求都不发**（用户反馈"进文件夹再按 a
+                //    返回又要重新加载，很卡"）。
+                DirCacheEntry hit;
+                if (_dirCache.TryGetValue(DirCacheKey(fid), out hit))
                 {
-                    _fileFilter = "";
-                    try { FileFilterBox.Text = ""; } catch { }
+                    ApplyDirView(hit);
+                    Log("目录来自缓存: 共 " + hit.Items.Count + " 项（未重新请求）");
+                    return;
                 }
-                // 目录在前、文件在后，同类按名称排序 —— 与 Python Flet 版一致
-                // （原版只按接口返回顺序展示，用户看到文件夹和文件混在一起很别扭）。
-                var ordered = items
-                    .OrderBy(it => it.IsDir ? 0 : 1)
-                    .ThenBy(it => it.Name, StringComparer.CurrentCultureIgnoreCase);
-                foreach (var it in ordered)
-                {
-                    _files.Add(new ShareFileItem
-                    {
-                        Fid = it.Fid, Name = it.Name, Size = it.Size,
-                        IsDir = it.IsDir, Token = it.Token,
-                    });
-                }
-                Log("目录加载完成: " + _files.Count + " 项");
 
-                // 【2026-10-03】文件夹大小：夸克列表接口对目录**恒返回 size=0**，
-                // 所以列表里所有文件夹都显示「0 B」。这里在**后台**递归把子文件加起来，
-                // 算好一个就刷一个（SizeText 会随 PropertyChanged 自动更新）。
-                StartDirSizeScan(_files.Where(f => f.IsDir).ToList());
+                // ② 只取第一页就先显示，剩下的等滚到底部再取
+                var page = await FetchDirPageAsync(fid, 1);
+                if (token != _dirLoadToken) return;   // 期间又切了目录 → 这份结果作废
+
+                var entry = new DirCacheEntry
+                {
+                    Items = SortDirEntries(page.Items),
+                    NextPage = 2,
+                    HasMore = page.HasMore,
+                };
+                _dirCache[DirCacheKey(fid)] = entry;
+                ApplyDirView(entry);
+                Log("目录加载完成: 本页 " + entry.Items.Count + " 项"
+                    + (entry.HasMore ? "，下面还有（往下滑继续加载）" : ""));
             }
             catch (Exception ex)
             {
@@ -1525,8 +2005,20 @@ namespace GeZi
 
         // ---------------- 文件夹大小（后台递归求和） ----------------
 
-        /// <summary>已算出的目录大小缓存（fid → 字节数）。换目录不清，回来时能秒显示。</summary>
+        /// <summary>
+        /// 已算出的目录大小缓存（缓存键 → 字节数）。换目录不清，回来时能秒显示。
+        /// ⚠️ 键要带模式前缀（见 <see cref="DirSizeKey"/>）—— 分享根与网盘根的 fid 都是 "0"。
+        /// </summary>
         private readonly Dictionary<string, long> _dirSizeCache = new Dictionary<string, long>();
+
+        /// <summary>待算大小的文件夹**队列**（随"露出来"的条目增长）。</summary>
+        private readonly List<ShareFileItem> _dirSizeQueue = new List<ShareFileItem>();
+
+        /// <summary>队列是否正在被消费（空了就置回 false）。</summary>
+        private bool _dirSizeRunning;
+
+        /// <summary>本轮（同一次目录加载）还能发多少次请求。</summary>
+        private int _dirSizeBudget;
 
         /// <summary>当前这轮目录大小扫描的取消源。换目录/重进时取消上一轮。</summary>
         private CancellationTokenSource _dirSizeCts;
@@ -1536,57 +2028,87 @@ namespace GeZi
         /// </summary>
         /// <remarks>
         /// 递归求和是"每个子目录一次请求"。一个几千文件的分享可能展开成几百次请求 ——
-        /// 既慢又容易踩到风控。所以给个预算，超了就停手（剩下的保持「计算中…」），
+        /// 既慢又容易踩到风控。所以给个预算，超了就停手（剩下的标成「—」而不是 0），
         /// 宁可少算也不要因为一个后台功能把接口打爆。
         /// </remarks>
         private const int DirSizeRequestBudget = 300;
 
-        /// <summary>启动一轮后台扫描（不 await，界面不等它）。</summary>
-        private void StartDirSizeScan(IList<ShareFileItem> dirs)
+        /// <summary>大小缓存的键：与目录缓存同理，带模式前缀，免得两个模式串台。</summary>
+        private string DirSizeKey(string fid)
         {
-            if (dirs == null || dirs.Count == 0) return;
-
-            // 取消上一轮（用户可能已经切到别的目录了）
-            try { _dirSizeCts?.Cancel(); } catch { }
-            var cts = new CancellationTokenSource();
-            _dirSizeCts = cts;
-
-            // 已经在缓存里的直接填上，不用再请求
-            var todo = new List<ShareFileItem>();
-            foreach (var d in dirs)
-            {
-                long cached;
-                if (_dirSizeCache.TryGetValue(d.Fid ?? "", out cached))
-                    d.DirSize = cached;
-                else
-                    todo.Add(d);
-            }
-            if (todo.Count == 0) return;
-
-            // 不 await：让它在后台自己跑，界面立刻可用
-            var ignored = ComputeDirSizesAsync(todo, cts.Token);
+            return (ShareMode ? "s:" : "d:") + (fid ?? "");
         }
 
-        private async Task ComputeDirSizesAsync(IList<ShareFileItem> dirs, CancellationToken ct)
+        /// <summary>换目录时重置：停掉上一轮、清空待办、重置预算。</summary>
+        private void ResetDirSizeScan()
         {
-            int budget = DirSizeRequestBudget;
+            try { _dirSizeCts?.Cancel(); } catch { }
+            _dirSizeCts = new CancellationTokenSource();
+            _dirSizeQueue.Clear();
+            _dirSizeBudget = DirSizeRequestBudget;
+        }
+
+        /// <summary>
+        /// 把要算大小的目录**追加**进队列（已在缓存里的直接填上）。
+        ///
+        /// 【为什么改成队列】原来是"每调一次就取消上一轮、只算这次给的目录"，
+        /// 而分页之后目录是**一批批露出来**的 —— 那样每露一批就会把上一批没算完的丢掉。
+        /// </summary>
+        private void QueueDirSizeScan(IList<ShareFileItem> dirs)
+        {
+            if (dirs == null || dirs.Count == 0) return;
             foreach (var d in dirs)
             {
-                if (ct.IsCancellationRequested) return;
-                try
+                if (d == null || string.IsNullOrEmpty(d.Fid)) continue;
+                long cached;
+                if (_dirSizeCache.TryGetValue(DirSizeKey(d.Fid), out cached))
                 {
-                    long total = await SumDirAsync(d.Fid, ct, () => budget-- > 0);
-                    if (ct.IsCancellationRequested) return;
-                    _dirSizeCache[d.Fid ?? ""] = total;
-                    d.DirSize = total;
+                    d.DirSize = cached;
+                    continue;
                 }
-                catch (Exception ex)
+                if (!_dirSizeQueue.Contains(d)) _dirSizeQueue.Add(d);
+            }
+            if (_dirSizeRunning) return;
+            var cts = _dirSizeCts;
+            if (cts == null) return;
+            _dirSizeRunning = true;
+            // 不 await：让它在后台自己跑，界面立刻可用
+            var ignored = DrainDirSizeQueueAsync(cts.Token);
+        }
+
+        private async Task DrainDirSizeQueueAsync(CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested && _dirSizeQueue.Count > 0)
                 {
-                    if (ct.IsCancellationRequested) return;
-                    d.DirSizeFailed = true;
-                    Log("计算文件夹大小失败（" + d.Name + "）：" + ex.Message);
+                    var d = _dirSizeQueue[0];
+                    _dirSizeQueue.RemoveAt(0);
+                    if (d == null || string.IsNullOrEmpty(d.Fid)) continue;
+
+                    // 预算用完 → 标成"算不了"（显示「—」）。⚠️ 不能落 0：
+                    // 几千个目录时预算必然用完，落 0 会让一大片文件夹看起来是空的。
+                    if (_dirSizeBudget <= 0)
+                    {
+                        d.DirSizeFailed = true;
+                        continue;
+                    }
+                    try
+                    {
+                        long total = await SumDirAsync(d.Fid, ct, () => _dirSizeBudget-- > 0);
+                        if (ct.IsCancellationRequested) return;
+                        _dirSizeCache[DirSizeKey(d.Fid)] = total;
+                        d.DirSize = total;
+                    }
+                    catch (Exception ex)
+                    {
+                        if (ct.IsCancellationRequested) return;
+                        d.DirSizeFailed = true;
+                        Log("计算文件夹大小失败（" + d.Name + "）：" + ex.Message);
+                    }
                 }
             }
+            finally { _dirSizeRunning = false; }
         }
 
         /// <summary>递归求和：文件夹 = 所有子孙文件字节数之和。</summary>
@@ -1596,7 +2118,7 @@ namespace GeZi
             if (string.IsNullOrEmpty(fid) || ct.IsCancellationRequested) return 0;
 
             long cached;
-            if (_dirSizeCache.TryGetValue(fid, out cached)) return cached;
+            if (_dirSizeCache.TryGetValue(DirSizeKey(fid), out cached)) return cached;
             if (!takeBudget()) return 0;
 
             var items = ShareMode
@@ -1612,7 +2134,7 @@ namespace GeZi
                 else
                     sum += it.Size;
             }
-            _dirSizeCache[fid] = sum;
+            _dirSizeCache[DirSizeKey(fid)] = sum;
             return sum;
         }
 
@@ -1623,6 +2145,8 @@ namespace GeZi
             if (!BeginBusy(DriveRefreshBtn, "刷新中")) return;
             try
             {
+                // 「刷新」的语义就是要**绕过缓存**重新取一次
+                _dirCache.Remove(DirCacheKey(_curFid));
                 await LoadDirAsync(_curFid);
             }
             finally
@@ -1947,7 +2471,26 @@ namespace GeZi
             if ((Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Windows)) != 0)
                 return;
 
-            // ① 切换页面：任何页面都能用。
+            // ① h：开关「解析历史」面板（任何页面都可用）。
+            //    面板开着时它当"关闭"用，Esc 同样关；并且**其它快捷键一律不响应** ——
+            //    面板是模态观感，这期间把界面切走会让人莫名其妙。
+            if (HistoryOpen)
+            {
+                if (e.Key == Key.H || e.Key == Key.Escape)
+                {
+                    e.Handled = true;
+                    HideHistoryPanel();
+                }
+                return;
+            }
+            if (e.Key == Key.H)
+            {
+                e.Handled = true;
+                ShowHistoryPanel();
+                return;
+            }
+
+            // ② 切换页面：任何页面都能用。
             //    1/2/3 = 下载 / 任务 / 登录（设置那页给了 q，不让数字键去占位），
             //    6 = 关于本程序。小键盘上的同名键（NumPad）一并认，免得用户按了没反应。
             switch (e.Key)
@@ -6807,7 +7350,11 @@ namespace GeZi
                     // 用筛选视图的计数：筛选后一条不剩时也应该显示空状态；
                     // 但筛选是本地过滤，跟"正在加载"无关 —— 筛选出 0 条时
                     // 仍应显示空状态，不该显示"正在加载"。
-                    int n = _filesView != null ? _filesView.Cast<object>().Count() : _files.Count;
+                    // 没有筛选词时 _files.Count 就是可见条数，**不必整表枚举**视图 ——
+                    // 几千项的目录里，这个枚举是卡顿的主因之一。
+                    int n = string.IsNullOrEmpty(_fileFilter)
+                        ? _files.Count
+                        : (_filesView != null ? _filesView.Cast<object>().Count() : _files.Count);
                     bool loading = _loadingDir && _files.Count == 0 && string.IsNullOrEmpty(_fileFilter);
 
                     if (FileLoadingState != null)
@@ -6825,6 +7372,31 @@ namespace GeZi
                     TaskEmptyState.Visibility = _tasks.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             }
             catch { }
+        }
+
+        /// <summary>已排队的空状态刷新（把连续多次集合变化合并成一次计算）。</summary>
+        private bool _emptyStatePending;
+
+        /// <summary>
+        /// 合并版 <see cref="UpdateEmptyStates"/>：置个标记，攒到本轮 UI 空闲时才算一次。
+        ///
+        /// 【为什么要合并】往列表里铺目录时集合会连着变很多次，而 UpdateEmptyStates
+        /// 要数一遍可见条数（有筛选词时是整表枚举）—— 一次铺几千条就是 O(n²)，
+        /// 界面直接卡死（几千项目录的用户实测反馈）。合并之后一批变化只算一次。
+        /// </summary>
+        private void RequestUpdateEmptyStates()
+        {
+            if (_emptyStatePending) return;
+            _emptyStatePending = true;
+            try
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    _emptyStatePending = false;
+                    UpdateEmptyStates();
+                }), System.Windows.Threading.DispatcherPriority.Background);
+            }
+            catch { _emptyStatePending = false; }
         }
 
         // 用 WindowChrome 去掉了系统边框，所以拖拽/双击最大化要自己接。

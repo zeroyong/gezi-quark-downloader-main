@@ -81,4 +81,8 @@
     <Color x:Key="TitleBarHoverColor">#FFEDEFF5</Color>
     <Color x:Key="TitleBarCloseHoverColor">#FFE81123</Color>
 
+    <!-- ────────── 模态遮罩（居中浮层背后的压暗层，如解析历史面板）
+         浅色界面下不能用纯黑 65%（会显得脏），改用偏蓝的深色 + 更低不透明度。 -->
+    <Color x:Key="OverlayColor">#5C0F141E</Color>
+
 </ResourceDictionary>

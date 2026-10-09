@@ -628,7 +628,7 @@
                                         </StackPanel>
                                     </Button>
                                     <Button x:Name="DriveRefreshBtn" Click="OnRefresh"
-                                            Style="{StaticResource ToolButton}" Margin="0">
+                                            Style="{StaticResource ToolButton}">
                                         <StackPanel Orientation="Horizontal">
                                             <Path Data="{StaticResource IconRefresh}" Stretch="Uniform"
                                                   Width="13" Height="13" VerticalAlignment="Center"
@@ -638,12 +638,35 @@
                                             <TextBlock Text="刷新" Margin="6,0,0,0" VerticalAlignment="Center"/>
                                         </StackPanel>
                                     </Button>
+                                    <!-- 【2026-10-09】解析历史的**看得见**的入口：用户要求
+                                         「在我的网盘右侧也加一个，更直观」——
+                                         单靠 h 键没人猜得到。⚠️ 这条工具栏是两个模式共用的，
+                                         所以「分享链接」模式下也一并显示（两边都能用，不冲突）。 -->
+                                    <Button x:Name="ShareHistoryBtn" Click="OnShareHistoryButtonClick"
+                                            Style="{StaticResource ToolButton}" Margin="0"
+                                            ToolTip="解析历史：最近解析过的分享，点一条即可重新打开（快捷键 h）">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Path Data="{StaticResource IconHistory}" Stretch="Uniform"
+                                                  Width="13" Height="13" VerticalAlignment="Center"
+                                                  Stroke="{DynamicResource TextSecondaryBrush}"
+                                                  StrokeThickness="2"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                  StrokeLineJoin="Round"/>
+                                            <TextBlock Text="解析历史" Margin="6,0,0,0"
+                                                       VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
                                 </StackPanel>
                             </Grid>
 
                             <!-- 文件列表 -->
                             <Border Grid.Row="1" Style="{StaticResource Card}" Padding="0">
                                 <Grid>
+                                    <Grid.RowDefinitions>
+                                        <!-- 列表占满；底部那行只在"还有没加载完的"时候才有高度 -->
+                                        <RowDefinition Height="*"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
                                     <!-- ⚠️ SelectionMode=Extended 本来 Shift+点击 = **连选**（整段区间）。
                                          用户要求「可以使用 shift 多选，但不是连选」——
                                          即 Shift+点击只切换**这一个**项的选中态。
@@ -772,6 +795,14 @@
                                                    Margin="0,4,0,0" HorizontalAlignment="Center"
                                                    Style="{StaticResource TertiaryText}" FontSize="11"/>
                                     </StackPanel>
+
+                                    <!-- 【2026-10-09】分页提示：目录大时列表一次只"露"一批条目，
+                                         这行告诉用户"下面还有"，滚到底会自动续上（见 LoadMoreItems）。 -->
+                                    <TextBlock x:Name="FileMoreHint" Grid.Row="1"
+                                               Visibility="Collapsed"
+                                               HorizontalAlignment="Center" Margin="0,2,0,10"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"
+                                               FontSize="11.5"/>
                                 </Grid>
                             </Border>
                         </Grid>
@@ -1459,6 +1490,7 @@
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
                                         </Grid.RowDefinitions>
 
                                         <!-- 1 / 2 / 3：三个数字键共用一行说明（分开写三行太占地方） -->
@@ -1495,40 +1527,48 @@
                                                    Text="关于本程序"/>
 
                                         <Border Grid.Row="3" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
-                                            <TextBlock Text="a" Style="{StaticResource KeyCapText}"/>
+                                            <TextBlock Text="h" Style="{StaticResource KeyCapText}"/>
                                         </Border>
                                         <TextBlock Grid.Row="3" Grid.Column="1" Margin="12,10,0,0"
                                                    VerticalAlignment="Center"
                                                    Style="{StaticResource SecondaryText}"
-                                                   Text="后退：返回上一级目录（「分享链接」与「我的网盘」通用）"/>
+                                                   Text="打开 / 关闭「解析历史」（记着解析过的分享，点一条即可重新打开）"/>
 
                                         <Border Grid.Row="4" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
-                                            <TextBlock Text="d" Style="{StaticResource KeyCapText}"/>
+                                            <TextBlock Text="a" Style="{StaticResource KeyCapText}"/>
                                         </Border>
                                         <TextBlock Grid.Row="4" Grid.Column="1" Margin="12,10,0,0"
                                                    VerticalAlignment="Center"
                                                    Style="{StaticResource SecondaryText}"
-                                                   Text="免转存下载（不往自己网盘写中转文件；仅「分享链接」模式，且无法续传）"/>
+                                                   Text="后退：返回上一级目录（「分享链接」与「我的网盘」通用）"/>
 
                                         <Border Grid.Row="5" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
-                                            <TextBlock Text="x" Style="{StaticResource KeyCapText}"/>
+                                            <TextBlock Text="d" Style="{StaticResource KeyCapText}"/>
                                         </Border>
                                         <TextBlock Grid.Row="5" Grid.Column="1" Margin="12,10,0,0"
                                                    VerticalAlignment="Center"
                                                    Style="{StaticResource SecondaryText}"
-                                                   Text="下载选中"/>
+                                                   Text="免转存下载（不往自己网盘写中转文件；仅「分享链接」模式，且无法续传）"/>
 
                                         <Border Grid.Row="6" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
-                                            <TextBlock Text="g" Style="{StaticResource KeyCapText}"/>
+                                            <TextBlock Text="x" Style="{StaticResource KeyCapText}"/>
                                         </Border>
                                         <TextBlock Grid.Row="6" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="下载选中"/>
+
+                                        <Border Grid.Row="7" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="g" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="7" Grid.Column="1" Margin="12,10,0,0"
                                                    VerticalAlignment="Center"
                                                    Style="{StaticResource SecondaryText}"
                                                    Text="获取直链…"/>
                                     </Grid>
 
                                     <TextBlock Style="{StaticResource ProseText}" Margin="0,14,0,0"
-                                               Text="都是单键，不需要按 Ctrl/Alt。切页在任何页面都可用；a / d / x / g 作用于文件列表，只在「下载」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件用 Shift+点击（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
+                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史在任何页面都可用；a / d / x / g 作用于文件列表，只在「下载」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件用 Shift+点击（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
                                 </StackPanel>
                             </Border>
                         </StackPanel>
@@ -1869,6 +1909,77 @@
                     </ScrollViewer>
                 </TabItem>
                 </TabControl>
+            </Grid>
+
+            <!-- ================= 解析历史（按 h 唤起） =================
+                 盖住整窗（含标题栏），观感与「关于」这类浮层一致：**居中**一块卡片，
+                 背后压暗；点面板外的暗色区域或按 Esc / h 关闭。
+                 【为什么不做成独立 Window】独立窗口没法把"背后的主界面压暗"，
+                 而这个面板要的正是"浮在当前界面之上"；在窗口里加一层 Grid 最直接。
+                 列表内容由 RebuildHistoryPanel() 动态生成（分组标题 + 可点行）。
+                 Focusable=True：打开时把焦点收到自己身上，免得之后随手敲的字母
+                 钻进底下那个看不见的链接框里（会把链接改脏）。 -->
+            <Grid x:Name="HistoryOverlay" Grid.RowSpan="2" Visibility="Collapsed"
+                  Focusable="True" FocusVisualStyle="{x:Null}">
+                <!-- 遮罩：点它 = 关闭 -->
+                <Border Background="{DynamicResource OverlayBrush}"
+                        MouseLeftButtonDown="OnHistoryOverlayClick"/>
+
+                <Border x:Name="HistoryPanel" Width="580" MaxHeight="500"
+                        HorizontalAlignment="Center" VerticalAlignment="Center"
+                        Background="{DynamicResource SurfaceBrush}"
+                        BorderBrush="{DynamicResource BorderBrushSoft}" BorderThickness="1"
+                        CornerRadius="14">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <!-- 头：图标 + 标题 + 条数 + 「清空」 -->
+                        <Grid Grid.Row="0" Margin="18,16,14,10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" Orientation="Horizontal"
+                                        VerticalAlignment="Center">
+                                <Path Data="{StaticResource IconHistory}" Stretch="Uniform"
+                                      Width="17" Height="17" VerticalAlignment="Center"
+                                      Stroke="{DynamicResource PrimaryBrush}" StrokeThickness="1.8"
+                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                      StrokeLineJoin="Round"/>
+                                <TextBlock Text="解析历史" Margin="9,0,0,0" FontSize="15"
+                                           FontWeight="SemiBold" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                <TextBlock x:Name="HistoryCountText" Margin="9,0,0,0" FontSize="11.5"
+                                           VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                            </StackPanel>
+                            <Button x:Name="HistoryClearBtn" Grid.Column="1" Content="清空"
+                                    Click="OnHistoryClearClick"
+                                    Style="{StaticResource SecondaryButton}"
+                                    Padding="12,5" FontSize="12"
+                                    ToolTip="清空全部解析历史"/>
+                        </Grid>
+
+                        <!-- 列表（内容由 RebuildHistoryPanel 生成） -->
+                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto"
+                                      Padding="10,0,10,12">
+                            <StackPanel x:Name="HistoryListPanel"/>
+                        </ScrollViewer>
+
+                        <!-- 脚：关闭方式 -->
+                        <Border Grid.Row="2" BorderThickness="0,1,0,0"
+                                BorderBrush="{DynamicResource BorderBrushSoft}"
+                                Padding="18,11">
+                            <TextBlock FontSize="11.5" TextWrapping="Wrap"
+                                       Foreground="{DynamicResource TextTertiaryBrush}"
+                                       Text="点任意一条即可重新解析该分享 · 右键可置顶或删除 · 按 h 或 Esc、或点面板外的空白处关闭"/>
+                        </Border>
+                    </Grid>
+                </Border>
             </Grid>
         </Grid>
     </Border>

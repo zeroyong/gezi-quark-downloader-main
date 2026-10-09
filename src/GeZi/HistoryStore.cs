@@ -35,7 +35,45 @@ namespace GeZi
     }
 
     /// <summary>
-    /// 下载历史 + 未完成任务记录的持久化。
+    /// 一条「解析过的分享」记录（按 <c>h</c> 唤出的历史面板用）。
+    ///
+    /// 【为什么不复用 HistoryRecord】那条是**下载**历史（记的是本地文件路径与大小），
+    /// 这条记的是**分享**（pwd_id / 提取码），两者字段没有交集，混在一起两边都要判空。
+    /// </summary>
+    [DataContract]
+    public class ShareHistoryEntry
+    {
+        [DataMember(Order = 1)] public string PwdId { get; set; }
+
+        /// <summary>提取码；无码时为空串。</summary>
+        [DataMember(Order = 2)] public string Passcode { get; set; }
+
+        /// <summary>解析时进入的目录（带 fid 的分享链接才有意义，普通分享是 "0"）。</summary>
+        [DataMember(Order = 3)] public string StartFid { get; set; }
+
+        /// <summary>
+        /// 面板里显示的名字：解析后根目录里的**第一个文件夹名**。
+        /// 没有文件夹（分享根目录只有散文件）时退化成「（根目录）· N 个文件」。
+        /// </summary>
+        [DataMember(Order = 4)] public string Name { get; set; }
+
+        /// <summary>上面那个名字是不是文件夹 —— 决定面板里用文件夹图标还是文件图标。</summary>
+        [DataMember(Order = 5)] public bool IsFolder { get; set; }
+
+        /// <summary>解析时刻。"yyyy-MM-dd HH:mm:ss"，与下载历史同一个格式。</summary>
+        [DataMember(Order = 6)] public string Time { get; set; }
+
+        /// <summary>
+        /// 用户手动「置顶」的标记：置顶的始终排在最前，**不受后续解析的影响**。
+        ///
+        /// 【为什么不是"把时间改成现在"】那样只是把它挪到最前面一次，而且显示的时间
+        /// 会变成谎话（明明是上周解析的，却写着"今天"）。
+        /// </summary>
+        [DataMember(Order = 7)] public bool Pinned { get; set; }
+    }
+
+    /// <summary>
+    /// 下载历史 + 未完成任务记录 + 解析历史的持久化。
     ///
     /// 移植自 Python Flet 版的 `records`（历史，上限 200）与 `flet_pending`（未完成任务）。
     /// 两者原先都存在 core 的 state 里（同一个 state.json），这里合并成一个文件，
@@ -50,11 +88,19 @@ namespace GeZi
     {
         private const int MaxRecords = 200;   // 与 Python Flet 版一致
 
+        /// <summary>
+        /// 解析历史的上限。比下载历史小得多：它是"最近打开过什么"，翻久了没意义，
+        /// 而且每条都要在面板里画出来。
+        /// </summary>
+        private const int MaxShareHistory = 50;
+
         [DataContract]
         private sealed class State
         {
             [DataMember(Order = 1)] public List<HistoryRecord> Records { get; set; }
             [DataMember(Order = 2)] public List<PendingTask> Pending { get; set; }
+            /// <summary>解析历史。⚠️ 老 state.json 里没有这个字段 → 反序列化为 null，Load 里补空表。</summary>
+            [DataMember(Order = 3)] public List<ShareHistoryEntry> Shares { get; set; }
         }
 
         private static string StatePath
@@ -87,13 +133,19 @@ namespace GeZi
                         {
                             if (s.Records == null) s.Records = new List<HistoryRecord>();
                             if (s.Pending == null) s.Pending = new List<PendingTask>();
+                            if (s.Shares == null) s.Shares = new List<ShareHistoryEntry>();
                             return s;
                         }
                     }
                 }
             }
             catch { }
-            return new State { Records = new List<HistoryRecord>(), Pending = new List<PendingTask>() };
+            return new State
+            {
+                Records = new List<HistoryRecord>(),
+                Pending = new List<PendingTask>(),
+                Shares = new List<ShareHistoryEntry>(),
+            };
         }
 
         private static void Save(State s)
@@ -145,6 +197,106 @@ namespace GeZi
         {
             var s = Load();
             s.Records.Clear();
+            Save(s);
+        }
+
+        // ---------------- 解析历史（按 h 唤出的面板用） ----------------
+
+        /// <summary>解析历史：**置顶的在最前**，其余按时间倒序（新的在前）。</summary>
+        public static List<ShareHistoryEntry> GetShareHistory()
+        {
+            var s = Load();
+            var list = new List<ShareHistoryEntry>(s.Shares);
+            list.Reverse();   // 存储是"旧的在前"，给 UI 时翻成"新的在前"
+            if (list.TrueForAll(x => !x.Pinned))
+                return list;
+
+            // 置顶的提到最前；两段内部都保持"新的在前"
+            var result = list.FindAll(x => x.Pinned);
+            result.AddRange(list.FindAll(x => !x.Pinned));
+            return result;
+        }
+
+        /// <summary>
+        /// 记一条解析历史。
+        ///
+        /// 【同一条分享只留一条】pwd_id 相同就把旧的删掉再插到**末尾**（= 最新）——
+        /// 再解析一次同一条链接，只是让它回到列表最前面并更新名字/提取码/时间，
+        /// 而不是堆出好几条一模一样的记录。
+        /// ⚠️ 旧那条若被置顶过，要**把置顶状态带过来** —— 置顶是用户的显式选择，
+        ///    不能因为他又点了一次这条链接就悄悄取消。
+        /// </summary>
+        public static void AddShareHistory(string pwdId, string passcode, string startFid,
+            string name, bool isFolder)
+        {
+            if (string.IsNullOrEmpty(pwdId)) return;
+            try
+            {
+                var s = Load();
+                bool wasPinned = false;
+                for (int i = s.Shares.Count - 1; i >= 0; i--)
+                {
+                    if (string.Equals(s.Shares[i].PwdId, pwdId, StringComparison.Ordinal))
+                    {
+                        wasPinned = wasPinned || s.Shares[i].Pinned;
+                        s.Shares.RemoveAt(i);
+                    }
+                }
+                s.Shares.Add(new ShareHistoryEntry
+                {
+                    PwdId = pwdId,
+                    Passcode = passcode ?? "",
+                    StartFid = string.IsNullOrEmpty(startFid) ? "0" : startFid,
+                    Name = name ?? "",
+                    IsFolder = isFolder,
+                    Pinned = wasPinned,
+                    Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                });
+                if (s.Shares.Count > MaxShareHistory)
+                    s.Shares.RemoveRange(0, s.Shares.Count - MaxShareHistory);
+                Save(s);
+            }
+            catch { }
+        }
+
+        /// <summary>置顶 / 取消置顶某条解析历史。</summary>
+        public static void SetSharePinned(string pwdId, bool pinned)
+        {
+            if (string.IsNullOrEmpty(pwdId)) return;
+            try
+            {
+                var s = Load();
+                foreach (var e in s.Shares)
+                {
+                    if (string.Equals(e.PwdId, pwdId, StringComparison.Ordinal))
+                        e.Pinned = pinned;
+                }
+                Save(s);
+            }
+            catch { }
+        }
+
+        /// <summary>删掉某条解析历史（按 pwd_id）。</summary>
+        public static void RemoveShareHistory(string pwdId)
+        {
+            if (string.IsNullOrEmpty(pwdId)) return;
+            try
+            {
+                var s = Load();
+                for (int i = s.Shares.Count - 1; i >= 0; i--)
+                {
+                    if (string.Equals(s.Shares[i].PwdId, pwdId, StringComparison.Ordinal))
+                        s.Shares.RemoveAt(i);
+                }
+                Save(s);
+            }
+            catch { }
+        }
+
+        public static void ClearShareHistory()
+        {
+            var s = Load();
+            s.Shares.Clear();
             Save(s);
         }
 
