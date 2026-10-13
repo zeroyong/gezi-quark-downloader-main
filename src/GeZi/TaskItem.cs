@@ -29,10 +29,23 @@ namespace GeZi
         /// <summary>是否已写入下载历史。终态只记一次，防止重复上报把历史刷屏。</summary>
         public bool HistoryRecorded { get; set; }
 
+        private static long _nextSeq;
+
+        /// <summary>
+        /// 构造次序（进程内自增，仅用于任务列表排序）。
+        ///
+        /// 【2026-10-13】用户要求任务列表可切换"新任务在前 / 在后"。列表里同一批
+        /// 任务（比如一次加入 20 个文件）几乎同时创建，用 <see cref="DateTime.Now"/>
+        /// 排序会因精度不够而次序不稳，所以用一个单调递增的序号当"时间戳"。
+        /// 越新加入的任务 Seq 越大 ⇒ 倒序排列即"新任务在前"。
+        /// </summary>
+        public long Seq { get; }
+
         public TaskItem(DownloadJob job, string name)
         {
             Job = job;
             Name = name;
+            Seq = ++_nextSeq;
         }
 
         private JobState _state = JobState.Queued;

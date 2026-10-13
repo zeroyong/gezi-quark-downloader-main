@@ -145,6 +145,18 @@ namespace GeZi
         ///    系统是深色则界面跟着变深，正是"跟随系统"该有的行为。
         /// </summary>
         public AppTheme Theme { get; set; } = AppTheme.System;
+
+        /// <summary>
+        /// 任务列表排序：新加入的任务是否排在**列表最前面**（2026-10-13 新增）。
+        /// false（默认）= 排在已有任务**后面**，即加入顺序，与旧版行为一致；
+        /// true = 按时间倒序，最新的任务在最上面（见 <see cref="TaskItem.Seq"/>）。
+        ///
+        /// ⚠️ 默认值刻意留 false：XmlSerializer 反序列化**不执行字段初始化器**，
+        ///    老配置文件里没有这个节点时属性就是 default(bool) = false，
+        ///    正好等于"保持旧行为"，所以这里**不需要**像 ClipboardAutoParse 那样
+        ///    额外记一个"写过没有"的标记。
+        /// </summary>
+        public bool TaskNewestFirst { get; set; }
     }
 
     /// <summary>主窗口「关闭」按钮的行为。</summary>

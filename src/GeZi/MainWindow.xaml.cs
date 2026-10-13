@@ -1755,6 +1755,18 @@ namespace GeZi
             return null;
         }
 
+        /// <summary>
+        /// 入队成功后清掉文件列表的选中。
+        ///
+        /// 【2026-10-13】用户要求：「用 Shift 选中文件夹之后，再按 d 免转存，还是会选中
+        /// —— 记得发送后取消选中」。留着高亮的坏处：看不出东西"已经交出去了"，
+        /// 而且顺手再按一次 d/x 会把同一批文件**重复入队**。
+        /// </summary>
+        private void ClearFileSelection()
+        {
+            try { FileList.SelectedItems.Clear(); } catch { }
+        }
+
         /// <summary>文件列表筛选框变化：只按名称包含关键字过滤，不改动底层集合。</summary>
         private void OnFileFilterChanged(object sender, TextChangedEventArgs e)
         {
@@ -1790,6 +1802,11 @@ namespace GeZi
             public bool HasMore;
             /// <summary>已经放进 <c>_files</c> 的条数。</summary>
             public int RevealCount;
+            /// <summary>
+            /// 离开这个目录时列表的滚动位置（像素）。
+            /// 按 a 返回时把滚动条放回原处 —— 否则"内容回来了、位置却在最上面"。
+            /// </summary>
+            public double ScrollOffset;
         }
 
         /// <summary>目录缓存：缓存键 → 已取内容。返回上一层/重进时直接铺开，不再请求。</summary>
@@ -1798,6 +1815,9 @@ namespace GeZi
 
         /// <summary>当前目录对应的那一份缓存（没加载过时为 null）。</summary>
         private DirCacheEntry _curDir;
+
+        /// <summary>文件列表模板里的那个 ScrollViewer（滚动时顺手记下来，恢复位置要用）。</summary>
+        private ScrollViewer _fileScroller;
 
         /// <summary>目录加载的"代"：切目录后，旧的异步结果要作废（否则会覆盖新目录）。</summary>
         private int _dirLoadToken;
@@ -1836,9 +1856,21 @@ namespace GeZi
                 .ToList();
         }
 
-        /// <summary>把一份目录内容铺到界面上：清列表 → 露第一批 → 重起大小求和。</summary>
-        private void ApplyDirView(DirCacheEntry entry)
+        /// <summary>
+        /// 把一份目录内容铺到界面上：清列表 → 露第一批 → 重起大小求和。
+        /// </summary>
+        /// <param name="restore">
+        /// true = 这是从缓存**返回**到之前看过的目录：把上次已铺开的条数和滚动位置
+        /// 一起还原（用户要求「用 a 回退时记住上次滚动的位置和加载的内容，
+        /// 不要重复加载」）。false = 首次进入，从头铺。
+        /// </param>
+        private void ApplyDirView(DirCacheEntry entry, bool restore = false)
         {
+            // ⚠️ 必须先取值再动列表：下面 _files.Clear() 会触发 ScrollChanged，
+            //    而那个处理器会把 entry.ScrollOffset 覆写成 0（因为列表清空就在顶部）。
+            int wantCount = restore ? entry.RevealCount : 0;
+            double wantOffset = restore ? entry.ScrollOffset : 0;
+
             _curDir = entry;
 
             // 换目录时清掉上一次的筛选词，避免用户以为"新目录是空的"
@@ -1849,10 +1881,76 @@ namespace GeZi
             }
 
             _files.Clear();
-            entry.RevealCount = 0;
             ResetDirSizeScan();     // 换目录了：上一轮没算完的不再算
-            RevealNextBatch();
+
+            if (restore)
+            {
+                // 已算过的文件夹大小在 _dirSizeCache 里，恢复时不会重新发请求。
+                RevealUpTo(wantCount);
+                RestoreScrollOffset(wantOffset);
+            }
+            else
+            {
+                entry.RevealCount = 0;
+                entry.ScrollOffset = 0;
+                RevealNextBatch();
+            }
             UpdateDirMoreHint();
+        }
+
+        /// <summary>
+        /// 一次性把 <paramref name="count"/> 条以内已看过的内容铺回列表。
+        /// 用于"从缓存恢复视图"：不走 <see cref="RevealNextBatch"/> 的 10 条一批，
+        /// 免得几千项时一路批处理刷几十次 UI。
+        /// </summary>
+        private void RevealUpTo(int count)
+        {
+            if (_curDir == null) return;
+            int to = Math.Min(count, _curDir.Items.Count);
+            if (to <= _files.Count) return;
+
+            var freshDirs = new List<ShareFileItem>();
+            for (int i = _files.Count; i < to; i++)
+            {
+                var it = _curDir.Items[i];
+                _files.Add(it);
+                if (it.IsDir) freshDirs.Add(it);
+            }
+            _curDir.RevealCount = to;
+            QueueDirSizeScan(freshDirs);
+        }
+
+        /// <summary>把滚动条放回上次离开这个目录时的位置。</summary>
+        private void RestoreScrollOffset(double offset)
+        {
+            if (offset <= 0) return;
+            // 必须等布局跑完（列表内容变了、可滚动高度才算得出来），
+            // 否则 ScrollToVerticalOffset 会被夹到 0。
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                try
+                {
+                    var sv = _fileScroller ?? FindDescendantScrollViewer(FileList);
+                    if (sv == null) return;
+                    _fileScroller = sv;
+                    sv.ScrollToVerticalOffset(offset);
+                }
+                catch { }
+            }), DispatcherPriority.Loaded);
+        }
+
+        private static ScrollViewer FindDescendantScrollViewer(DependencyObject root)
+        {
+            if (root == null) return null;
+            int n = VisualTreeHelper.GetChildrenCount(root);
+            for (int i = 0; i < n; i++)
+            {
+                var c = VisualTreeHelper.GetChild(root, i);
+                if (c is ScrollViewer sv) return sv;
+                var r = FindDescendantScrollViewer(c);
+                if (r != null) return r;
+            }
+            return null;
         }
 
         /// <summary>把下一批（<see cref="DirRevealSize"/> 条）放进列表。</summary>
@@ -1939,6 +2037,7 @@ namespace GeZi
         /// <summary>
         /// 文件列表滚动：快到底部就继续加载。
         /// ⚠️ 只在**往下滚**（或内容变高）时判，否则往上滚回顶部也会触发一遍。
+        /// 另外顺手把当前滚动位置记进当前目录的缓存里，供按 a 返回时还原。
         /// </summary>
         private void OnFileListScrollChanged(object sender, ScrollChangedEventArgs e)
         {
@@ -1946,6 +2045,10 @@ namespace GeZi
             {
                 var sv = e.OriginalSource as ScrollViewer;
                 if (sv == null) return;
+                if (_fileScroller == null) _fileScroller = sv;
+                if (_curDir != null && e.VerticalChange != 0)
+                    _curDir.ScrollOffset = sv.VerticalOffset;
+
                 if (e.VerticalChange < 0) return;
                 // 距底部还剩不到一屏就不算"到底"：一屏的高度 ≈ 视口高度，够宽松了
                 if (sv.ScrollableHeight - sv.VerticalOffset > sv.ViewportHeight) return;
@@ -1966,11 +2069,13 @@ namespace GeZi
             {
                 // ① 缓存命中 → 直接铺开，**一个请求都不发**（用户反馈"进文件夹再按 a
                 //    返回又要重新加载，很卡"）。
+                //    并且按 restore 还原上次的滚动位置与已铺开条数。
                 DirCacheEntry hit;
                 if (_dirCache.TryGetValue(DirCacheKey(fid), out hit))
                 {
-                    ApplyDirView(hit);
-                    Log("目录来自缓存: 共 " + hit.Items.Count + " 项（未重新请求）");
+                    ApplyDirView(hit, restore: true);
+                    Log("目录来自缓存: 共 " + hit.Items.Count + " 项，已恢复 "
+                        + hit.RevealCount + " 项（未重新请求）");
                     return;
                 }
 
@@ -3053,7 +3158,8 @@ namespace GeZi
 
             LogAllocation(alloc);
             foreach (var job in jobs)
-                _tasks.Add(new TaskItem(job, job.Name));
+                AddTaskItem(new TaskItem(job, job.Name));
+            ClearFileSelection();   // 同上：入队即撤掉列表里的高亮
             Log("已加入下载队列: " + jobs.Count + " 个文件（复用已取链接）");
             Tabs.SelectedIndex = 1;
             RunJobs(jobs);
@@ -3172,7 +3278,8 @@ namespace GeZi
 
                 LogAllocation(alloc);
                 foreach (var job in jobs)
-                    _tasks.Add(new TaskItem(job, job.Name));
+                    AddTaskItem(new TaskItem(job, job.Name));
+                ClearFileSelection();   // 已提交 → 撤掉高亮，避免误触重复入队
                 Log("已加入下载队列: " + jobs.Count + " 个文件");
                 Tabs.SelectedIndex = 1;
                 RunJobs(jobs);
@@ -3942,6 +4049,69 @@ namespace GeZi
             }
             SyncPending();
             UpdatePauseAllButton(force: true);
+        }
+
+        // ---------------- 任务列表排序：新任务在前 / 在后（2026-10-13 新增） ----------------
+        //
+        // 【原行为】新任务一律 `_tasks.Add(...)` 追加到列表**末尾** —— 于是最新加入的
+        //   任务被一堆早已下完的旧任务压在下面，要一直往下滚才能看到（用户反馈）。
+        // 【现行为】工具栏右上角一颗切换按钮：默认仍是"新任务在后"（保持旧行为），
+        //   点一下就变成"新任务在前"（时间倒序），选择会落盘，下次启动依然生效。
+
+        /// <summary>
+        /// 把新任务按当前排序偏好放进列表。
+        /// ⚠️ 所有"加入任务"的地方都必须走这里，不要再直接 <c>_tasks.Add</c>，
+        ///    否则排序偏好会被悄悄绕过去（列表里新旧任务混在一起）。
+        /// </summary>
+        private void AddTaskItem(TaskItem t)
+        {
+            if (_settings.TaskNewestFirst)
+                _tasks.Insert(0, t);
+            else
+                _tasks.Add(t);
+        }
+
+        /// <summary>
+        /// 按当前排序偏好重排**已有**任务（点击切换排序时调用）。
+        /// 用 <see cref="ObservableCollection{T}.Move"/> 而不是 Clear+重填：
+        /// Move 只挪位置、不销毁容器，选中项和滚动位置都不会乱跳。
+        /// </summary>
+        private void ApplyTaskOrder()
+        {
+            var ordered = _settings.TaskNewestFirst
+                ? _tasks.OrderByDescending(t => t.Seq).ToList()
+                : _tasks.OrderBy(t => t.Seq).ToList();
+
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                int cur = _tasks.IndexOf(ordered[i]);
+                if (cur != i) _tasks.Move(cur, i);
+            }
+        }
+
+        private void OnToggleTaskSort(object sender, RoutedEventArgs e)
+        {
+            _settings.TaskNewestFirst = !_settings.TaskNewestFirst;
+            SettingsStore.Save(_settings);
+            ApplyTaskOrder();
+            UpdateTaskSortButton();
+            Log(_settings.TaskNewestFirst
+                ? "任务列表已切换：新任务排在最前面（按最新时间）"
+                : "任务列表已切换：新任务排在已有任务后面（加入顺序）");
+        }
+
+        /// <summary>同步排序按钮的文案 / 图标（图标在文字右边）/ 悬停提示。</summary>
+        private void UpdateTaskSortButton()
+        {
+            bool first = _settings.TaskNewestFirst;
+            TaskSortText.Text = first ? "新任务在前" : "新任务在后";
+            // TryFindResource：拿不到就保持 XAML 里 StaticResource 给的默认图标，
+            // 不要为了换个图标把整个启动流程炸掉。
+            var geo = TryFindResource(first ? "IconSortDesc" : "IconSortAsc") as Geometry;
+            if (geo != null) TaskSortIcon.Data = geo;
+            TaskSortBtn.ToolTip = first
+                ? "当前：新任务排在最前面（点击改为排在已有任务后面）"
+                : "当前：新任务排在已有任务后面（点击改为排在最前面）";
         }
 
         // ---------------- 任务列表右键菜单（单任务操作） ----------------
@@ -5333,7 +5503,7 @@ namespace GeZi
                 }
 
                 foreach (var job in jobs)
-                    _tasks.Add(new TaskItem(job, job.Name));
+                    AddTaskItem(new TaskItem(job, job.Name));
                 Log("已续传 " + jobs.Count + " 个任务。");
                 RunJobs(jobs);
             }
@@ -5525,6 +5695,8 @@ namespace GeZi
                 ClipboardAutoParseCheck.IsChecked = _settings.ClipboardAutoParse;
                 // 外观主题：把配置里的选择回填到三个单选（_applyingSettings 已挡掉 Checked）
                 SyncThemeRadios();
+                // 任务列表排序偏好 → 同步工具栏那颗切换按钮的文案与图标
+                UpdateTaskSortButton();
             }
             finally
             {

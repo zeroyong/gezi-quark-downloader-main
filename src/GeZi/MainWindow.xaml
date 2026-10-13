@@ -887,46 +887,73 @@
                             </StackPanel>
                         </StackPanel>
 
-                        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,12">
-                            <!-- 【2026-10-03】「暂停全部 / 恢复全部」合并成一个按钮：
-                                 图标与文案按当前任务状态自动切换（有在跑的就显示"暂停全部"，
-                                 否则显示"恢复全部"），由 UpdatePauseAllButton() 在代码里维护。
-                                 「取消全部」按钮按用户要求移除 —— 单个任务的「取消」仍在右键菜单里。 -->
-                            <Button x:Name="PauseAllBtn" Click="OnPauseAllOrResume"
-                                    Style="{StaticResource ToolButton}"/>
-                            <Button x:Name="ClearDoneBtn" Content="清空已完成" Click="OnClearDone"
-                                    Style="{StaticResource ToolButton}"/>
-                            <Button x:Name="HistoryBtn" Click="OnOpenHistory" Style="{StaticResource ToolButton}">
+                        <!-- 【2026-10-13】工具栏改成两栏：左边是原有操作按钮，右上角是
+                             「排序」切换（用户要求「新下载的排在前面（按最新时间排列），
+                             点击切换，右侧带上对应图标」）。图标刻意放在**文字右边** ——
+                             本项目其它按钮都是"图标在左"，这一颗在右，一眼就能认出是
+                             「状态开关」而不是普通动作按钮。 -->
+                        <Grid Grid.Row="1" Margin="0,0,0,12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+
+                            <StackPanel Grid.Column="0" Orientation="Horizontal">
+                                <!-- 【2026-10-03】「暂停全部 / 恢复全部」合并成一个按钮：
+                                     图标与文案按当前任务状态自动切换（有在跑的就显示"暂停全部"，
+                                     否则显示"恢复全部"），由 UpdatePauseAllButton() 在代码里维护。
+                                     「取消全部」按钮按用户要求移除 —— 单个任务的「取消」仍在右键菜单里。 -->
+                                <Button x:Name="PauseAllBtn" Click="OnPauseAllOrResume"
+                                        Style="{StaticResource ToolButton}"/>
+                                <Button x:Name="ClearDoneBtn" Content="清空已完成" Click="OnClearDone"
+                                        Style="{StaticResource ToolButton}"/>
+                                <Button x:Name="HistoryBtn" Click="OnOpenHistory" Style="{StaticResource ToolButton}">
+                                    <StackPanel Orientation="Horizontal">
+                                        <Path Data="{StaticResource IconHistory}" Stretch="Uniform" Width="12"
+                                              Height="12" VerticalAlignment="Center"
+                                              Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                        <TextBlock Text="下载历史" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="DiagBtn" Click="OnOpenDiagnostics" Style="{StaticResource ToolButton}">
+                                    <StackPanel Orientation="Horizontal">
+                                        <Path Data="{StaticResource IconDiagnostics}" Stretch="Uniform" Width="12"
+                                              Height="12" VerticalAlignment="Center"
+                                              Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                        <TextBlock Text="诊断面板" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </Button>
+                                <!-- 【2026-10-03 新增】用户要求任务页也能直接打开下载目录（原来只有设置页有） -->
+                                <Button x:Name="OpenTaskDirBtn" Click="OnOpenOutDir" Style="{StaticResource ToolButton}"
+                                        Margin="0" ToolTip="在资源管理器中打开下载目录">
+                                    <StackPanel Orientation="Horizontal">
+                                        <Path Data="{StaticResource IconFolder}" Stretch="Uniform" Width="12"
+                                              Height="12" VerticalAlignment="Center"
+                                              Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                              StrokeLineJoin="Round"/>
+                                        <TextBlock Text="打开下载目录" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </Button>
+                            </StackPanel>
+
+                            <Button x:Name="TaskSortBtn" Grid.Column="1" Click="OnToggleTaskSort"
+                                    Style="{StaticResource ToolButton}" Margin="0"
+                                    AutomationProperties.Name="任务排序">
                                 <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconHistory}" Stretch="Uniform" Width="12"
-                                          Height="12" VerticalAlignment="Center"
-                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
-                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                                    <TextBlock Text="下载历史" Margin="6,0,0,0" VerticalAlignment="Center"/>
-                                </StackPanel>
-                            </Button>
-                            <Button x:Name="DiagBtn" Click="OnOpenDiagnostics" Style="{StaticResource ToolButton}">
-                                <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconDiagnostics}" Stretch="Uniform" Width="12"
-                                          Height="12" VerticalAlignment="Center"
-                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
-                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                                    <TextBlock Text="诊断面板" Margin="6,0,0,0" VerticalAlignment="Center"/>
-                                </StackPanel>
-                            </Button>
-                            <!-- 【2026-10-03 新增】用户要求任务页也能直接打开下载目录（原来只有设置页有） -->
-                            <Button x:Name="OpenTaskDirBtn" Click="OnOpenOutDir" Style="{StaticResource ToolButton}"
-                                    Margin="0" ToolTip="在资源管理器中打开下载目录">
-                                <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconFolder}" Stretch="Uniform" Width="12"
-                                          Height="12" VerticalAlignment="Center"
-                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
+                                    <TextBlock x:Name="TaskSortText" Text="新任务在后"
+                                               VerticalAlignment="Center"/>
+                                    <Path x:Name="TaskSortIcon" Data="{StaticResource IconSortAsc}"
+                                          Stretch="Uniform" Width="13" Height="13" Margin="6,0,0,0"
+                                          VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.6"
                                           StrokeStartLineCap="Round" StrokeEndLineCap="Round"
                                           StrokeLineJoin="Round"/>
-                                    <TextBlock Text="打开下载目录" Margin="6,0,0,0" VerticalAlignment="Center"/>
                                 </StackPanel>
                             </Button>
-                        </StackPanel>
+                        </Grid>
 
                         <Grid Grid.Row="2">
                             <!-- 任务列表原来是默认的 SelectionMode=Single（根本多选不了），

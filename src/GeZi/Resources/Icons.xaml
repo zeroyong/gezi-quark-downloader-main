@@ -143,4 +143,18 @@
     -->
     <Geometry x:Key="IconHelpCircle">M12,2 A10,10 0 1 1 12,22 A10,10 0 1 1 12,2 M9.09,9 A3,3 0 0 1 14.92,10 C14.92,12 11.92,13 11.92,13 M12,17 L12.01,17</Geometry>
 
+    <!--
+        任务列表排序切换图标（2026-10-13 新增）。
+        取自 Lucide 图标库（ISC 许可，可自由嵌入）：
+          · arrow-down-narrow-wide —— https://lucide.dev/icons/arrow-down-narrow-wide
+          · arrow-up-narrow-wide   —— https://lucide.dev/icons/arrow-up-narrow-wide
+        24×24 viewBox、stroke-width 2、圆头圆角 —— 用 Stroke 描边，不要 Fill。
+
+        IconSortDesc（向下箭头 + 逐行收窄）：时间倒序 = **新任务在前**。
+        IconSortAsc （向上箭头 + 逐行收窄）：时间正序 = **新任务在后**（加入顺序）。
+        同一颗按钮点击切换，图标随之互换（见 UpdateTaskSortButton）。
+    -->
+    <Geometry x:Key="IconSortDesc">M3,16 L7,20 L11,16 M7,20 V4 M11,4 H21 M11,9 H18 M11,14 H15</Geometry>
+    <Geometry x:Key="IconSortAsc">M3,8 L7,4 L11,8 M7,4 V20 M11,20 H21 M11,15 H18 M11,10 H15</Geometry>
+
 </ResourceDictionary>
