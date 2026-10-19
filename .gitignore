@@ -16,6 +16,22 @@ cookie*.txt
 .claude/
 .cursor/
 
+# ---------- Agent 会话临时产物（汇报页缓存等，不入库） ----------
+.dsh/
+
+# ---------- Flutter 移植版构建产物 ----------
+flutter-port/gezi_mobile/.dart_tool/
+flutter-port/gezi_mobile/build/
+flutter-port/gezi_mobile/.flutter-plugins
+flutter-port/gezi_mobile/.flutter-plugins-dependencies
+flutter-port/gezi_mobile/android/.gradle/
+flutter-port/gezi_mobile/android/local.properties
+flutter-port/gezi_mobile/ios/Pods/
+flutter-port/gezi_mobile/ios/.symlinks/
+flutter-port/gezi_mobile/ios/Flutter/Flutter.framework/
+flutter-port/gezi_mobile/ios/Flutter/Flutter.podspec
+flutter-port/gezi_mobile/*.iml
+
 # ---------- 本地开发文档 ----------
 docs/
 AGENTS.md
