@@ -75,6 +75,13 @@ namespace GeZi
         public string Who { get; set; } = "";
 
         /// <summary>
+        /// 用户手动指定的 VLC 路径（vlc.exe）。
+        /// 留空 = 自动探测；便携版/VLC 装在非常规目录时由设置页「选择 VLC 位置…」写入。
+        /// 路径失效（文件被移走）时自动回退到自动探测，不会拦住下载/播放。
+        /// </summary>
+        public string VlcPath { get; set; } = "";
+
+        /// <summary>
         /// 账号头像 URL（登录时从 account/info 探测到的）。
         /// 留空 = 拿不到 → 界面回退到"昵称首字"头像。
         /// 头像链接可能带时效，每次登录/启动校验都会重新探测覆盖。

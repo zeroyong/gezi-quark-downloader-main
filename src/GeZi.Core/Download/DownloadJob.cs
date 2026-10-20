@@ -51,6 +51,18 @@ namespace GeZi.Core.Download
         public Func<CancellationToken, Task<string>> LinkRefresher { get; set; }
 
         /// <summary>
+        /// 取「边下边播」的流式读取视图（由调度器在下载开始时挂上）。
+        /// 未在下载 / 非独立分片模式时返回 null。
+        /// </summary>
+        public Func<StreamMap> GetStreamMap { get; set; }
+
+        /// <summary>
+        /// 优先下载某个字节区间覆盖的分片。播放器 seek / 读尾部索引时调用，
+        /// 让"后面的部分"先下，而不是只能按顺序等。
+        /// </summary>
+        public Func<long, long, bool> BoostRange { get; set; }
+
+        /// <summary>
         /// 【免转存专用】为 true 时，失败文案**不再承诺"可续传"**。
         /// 免转存的续传取链依赖分享 stoken，而续传**不会重新换 stoken**（只在解析分享时取一次），
         /// stoken 过期就永远取不到新链 → 提示必须改成"需重新解析分享"。
@@ -101,6 +113,17 @@ namespace GeZi.Core.Download
         public bool FromShare { get; set; }
         /// <summary>相对目录（含尾部分隔符时也算合法），用于重建目标路径。</summary>
         public string RelDir { get; set; }
+
+        /// <summary>
+        /// 任务分组名（可选，2026-10-20 新增）：**下载时所在目录的名字**。
+        ///
+        /// 【为什么单独存】直接在当前打开的分享子目录里勾文件下载时，<see cref="RelDir"/>
+        /// 是空串（文件就在 OutDir 根），任务页只能把这类任务归到「单独选择的文件」。
+        /// 但用户希望按"打开前的那个文件夹"归类 —— 于是把当时所在目录名记在这里，
+        /// 只影响分组显示，**不参与目标路径拼接**。
+        /// </summary>
+        public string GroupName { get; set; }
+
         /// <summary>目标文件完整路径。</summary>
         public string Dest { get; set; }
         /// <summary>文件总大小（0 = 未知）。</summary>

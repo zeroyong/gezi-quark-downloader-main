@@ -116,6 +116,29 @@ namespace GeZi.Core.Download
         public bool ResumeCannotRefresh { get; set; }
 
         /// <summary>
+        /// 本次下载的「流式读取视图」（仅 SegmentedFiles 模式创建）。
+        /// 边下边播服务用它按任意偏移读取：已合并前缀读目标文件，
+        /// 尚未合并的分片直接读分片文件 —— 这样才能播到"后面的部分"。
+        /// </summary>
+        public StreamMap CurrentStreamMap { get { return _streamMap; } }
+        private volatile StreamMap _streamMap;
+
+        /// <summary>优先下载 [start,end] 覆盖的分片（由边下边播的 Range 请求驱动）。</summary>
+        private volatile Func<long, long, int> _boostImpl;
+
+        /// <summary>
+        /// 把某个字节区间涉及的分片提到队首。返回是否真的排入了新分片。
+        /// 播放器 seek / 读 MP4 尾部索引时调用，避免"按顺序下"只能干等。
+        /// </summary>
+        public bool BoostRange(long start, long end)
+        {
+            var f = _boostImpl;
+            if (f == null) return false;
+            try { return f(start, end) > 0; }
+            catch { return false; }
+        }
+
+        /// <summary>
         /// 单次任务内允许重新取链的次数上限。
         ///
         /// 必须有上限：若服务端一直回 403（例如文件被风控、分享已被关闭），
@@ -1229,7 +1252,7 @@ namespace GeZi.Core.Download
         }
 
         /// <summary>第 idx 片的分片文件路径。定长编号保证按文件名排序即等于按片序。</summary>
-        private static string PartPath(string dir, int idx)
+        internal static string PartPath(string dir, int idx)
             => Path.Combine(dir, "p" + idx.ToString("D6", CultureInfo.InvariantCulture));
 
         /// <summary>
@@ -1268,6 +1291,10 @@ namespace GeZi.Core.Download
             Dictionary<string, string> headers, long total, IProgress<DownloadProgress> progress,
             CancellationToken cancel, PauseToken pause, bool mergeMode, DateTime taskStart)
         {
+            // 每次重跑（含换链重试）都重建流视图，避免播放器读到上一轮的旧分片
+            _streamMap = null;
+            _boostImpl = null;
+
             var parts = Split(total, _threads);
             string metaPath, partsDirBase;
             ResolvePaths(dest, out partsDirBase, out metaPath);
@@ -1467,6 +1494,35 @@ namespace GeZi.Core.Download
             for (int i = mergedCount; i < plan.Parts.Count; i++)
                 queue.Enqueue(i);
 
+            // ---------------- 边下边播：优先分片 ----------------
+            // 播放器的 Range 请求会走到 _boostImpl：把覆盖该区间的分片塞进优先队列。
+            // 同一片可能同时出现在普通队列和优先队列里，用 claimed 保证只有一个
+            // worker 真正去下它（否则两个 worker 会同时写同一个分片文件）。
+            var boostQueue = new ConcurrentQueue<int>();
+            var claimed = new int[plan.Parts.Count];   // 0=未认领，1=已认领/已完成
+            var boosted = new int[plan.Parts.Count];   // 同一片只进一次优先队列
+            var boostPreemptBox = new long[1];         // 上次为播放抢占的时间（节流）
+
+            Func<long, long, int> enqueueBoost = (rawStart, rawEnd) =>
+            {
+                if (rawEnd < rawStart) return 0;
+                long s = Math.Max(0, rawStart);
+                long e = Math.Min(total - 1, rawEnd);
+                int n = 0;
+                for (int i = 0; i < plan.Parts.Count && n < 128; i++)
+                {
+                    var p = plan.Parts[i];
+                    if (p.E < s || p.S > e) continue;              // 不相交
+                    if (Volatile.Read(ref claimed[i]) != 0) continue;  // 已在下/已完成
+                    long size = p.E - p.S + 1;
+                    if (Volatile.Read(ref p.W) >= size) continue;      // 已下完
+                    if (Interlocked.CompareExchange(ref boosted[i], 1, 0) != 0) continue;
+                    boostQueue.Enqueue(i);
+                    n++;
+                }
+                return n;
+            };
+
             long done = 0;
             foreach (var p in plan.Parts)
                 done += p.W;
@@ -1491,6 +1547,12 @@ namespace GeZi.Core.Download
 
             // 合并线程已合并的字节数，供 5 秒诊断日志跨线程读取
             long[] mergedBox = new long[] { mergedBytes };
+
+            // 独立分片模式才提供流式读取视图：
+            // 目标文件是连续前缀，未合并的分片则从各自的分片文件读。
+            // （共写同一文件时文件里有空洞，不能拿来串流。）
+            if (mergeMode)
+                _streamMap = new StreamMap(dest, plan, partsDir, mergedBox);
 
             // 「所有 worker 都已结束，只剩合并线程在收尾」的标志（跨线程用 Volatile 读写）。
             //
@@ -1526,6 +1588,55 @@ namespace GeZi.Core.Download
             // 各路瞬时速度（两遍扫描用：第一遍采样、第二遍按结果抢占）
             var wInstBps = new long[MaxRealConcurrency];
             bool overallSlowLogged = false;   // "整体限速"提示只打一次，避免刷屏
+
+            // 播放器请求优先分片时，如果所有 worker 都在忙，光排队要等到某一路
+            // 把当前分片下完（可能几分钟）。这里主动掐掉 1~2 路「已写字节最少」的连接，
+            // 让它们重新入队，腾出连接立刻去下优先分片 —— part.W 保留，不丢进度。
+            _boostImpl = (rawStart, rawEnd) =>
+            {
+                int n = enqueueBoost(rawStart, rawEnd);
+                if (n <= 0) return 0;
+
+                long now = NowMs();
+                long prev = Interlocked.Exchange(ref boostPreemptBox[0], now);
+                if (now - prev < 1500) return n;    // 节流：别被频繁 seek 拖成重连风暴
+
+                bool idle = false;
+                for (int k = 0; k < wCurPart.Length; k++)
+                    if (Volatile.Read(ref wCurPart[k]) < 0) { idle = true; break; }
+                if (idle) return n;                  // 有闲着的 worker，它们会直接领优先片
+
+                // 找两个「不在优先区间、已写字节最少」的 worker（浪费最小）
+                int best1 = -1, best2 = -1;
+                long least1 = long.MaxValue, least2 = long.MaxValue;
+                for (int k = 0; k < wCurPart.Length; k++)
+                {
+                    int cur = Volatile.Read(ref wCurPart[k]);
+                    if (cur < 0) continue;
+                    var p = plan.Parts[cur];
+                    if (p.E >= rawStart && p.S <= rawEnd) continue;   // 正在下播放要的片，别掐
+                    long written = Volatile.Read(ref p.W);
+                    if (written >= p.E - p.S + 1) continue;
+                    if (written < least1)
+                    {
+                        best2 = best1; least2 = least1;
+                        best1 = k; least1 = written;
+                    }
+                    else if (written < least2)
+                    {
+                        best2 = k; least2 = written;
+                    }
+                }
+                int[] picks = new int[] { best1, best2 };
+                foreach (int k in picks)
+                {
+                    if (k < 0) continue;
+                    var cts = Volatile.Read(ref wCts[k]);
+                    if (cts == null) continue;
+                    try { cts.Cancel(); } catch { }
+                }
+                return n;
+            };
 
             /// <summary>
             /// 慢连接抢占：采样各路瞬时速度，掐掉明显落后于众人的那几路。
@@ -2217,8 +2328,16 @@ namespace GeZi.Core.Download
                             await Task.Delay(TimeSpan.FromMilliseconds(staggerMs), cancelToken).ConfigureAwait(false);
                         }
 
-                        while (queue.TryDequeue(out int idx))
+                        while (true)
                         {
+                            // 先吃「边下边播」指定的优先分片，再按普通顺序领片。
+                            // 同一片可能同时还在普通队列里，claimed 保证只下一次。
+                            int idx;
+                            bool fromBoost = boostQueue.TryDequeue(out idx);
+                            if (!fromBoost && !queue.TryDequeue(out idx)) break;
+                            if (Interlocked.CompareExchange(ref claimed[idx], 1, 0) != 0)
+                                continue;
+
                             await gate.WaitAsync(cancelToken).ConfigureAwait(false);
                             bool gateTaken = true;
                             // 片级取消源：抢占只掐这一片，不牵连全局取消语义。
@@ -2279,6 +2398,8 @@ namespace GeZi.Core.Download
                                             //      ② 尾部在飞的就是反复重试的慢片；
                                             //      ③ 重试越多 → 越可能正处于退避等待中。
                                             //    三者叠加 → 用户反馈的「下载到最后就停」（停在 99%）。
+                                            // 回普通队列前释放认领，否则这一片会永远没人敢接
+                                            Interlocked.Exchange(ref claimed[idx], 0);
                                             queue.Enqueue(idx);
                                             Interlocked.Increment(ref preemptedCount);
                                             // 这片是"被抢占"不是"失败"：lastErr 是整片循环共享的局部变量，
@@ -2448,6 +2569,8 @@ namespace GeZi.Core.Download
                                     catch (OperationCanceledException)
                                         when (partToken.IsCancellationRequested && !cancelToken.IsCancellationRequested)
                                     {
+                                        // 回普通队列前释放认领，下一轮才能重新领到这一片
+                                        Interlocked.Exchange(ref claimed[idx], 0);
                                         queue.Enqueue(idx);
                                         Interlocked.Increment(ref preemptedCount);
                                         // ⚠️ 【2026-10-04 修】必须把 lastErr 清掉再跳出。
@@ -2832,11 +2955,136 @@ namespace GeZi.Core.Download
         }
     }
 
+    /// <summary>
+    /// 给「边下边播」用的流式读取视图（仅 SegmentedFiles 模式）。
+    ///
+    /// 目标文件只是**已合并的连续前缀**；播放器想跳到后面时，那部分数据可能
+    /// 已经下在分片文件里、但还没轮到合并。所以这里按偏移分流：
+    ///   · offset &lt; 已合并字节 → 读目标文件；
+    ///   · 否则找到所属分片 → 直接读该分片文件（只读到它当前写入的位置）。
+    /// 读不到（还没下到 / 分片正在切换）就返回 0，由 HTTP 层等一会儿再试。
+    /// </summary>
+    public sealed class StreamMap : IDisposable
+    {
+        private readonly string _dest;
+        private readonly DownloadPlan _plan;
+        private readonly string _partsDir;
+        private readonly long[] _merged;          // merge 线程维护的已合并字节
+        private readonly object _ioGate = new object();
+
+        private FileStream _destFs;
+        private FileStream _partFs;
+        private int _partIdx = -1;
+
+        internal StreamMap(string dest, DownloadPlan plan, string partsDir, long[] merged)
+        {
+            _dest = dest;
+            _plan = plan;
+            _partsDir = partsDir;
+            _merged = merged;
+        }
+
+        public string Dest { get { return _dest; } }
+        public long Total { get { return _plan.Total; } }
+
+        /// <summary>读取 offset 起的最多 count 字节；当前不可用返回 0。</summary>
+        public int ReadAt(long offset, byte[] buffer, int count)
+        {
+            if (buffer == null || count <= 0 || offset < 0) return 0;
+
+            // PotPlayer 可能同时开"索引/媒体"两条连接，而下面的缓存流带 Position，
+            // 必须串行化。单次读只有几十~128KB，锁竞争可以忽略。
+            lock (_ioGate)
+            {
+                if (offset >= _plan.Total) return 0;
+
+                long merged = Interlocked.Read(ref _merged[0]);
+                if (offset < merged)
+                    return ReadFromDest(offset, buffer, (int)Math.Min(count, merged - offset));
+
+                int idx = FindPart(offset);
+                if (idx < 0) return 0;
+
+                var p = _plan.Parts[idx];
+                long inPart = offset - p.S;
+                long written = Volatile.Read(ref p.W);
+                if (inPart >= written) return 0;
+
+                string pp = SegmentedDownloader.PartPath(_partsDir, idx);
+                long onDisk;
+                try { onDisk = new FileInfo(pp).Length; }
+                catch { return 0; }
+                long avail = Math.Min(written, onDisk) - inPart;
+                if (avail <= 0) return 0;
+
+                try
+                {
+                    if (_partFs == null || _partIdx != idx)
+                    {
+                        if (_partFs != null) { _partFs.Dispose(); _partFs = null; }
+                        _partFs = new FileStream(pp, FileMode.Open, FileAccess.Read,
+                                                 FileShare.ReadWrite | FileShare.Delete,
+                                                 64 * 1024, FileOptions.RandomAccess);
+                        _partIdx = idx;
+                    }
+                    _partFs.Position = inPart;
+                    int n = _partFs.Read(buffer, 0, (int)Math.Min(count, avail));
+                    return n > 0 ? n : 0;
+                }
+                catch { return 0; }
+            }
+        }
+
+        private int ReadFromDest(long offset, byte[] buffer, int count)
+        {
+            try
+            {
+                if (_destFs == null)
+                {
+                    _destFs = new FileStream(_dest, FileMode.Open, FileAccess.Read,
+                                             FileShare.ReadWrite | FileShare.Delete,
+                                             64 * 1024, FileOptions.RandomAccess);
+                }
+                _destFs.Position = offset;
+                int n = _destFs.Read(buffer, 0, count);
+                return n > 0 ? n : 0;
+            }
+            catch { return 0; }
+        }
+
+        private int FindPart(long offset)
+        {
+            int lo = 0, hi = _plan.Parts.Count - 1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                var p = _plan.Parts[mid];
+                if (offset < p.S) hi = mid - 1;
+                else if (offset > p.E) lo = mid + 1;
+                else return mid;
+            }
+            return -1;
+        }
+
+        public void Dispose()
+        {
+            lock (_ioGate)
+            {
+                try { if (_destFs != null) _destFs.Dispose(); } catch { }
+                try { if (_partFs != null) _partFs.Dispose(); } catch { }
+                _destFs = null;
+                _partFs = null;
+                _partIdx = -1;
+            }
+        }
+    }
+
     internal class PartPlan
     {
         public long S { get; set; }   // 起始（含）
         public long E { get; set; }   // 结束（含）
-        public long W { get; set; }   // 已写入字节
+        // 必须是字段：串流线程要用 Volatile.Read(ref ...) 读进度，属性不能取 ref
+        public long W;                // 已写入字节
     }
 
     internal class DownloadPlan

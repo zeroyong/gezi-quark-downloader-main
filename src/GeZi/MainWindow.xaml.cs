@@ -64,6 +64,13 @@ namespace GeZi
         private readonly List<string> _pathList = new List<string>();
         private readonly Stack<string> _fidStack = new Stack<string>();
 
+        /// <summary>
+        /// 分享链接带子目录（<c>#/list/share/&lt;fid&gt;</c>）时，**那个目录本身的名字**。
+        /// 解析时从分享凭证的 title 推断（分享标题默认就是被分享文件夹的名字），
+        /// 只用于任务页的「文件夹分组」显示，不参与目标路径拼接。
+        /// </summary>
+        private string _shareRootName = "";
+
         // ---------------- 托盘 / 小窗 / 退出（2026-10-03） ----------------
         /// <summary>托盘图标（常驻通知区）。</summary>
         private TrayIcon _tray;
@@ -474,6 +481,8 @@ namespace GeZi
             // 也避免"关窗后进程还活着"的路径（如托盘常驻）把保活留着。
             try { SleepGuard.Release(); } catch { }
             try { _client?.StopKeepAlive(); } catch { }
+            // 关掉边下边播的本地 HTTP 服务（仍在播放的播放器会随之断开）
+            try { LocalStreamServer.Instance.Dispose(); } catch { }
             // ⚠️ 托盘图标必须释放：不释放的话进程退出后图标会留在通知区，
             //    鼠标划过去才消失（最经典的托盘 bug）。
             try { _tray?.Dispose(); _tray = null; } catch { }
@@ -848,8 +857,22 @@ namespace GeZi
             _files.Clear();
             _fidStack.Clear();
             _pathList.Clear();
+            _shareRootName = "";
             _curFid = "0";
             UpdatePathText();
+        }
+
+        /// <summary>
+        /// 当前所在目录名 —— 任务分组用（2026-10-20）。
+        /// 优先取面包屑最后一段（用户自己点进来的子目录），否则用分享标题兜底
+        /// （链接直接指向某个子目录时，列表里只有它的子项、拿不到它自己的名字）。
+        /// 根目录 / 非分享模式返回空串 = 按「单独选择的文件」归类。
+        /// </summary>
+        private string CurrentFolderGroupName()
+        {
+            if (_pathList.Count > 0)
+                return _pathList[_pathList.Count - 1] ?? "";
+            return ShareMode ? (_shareRootName ?? "") : "";
         }
 
         // ---------------- 分享解析 ----------------
@@ -1048,7 +1071,8 @@ namespace GeZi
             SetBusy(true);
             try
             {
-                _stoken = await _client.GetStokenAsync(info.PwdId, passcode);
+                var shareInfo = await _client.GetShareInfoAsync(info.PwdId, passcode);
+                _stoken = shareInfo.Stoken;
                 if (string.IsNullOrEmpty(_stoken))
                 {
                     Log("获取分享凭证失败（可能需登录或提取码错误）");
@@ -1058,6 +1082,9 @@ namespace GeZi
                 }
                 ResetNav();
                 _curFid = info.StartFid;
+                // 链接直接指向某个子目录（#/list/share/<fid>）时，列表里只有它的子项，
+                // 拿不到它自己的名字 —— 用分享标题兜底，作为任务分组的名字。
+                _shareRootName = info.StartFid != "0" ? (shareInfo.Title ?? "") : "";
                 await LoadDirAsync(_curFid);
                 Log("解析成功。单击文件夹进入子目录；选中文件后点「下载选中」即可下载"
                     + "（文件夹要先选中：Shift / Ctrl+点击，或右键该行）。");
@@ -1739,17 +1766,22 @@ namespace GeZi
             {
                 e.Handled = true;
 
-                var gi = FindAncestorGroupItem(e.OriginalSource as DependencyObject);
-                if (gi != null)
-                {
-                    ToggleTaskGroupSelection(gi);
-                    return;
-                }
+                // ⚠️ 顺序不能反：分组内的每一行都在 GroupItem 里，
+                //    先查 GroupItem 会把「点某一行」也当成「点文件夹头」，
+                //    结果只能整组选中、无法单独选一个文件。
                 if (item != null)
                 {
                     item.IsSelected = !item.IsSelected;
                     try { item.Focus(); } catch { }
                     UpdateTaskSelectCount();
+                    return;
+                }
+                // 只有点在文件夹卡片的标题栏上才算「选整组」
+                var hdr = FindAncestor<ToggleButton>(e.OriginalSource as DependencyObject);
+                var gi = hdr == null ? null : FindAncestorGroupItem(hdr);
+                if (gi != null)
+                {
+                    ToggleTaskGroupSelection(gi);
                     return;
                 }
                 BeginTaskBandDrag(e);
@@ -1817,9 +1849,21 @@ namespace GeZi
             try { FileList.SelectedItems.Clear(); } catch { }
         }
 
-        /// <summary>文件列表筛选框变化：只按名称包含关键字过滤，不改动底层集合。</summary>
-        private void OnFileFilterChanged(object sender, TextChangedEventArgs e)
+        /// <summary>
+        /// 搜索框里按 Esc：**退出焦点**、把键盘交回文件列表
+        /// （用户要求「i 光标焦点到搜索文件的输入框里（esc 退出焦点）」）。
+        /// 注意全局快捷键处理器遇到输入框会直接放行，所以 Esc 必须在这里单独处理。
+        /// </summary>
+        private void OnFileFilterKeyDown(object sender, KeyEventArgs e)
         {
+            if (e.Key != Key.Escape) return;
+            e.Handled = true;
+            try { FileList.Focus(); } catch { }
+            Log("已退出搜索框（筛选内容保留）");
+        }
+
+        /// <summary>文件列表筛选框变化：只按名称包含关键字过滤，不改动底层集合。</summary>
+        private void OnFileFilterChanged(object sender, TextChangedEventArgs e)        {
             _fileFilter = (FileFilterBox.Text ?? "").Trim();
             try { _filesView?.Refresh(); } catch { }
         }
@@ -2646,6 +2690,14 @@ namespace GeZi
                 return;
             }
 
+            // ①.4 F：全屏 / 还原（= 最大化切换）。任何页面都可用。
+            if (e.Key == Key.F)
+            {
+                e.Handled = true;
+                ToggleMaximizeRestore();
+                return;
+            }
+
             // ①.5 任务页的「删除选择模式」：z 进入 / Enter 确认 / Esc 退出。
             //     用户要求「选好后 再按 Enter，弹出是仅删除记录还是一起删除本地文件」。
             if (_taskSelectMode)
@@ -2723,7 +2775,31 @@ namespace GeZi
                     e.Handled = true;
                     OnFetchLinks(null, null);
                     break;
+                case Key.I:   // 聚焦文件搜索框（Esc 退出焦点）
+                    e.Handled = true;
+                    FocusFileFilter();
+                    break;
             }
+        }
+
+        /// <summary>把光标送进当前目录的搜索框，并全选已有内容（按 i 时用）。</summary>
+        private void FocusFileFilter()
+        {
+            try
+            {
+                FileFilterBox.Focus();
+                FileFilterBox.SelectAll();
+            }
+            catch { }
+        }
+
+        /// <summary>F：全屏 / 还原（= 最大化切换）。与标题栏那颗「最大化或还原」一致。</summary>
+        private void ToggleMaximizeRestore()
+        {
+            WindowState = WindowState == WindowState.Maximized
+                ? WindowState.Normal
+                : WindowState.Maximized;
+            Log(WindowState == WindowState.Maximized ? "已进入全屏（最大化）" : "已还原窗口");
         }
 
         /// <summary>
@@ -3226,6 +3302,9 @@ namespace GeZi
                         PwdId = _pwdId, Stoken = _stoken, Passcode = PassBox.Text,
                         Fid = item.Fid, Token = item.Token, FromShare = item.FromShare,
                         RelDir = item.RelDir ?? "", Dest = dest, Size = item.Size,
+                        // 文件就在当前打开的目录里（RelDir 为空）→ 用该目录名做分组
+                        GroupName = item.RelDir == null || item.RelDir.Length == 0
+                            ? CurrentFolderGroupName() : null,
                     },
                 });
             }
@@ -3342,6 +3421,8 @@ namespace GeZi
                             Fid = item.Fid, Token = item.Token,
                             FromShare = item.FromShare, RelDir = item.RelDir ?? "",
                             Dest = dest, Size = item.Size,
+                            GroupName = item.RelDir == null || item.RelDir.Length == 0
+                                ? CurrentFolderGroupName() : null,
                         },
                     });
                 }
@@ -3964,6 +4045,7 @@ namespace GeZi
                         Stoken = pi == null ? null : pi.Stoken,
                         Passcode = pi == null ? null : pi.Passcode,
                         RelDir = pi == null ? null : pi.RelDir,
+                        GroupName = pi == null ? null : pi.GroupName,
                         Segmented = job != null && job.WriteMode == WriteMode.SegmentedFiles,
                         Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                     });
@@ -4007,6 +4089,7 @@ namespace GeZi
                             PwdId = s.PwdId, Stoken = s.Stoken, Passcode = s.Passcode,
                             Fid = s.Fid, Token = s.Token, FromShare = s.FromShare,
                             RelDir = s.RelDir ?? "", Dest = s.Dest, Size = s.Size,
+                            GroupName = s.GroupName ?? "",
                         },
                     };
                     job.LinkRefresher = ct => RefreshLinkAsyncForPending(job, ct);
@@ -4094,6 +4177,7 @@ namespace GeZi
                             Stoken = pi?.Stoken,
                             Passcode = pi?.Passcode,
                             RelDir = pi?.RelDir,
+                            GroupName = pi?.GroupName,
                         });
                     }
                 }
@@ -4109,41 +4193,81 @@ namespace GeZi
         // ---------------- 任务管理 ----------------
 
         /// <summary>
-        /// 工具栏那个合并后的「暂停全部 / 恢复全部」按钮 —— 按当前任务状态决定做什么。
+        /// 托盘菜单里的「暂停全部 / 恢复全部」：按当前状态自动选一个方向。
         /// </summary>
         /// <remarks>
-        /// 【2026-10-03】用户反馈「暂停全部和恢复全部可以弄成一个按钮」。原来两个独立按钮
-        /// 在任何时刻都只有一个是"有意义"的（没在下载时点「暂停全部」什么也不会发生），
-        /// 合并成一个会自己换文案/图标的按钮更省地方也更清楚。
+        /// 【2026-10-20 改】任务页工具栏已经拆成**两个独立按钮**（方案 B 分段胶囊），
+        /// 各自只管一个方向。这个方法保留给托盘右键菜单用（那里只有一行，没法放两个）。
         /// </remarks>
         private void OnPauseAllOrResume(object sender, RoutedEventArgs e)
         {
             bool anyRunning = _tasks.Any(t => t.State == JobState.Downloading || t.State == JobState.Queued);
-            if (anyRunning)
+            if (anyRunning) OnPauseAll(sender, e);
+            else OnResumeAll(sender, e);
+        }
+
+        /// <summary>「全部暂停」：只暂停，不碰已暂停的（分段胶囊左半）。</summary>
+        private void OnPauseAll(object sender, RoutedEventArgs e)
+        {
+            int n = 0;
+            foreach (var t in _tasks)
             {
-                foreach (var t in _tasks)
+                if (t.State == JobState.Downloading || t.State == JobState.Queued)
                 {
-                    if (t.State == JobState.Downloading || t.State == JobState.Queued)
-                    {
-                        t.Job.PauseJob();
-                        // 与单个暂停同理：先置标志再改状态，否则进度上报会把 Paused 覆盖掉
-                        t.PauseRequested = true;
-                        t.State = JobState.Paused;
-                    }
+                    t.Job.PauseJob();
+                    // 与单个暂停同理：先置标志再改状态，否则进度上报会把 Paused 覆盖掉
+                    t.PauseRequested = true;
+                    t.State = JobState.Paused;
+                    n++;
                 }
             }
-            else
+            if (n == 0)
             {
-                foreach (var t in _tasks)
-                {
-                    if (t.State == JobState.Paused)
-                    {
-                        t.PauseRequested = false;
-                        t.Job.ResumeJob();
-                        t.State = JobState.Downloading;
-                    }
-                }
+                Log("没有正在下载 / 排队的任务。");
+                return;
             }
+            Log("已暂停 " + n + " 个任务。");
+            SyncPending();
+            UpdatePauseAllButton(force: true);
+        }
+
+        /// <summary>
+        /// 「全部恢复」：只恢复已暂停的（分段胶囊右半）。
+        /// Dormant（上次运行恢复出来的占位行）单独走**一次批量续传**，
+        /// 避免 N 个任务各自并发取链、把请求量放大 N 倍。
+        /// </summary>
+        private void OnResumeAll(object sender, RoutedEventArgs e)
+        {
+            int n = 0;
+            foreach (var t in _tasks)
+            {
+                if (t.State != JobState.Paused || t.Dormant) continue;
+                t.PauseRequested = false;
+                t.Job.ResumeJob();
+                t.State = JobState.Downloading;
+                n++;
+            }
+
+            var dormantPending = new List<PendingTask>();
+            foreach (var t in _tasks)
+            {
+                if (t.State != JobState.Paused || !t.Dormant) continue;
+                var pend = BuildPendingTask(t);
+                if (pend != null) dormantPending.Add(pend);
+            }
+
+            if (n == 0 && dormantPending.Count == 0)
+            {
+                Log("没有已暂停的任务。");
+                return;
+            }
+            if (n > 0) Log("已恢复 " + n + " 个任务。");
+            if (dormantPending.Count > 0)
+            {
+                Log("正在为 " + dormantPending.Count + " 个未完成任务重新取链…");
+                _ = ResumePendingBatchAsync(dormantPending);
+            }
+            SyncPending();
             UpdatePauseAllButton(force: true);
         }
 
@@ -4155,33 +4279,43 @@ namespace GeZi
         /// 都没有 → 置灰（点了也没意义）。
         /// </summary>
         /// <param name="force">true = 忽略签名缓存强制重建（按钮刚被点击时用）。</param>
+        /// <summary>
+        /// 刷新分段胶囊上的两个数量与可用状态（2026-10-20 改为方案 B）。
+        /// 左半「全部暂停」只统计 下载中/排队；右半「全部恢复」只统计 已暂停。
+        /// </summary>
+        /// <param name="force">true = 忽略签名缓存强制刷新（按钮刚被点击时用）。</param>
         private void UpdatePauseAllButton(bool force = false)
         {
             if (PauseAllBtn == null) return;
 
-            bool anyRunning = _tasks.Any(t => t.State == JobState.Downloading || t.State == JobState.Queued);
-            bool anyPaused = _tasks.Any(t => t.State == JobState.Paused);
-            string sig = anyRunning ? "run" : (anyPaused ? "pause" : "idle");
+            int running = _tasks.Count(t => t.State == JobState.Downloading || t.State == JobState.Queued);
+            int paused = _tasks.Count(t => t.State == JobState.Paused);
+            string sig = running + "/" + paused;
             if (!force && sig == _pauseAllSig) return;
             _pauseAllSig = sig;
 
-            PauseAllBtn.IsEnabled = anyRunning || anyPaused;
-            if (anyRunning)
+            if (PauseAllCount != null)
             {
-                PauseAllBtn.Content = BuildToolIconText("IconPause", "暂停全部", 2.0);
-                PauseAllBtn.ToolTip = "暂停所有正在下载 / 排队的任务";
+                PauseAllCount.Text = running.ToString();
+                PauseAllCount.Opacity = running > 0 ? 1.0 : 0.55;
             }
-            else if (anyPaused)
+            if (ResumeAllCount != null)
             {
-                PauseAllBtn.Content = BuildToolIconText("IconPlay", "恢复全部", 1.6);
-                PauseAllBtn.ToolTip = "恢复所有已暂停的任务";
+                ResumeAllCount.Text = paused.ToString();
+                ResumeAllCount.Opacity = paused > 0 ? 1.0 : 0.55;
             }
-            else
+
+            PauseAllBtn.IsEnabled = running > 0;
+            if (ResumeAllBtn != null) ResumeAllBtn.IsEnabled = paused > 0;
+
+            PauseAllBtn.ToolTip = running > 0
+                ? "暂停所有正在下载 / 排队的任务（" + running + " 个）"
+                : "当前没有正在下载 / 排队的任务";
+            if (ResumeAllBtn != null)
             {
-                // 没有任务时按钮置灰。文案固定显示「暂停全部」——
-                // 显示「恢复全部」会让人以为"有东西被暂停了、可以恢复"。
-                PauseAllBtn.Content = BuildToolIconText("IconPause", "暂停全部", 2.0);
-                PauseAllBtn.ToolTip = "当前没有任务";
+                ResumeAllBtn.ToolTip = paused > 0
+                    ? "恢复所有已暂停的任务（" + paused + " 个）"
+                    : "当前没有已暂停的任务";
             }
         }
 
@@ -4217,36 +4351,6 @@ namespace GeZi
                 SleepGuard.Set(active);
             }
             catch { /* 保活失败绝不能影响下载本身 */ }
-        }
-
-        /// <summary>工具栏按钮的「图标 + 文字」内容（与 XAML 里手写的结构一致）。</summary>
-        private UIElement BuildToolIconText(string iconKey, string text, double strokeThickness)
-        {
-            var geo = TryFindResource(iconKey) as System.Windows.Media.Geometry;
-            var path = new ShapePath
-            {
-                Data = geo,
-                Stretch = Stretch.Uniform,
-                Width = 12,
-                Height = 12,
-                VerticalAlignment = VerticalAlignment.Center,
-                StrokeThickness = strokeThickness,
-                StrokeStartLineCap = PenLineCap.Round,
-                StrokeEndLineCap = PenLineCap.Round,
-                StrokeLineJoin = PenLineJoin.Round,
-            };
-            var brush = TryFindResource("TextSecondaryBrush") as Brush;
-            if (brush != null) path.Stroke = brush;
-
-            var sp = new StackPanel { Orientation = Orientation.Horizontal };
-            sp.Children.Add(path);
-            sp.Children.Add(new TextBlock
-            {
-                Text = text,
-                Margin = new Thickness(6, 0, 0, 0),
-                VerticalAlignment = VerticalAlignment.Center,
-            });
-            return sp;
         }
 
         private void OnClearDone(object sender, RoutedEventArgs e)
@@ -4356,6 +4460,11 @@ namespace GeZi
                     _taskView.GroupDescriptions.Add(
                         new PropertyGroupDescription(nameof(TaskItem.GroupName)));
             }
+
+            // 分组 = 文件夹卡片里的平铺行；平铺 = 一行一张小卡片。
+            var styleKey = _settings.TaskView == TaskViewMode.Grouped ? "TaskRowItem" : "TaskListItem";
+            if (TryFindResource(styleKey) is Style rowStyle)
+                TaskList.ItemContainerStyle = rowStyle;
         }
 
         /// <summary>同步「展示方式」按钮的文案 / 图标（图标在文字右边）。</summary>
@@ -4404,17 +4513,20 @@ namespace GeZi
         {
             if (_taskSelectMode) return;
             _taskSelectMode = true;
+            // 行模板里的勾选框靠这个 Tag 显示（不做隐藏控件常驻）
+            TaskList.Tag = "z";
             TaskSelectBar.Visibility = Visibility.Visible;
             TaskSelectFrame.Visibility = Visibility.Visible;
             TaskBandLayer.Visibility = Visibility.Visible;
             UpdateTaskSelectCount();
-            Log("已进入删除选择模式：拖拽框选或点击选择，选中文件夹行 = 整组；按 Enter 确认，Esc 退出。");
+            Log("已进入删除选择模式：拖拽框选，或点文件行单独选择、点文件夹头选中整组；按 Enter 确认，Esc 退出。");
         }
 
         private void ExitTaskSelectMode(bool clearSelection = true)
         {
             if (!_taskSelectMode) return;
             _taskSelectMode = false;
+            TaskList.Tag = null;
             TaskSelectBar.Visibility = Visibility.Collapsed;
             TaskSelectFrame.Visibility = Visibility.Collapsed;
             TaskBandLayer.Visibility = Visibility.Collapsed;
@@ -4453,9 +4565,15 @@ namespace GeZi
 
         private static GroupItem FindAncestorGroupItem(DependencyObject d)
         {
+            return FindAncestor<GroupItem>(d);
+        }
+
+        /// <summary>从可视元素往上找第一个指定类型（用于判定点的是标题栏还是行）。</summary>
+        private static T FindAncestor<T>(DependencyObject d) where T : DependencyObject
+        {
             while (d != null)
             {
-                if (d is GroupItem gi) return gi;
+                if (d is T t) return t;
                 d = VisualTreeHelper.GetParent(d);
             }
             return null;
@@ -4549,25 +4667,32 @@ namespace GeZi
         private TaskDeleteChoice AskTaskDeleteChoice(IList<TaskItem> tasks)
         {
             int total = tasks.Count;
-            var groups = tasks.GroupBy(t => t.GroupName)
-                              .Where(g => g.Key != TaskItem.SingleFileGroupName)
-                              .ToList();
-            int inGroups = groups.Sum(g => g.Count());
-            int singles = total - inGroups;
+            var selectedSet = new HashSet<TaskItem>(tasks);
+            // 【2026-10-20】只有整组都被选中时才会连文件夹一起删；
+            // 只选了文件夹里的一个文件时它就是普通文件，不能再写成"1 个文件夹"。
+            var wholeFolders = tasks
+                .Where(t => t.GroupName != TaskItem.SingleFileGroupName)
+                .Select(t => t.GroupName)
+                .Distinct()
+                .Where(name => _tasks.Where(x => x.GroupName == name).All(selectedSet.Contains))
+                .ToList();
+            int inWholeFolders = tasks.Count(t => wholeFolders.Contains(t.GroupName));
+            int loneFiles = total - inWholeFolders;
 
             string summary;
-            if (groups.Count > 0 && singles > 0)
-                summary = string.Format("共 {0} 个任务：{1} 个文件夹（{2} 个文件），另有 {3} 个单独的文件。",
-                    total, groups.Count, inGroups, singles);
-            else if (groups.Count > 0)
-                summary = string.Format("共 {0} 个文件，来自 {1} 个文件夹。", total, groups.Count);
+            if (wholeFolders.Count > 0 && loneFiles > 0)
+                summary = string.Format("共 {0} 项：{1} 个文件夹（{2} 个文件），另有 {3} 个单独选择的文件。",
+                    total, wholeFolders.Count, inWholeFolders, loneFiles);
+            else if (wholeFolders.Count > 0)
+                summary = string.Format("共 {0} 个文件，来自 {1} 个文件夹（整个文件夹会被删除）。",
+                    total, wholeFolders.Count);
             else
-                summary = string.Format("共 {0} 个任务。", total);
+                summary = string.Format("共 {0} 个文件。", total);
 
-            if (groups.Count > 0)
+            if (wholeFolders.Count > 0)
             {
-                var names = groups.Select(g => "· " + g.Key).Take(3).ToList();
-                if (groups.Count > 3) names.Add("…");
+                var names = wholeFolders.Select(n => "· " + n).Take(3).ToList();
+                if (wholeFolders.Count > 3) names.Add("…");
                 summary += "\n" + string.Join("\n", names);
             }
 
@@ -4592,7 +4717,8 @@ namespace GeZi
 
             var warn = DialogChrome.Hint(
                 "「仅删除记录」只移除列表条目，磁盘上的文件保留。\n" +
-                "「删除记录和本地文件」会先取消下载，再删除目标文件与分片缓存 —— 不可恢复。", 0, 14);
+                "「删除记录和本地文件」会先取消下载，再删除目标文件与分片缓存；\n" +
+                "整组选中时，删空的文件夹也会一并清理 —— 不可恢复。", 0, 14);
             warn.SetResourceReference(TextBlock.ForegroundProperty, "DangerBrush");
             System.Windows.Controls.Grid.SetRow(warn, 2);
             root.Children.Add(warn);
@@ -4802,36 +4928,14 @@ namespace GeZi
                     Log("任务已完成。");
                     return;
                 }
-                var p = t.Job == null ? null : t.Job.Pending;
-                bool canResume = p != null && !string.IsNullOrEmpty(t.Job.Dest)
-                    && !string.IsNullOrEmpty(p.Fid)
-                    && (!p.FromShare
-                        || (!string.IsNullOrEmpty(p.Token) && !string.IsNullOrEmpty(p.PwdId)
-                            && !string.IsNullOrEmpty(p.Stoken)));
-                if (!canResume)
+                var pend = BuildPendingTask(t);
+                if (pend == null)
                 {
                     Log("这个任务缺少续传信息，无法继续；请重新解析分享后再下载（分片在，会自然续传）。");
                     return;
                 }
 
                 Log("正在为「" + t.Name + "」重新取链……");
-                var pend = new PendingTask
-                {
-                    Name = t.Name,
-                    Dest = t.Job.Dest,
-                    Url = t.Job.Url,
-                    Fid = p.Fid,
-                    Token = p.Token,
-                    FromShare = p.FromShare,
-                    Size = t.Total,
-                    StreamPlay = t.Job.WriteMode == WriteMode.SegmentedFiles,
-                    StreamPlayMode = t.Job.WriteMode == WriteMode.SegmentedFiles,
-                    Status = t.StatusText,
-                    PwdId = p.PwdId,
-                    Stoken = p.Stoken,
-                    Passcode = p.Passcode,
-                    RelDir = p.RelDir,
-                };
                 // 续传流程会自己新建一行并替换掉这条占位（见 ResumePendingBatchAsync 里的去重）
                 _ = ResumePendingBatchAsync(new List<PendingTask> { pend });
                 return;
@@ -4848,6 +4952,41 @@ namespace GeZi
             {
                 Log("该任务当前状态不可恢复（" + t.StatusText + "）");
             }
+        }
+
+        /// <summary>
+        /// 把一个（Dormant 的）任务还原成续传流程认识的 <see cref="PendingTask"/>。
+        /// 缺少重取链信息（免转存 / fid 为空）时返回 null，由调用方给提示。
+        /// </summary>
+        private PendingTask BuildPendingTask(TaskItem t)
+        {
+            if (t == null || t.Job == null) return null;
+            var p = t.Job.Pending;
+            if (p == null || string.IsNullOrEmpty(t.Job.Dest) || string.IsNullOrEmpty(p.Fid))
+                return null;
+            if (p.FromShare
+                && (string.IsNullOrEmpty(p.Token) || string.IsNullOrEmpty(p.PwdId)
+                    || string.IsNullOrEmpty(p.Stoken)))
+                return null;
+
+            return new PendingTask
+            {
+                Name = t.Name,
+                Dest = t.Job.Dest,
+                Url = t.Job.Url,
+                Fid = p.Fid,
+                Token = p.Token,
+                FromShare = p.FromShare,
+                Size = t.Total,
+                StreamPlay = t.Job.WriteMode == WriteMode.SegmentedFiles,
+                StreamPlayMode = t.Job.WriteMode == WriteMode.SegmentedFiles,
+                Status = t.StatusText,
+                PwdId = p.PwdId,
+                Stoken = p.Stoken,
+                Passcode = p.Passcode,
+                RelDir = p.RelDir,
+                GroupName = p.GroupName,
+            };
         }
 
         private void OnTaskCancel(object sender, RoutedEventArgs e)
@@ -5111,6 +5250,35 @@ namespace GeZi
             }
             catch (Exception ex) { failed.Add(dest + " — " + ex.Message); }
 
+            // 【2026-10-20】顺手清理因此变空的目录（只到下载根目录为止）。
+            // 用户反馈：「删除本地文件后，对应的文件夹还留着空壳」。
+            // ⚠️ 只删**空**目录：里面还有别的文件就立刻停手，绝不误删用户放进去的东西；
+            //    同时用 StartsWith 守住下载根目录，老任务（Dest 在别的盘/别的目录）不会越界。
+            try
+            {
+                string root = Path.GetFullPath(_settings.OutDir)
+                                  .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string dir = Path.GetDirectoryName(dest);
+                while (!string.IsNullOrEmpty(dir))
+                {
+                    string full = Path.GetFullPath(dir)
+                                      .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    if (string.Equals(full, root, StringComparison.OrdinalIgnoreCase)) break;   // 根目录本身不删
+                    if (!full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                        break;
+                    if (!Directory.Exists(full))
+                    {
+                        dir = Path.GetDirectoryName(full);
+                        continue;
+                    }
+                    if (Directory.EnumerateFileSystemEntries(full).Any()) break;   // 还有别的东西 → 停
+                    Directory.Delete(full);
+                    LogFromWorker("已删除空文件夹「" + Path.GetFileName(full) + "」");
+                    dir = Path.GetDirectoryName(full);
+                }
+            }
+            catch { }
+
             // 日志尽量只有一行（用户要求：「日志上只会显示已成功删除本地文件XXX」）。
             // 出问题时才追加说明 —— 那种情况必须让用户看到。
             if (failed.Count == 0 && delayed == 0)
@@ -5194,16 +5362,14 @@ namespace GeZi
                 return;
             }
 
-            // 还没下完就点播放：给一句准确的说明，免得用户以为是文件坏了。
-            // 【2026-10-04 实测结论】这不是"GeZi 打不开"—— 即使用写句柄把文件锁住，
-            // VLC 照样能打开（实测 0 条错误日志），GeZi 的调用链也是对的。
-            // 真正的原因是**文件只有按顺序拼好的那一段前缀**：
-            //   · 前面几片还没到齐时，文件可能只有几十 KB；
-            //   · 更关键的是 **MP4 的 moov（索引表）通常写在文件末尾**
-            //     （没做 faststart 的文件）—— 播放器必须先读到文件尾部才能播，
-            //     所以半截文件一律播不了，而**下完之后立刻就能播**。
+            // 还没下完就点播放：优先走「本地 HTTP 串流 + PotPlayer/VLC」。
+            // 旧做法是直接把半截文件交给播放器：它读到当前 EOF 就停，MP4 索引在
+            // 尾部时更是直接判损坏 —— 用户看到的往往是一句"无法播放此文件"。
             if (item.State != JobState.Completed)
             {
+                if (TryStartStreamingPlayback(item, dest))
+                    return;
+
                 Log(string.Format(
                     "提示: 该文件还没下完（当前 {0} / {1}）。独立分片模式下目标文件是按顺序"
                     + "拼出来的前缀，若视频索引在文件末尾，播放器会提示「无法播放此文件」—— "
@@ -5228,6 +5394,115 @@ namespace GeZi
                 }
             }
             catch (Exception ex) { Log("打开失败: " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 未下完的视频：走本地 HTTP 串流 + PotPlayer/VLC，而不是把半截文件
+        /// 直接交给播放器。返回 true 表示"已经处理（或已明确告知）"，外层不要再回退。
+        /// </summary>
+        private bool TryStartStreamingPlayback(TaskItem item, string dest)
+        {
+            if (item == null || item.Job == null) return false;
+            if (!MediaProbe.IsVideo(dest)) return false;
+
+            if (item.Job.WriteMode != WriteMode.SegmentedFiles)
+            {
+                Log("该任务使用「共写同一文件」，目标文件不是连续前缀，无法边下边播；"
+                    + "请在设置里改成「独立分片 + 边合并」。");
+                return false;
+            }
+
+            // 上次运行留下的占位行没有活动下载器，流视图取不到 —— 先恢复，
+            // 恢复后是新的一行，再点播放即可。
+            if (item.Dormant)
+            {
+                var ans = AppDialog.Show(this,
+                    "这个任务是上次运行留下的，需要先恢复下载才能边下边播。\n\n现在恢复吗？",
+                    "边下边播", System.Windows.MessageBoxButton.YesNo,
+                    System.Windows.MessageBoxImage.Question,
+                    System.Windows.MessageBoxResult.Yes);
+                if (ans != System.Windows.MessageBoxResult.Yes) return true;
+                ResumeTask(item);
+                AppDialog.Show(this,
+                    "已开始恢复下载。等任务开始写入后，再点一次「播放」即可边下边播。",
+                    "边下边播");
+                return true;
+            }
+
+            var map = item.Job.GetStreamMap == null ? null : item.Job.GetStreamMap();
+            if (map == null)
+            {
+                Log("下载器还没开始写盘，暂时无法边下边播。");
+                return false;
+            }
+
+            if (item.State == JobState.Paused)
+            {
+                var ans = AppDialog.Show(this,
+                    "任务当前已暂停。边下边播需要继续下载，是否恢复并播放？",
+                    "边下边播", System.Windows.MessageBoxButton.YesNo,
+                    System.Windows.MessageBoxImage.Question,
+                    System.Windows.MessageBoxResult.Yes);
+                if (ans != System.Windows.MessageBoxResult.Yes) return true;
+                ResumeTask(item);
+            }
+            else if (item.State == JobState.Failed || item.State == JobState.Cancelled)
+            {
+                Log("任务已停止，边下边播只能播放已下载的部分：" + item.Name);
+            }
+
+            // MP4 的 moov 常在文件尾部：先主动把最后 16MB 提成优先分片，
+            // 播放器一读索引就能马上拿到，不用干等顺序下载。
+            if (MediaProbe.IsMp4Family(dest) && !MediaProbe.IsMp4IndexAvailable(dest)
+                && item.Job.BoostRange != null && item.Total > 0)
+            {
+                long tailStart = Math.Max(0, item.Total - 16L * 1024 * 1024);
+                item.Job.BoostRange(tailStart, item.Total - 1);
+                Log("MP4 索引在文件尾部，已优先下载最后 16MB。");
+            }
+
+            string url = LocalStreamServer.Instance.Publish(
+                map.Total, map.Dest, map.ReadAt,
+                () => item.State == JobState.Completed,
+                () => item.State == JobState.Downloading || item.State == JobState.Queued,
+                (s, e) =>
+                {
+                    try
+                    {
+                        var boost = item.Job == null ? null : item.Job.BoostRange;
+                        return boost != null && boost(s, e);
+                    }
+                    catch { return false; }
+                });
+            if (string.IsNullOrEmpty(url))
+            {
+                Log("边下边播服务启动失败。");
+                return false;
+            }
+
+            var player = PlayerLocator.Find();
+            if (player == null)
+            {
+                LocalStreamServer.Instance.Unpublish(url);
+                Log("未检测到 VLC，无法边下边播。");
+                AppDialog.Show(this,
+                    "边下边播需要 VLC（播放器要能直接打开 HTTP 地址）。\n\n"
+                    + "装好 VLC 后，在设置页点「重新检测」即可。",
+                    "未检测到 VLC",
+                    System.Windows.MessageBoxButton.OK,
+                    System.Windows.MessageBoxImage.Information);
+                return true;
+            }
+
+            if (!ShellLaunch.OpenPlayerUrl(player, url))
+            {
+                LocalStreamServer.Instance.Unpublish(url);
+                Log("启动播放器失败：" + player.ExePath);
+                return false;
+            }
+
+            Log("边下边播已启动（" + player.Name + "）：" + url);
+            return true;
         }
 
         /// <summary>「定位」：在资源管理器中**选中**该文件；还没写盘就打开所在目录。</summary>
@@ -5667,6 +5942,7 @@ namespace GeZi
                                 PwdId = p.PwdId, Stoken = p.Stoken, Passcode = p.Passcode,
                                 Fid = p.Fid, Token = p.Token, FromShare = p.FromShare,
                                 RelDir = p.RelDir ?? "", Dest = dest, Size = p.Size,
+                                GroupName = p.GroupName ?? "",
                             },
                         };
                         var captured = job;
@@ -5747,16 +6023,15 @@ namespace GeZi
             {
                 if (p == null)
                 {
-                    // 🚨 只提 VLC（2026-10-04 用户要求）：全项目只对 VLC 做过参数适配，
-                    //    其它播放器（mpv / PotPlayer）可能行为不一致 → 干脆不提，避免给出错误预期。
                     PlayerStatusText.Text = "未检测到 VLC。"
-                        + "「打开」将回退到系统默认程序 —— 但边下边播未必能用，"
-                        + "因为系统自带播放器通常打不开「还没下完」的文件。";
+                        + "如果 VLC 装在非常规目录，点「选择 VLC 位置…」手动指定 vlc.exe（会记住）。"
+                        + "「打开」将回退到系统默认程序，但通常无法边下边播。";
                     GetVlcBtn.Visibility = System.Windows.Visibility.Visible;
                 }
                 else
                 {
-                    PlayerStatusText.Text = "已检测到 VLC（" + p.ExePath + "）—— 适合边下边播。";
+                    PlayerStatusText.Text = "已检测到 VLC（" + p.ExePath + "）"
+                        + " —— 支持边下边播。";
                     GetVlcBtn.Visibility = System.Windows.Visibility.Collapsed;
                 }
             }
@@ -5781,6 +6056,15 @@ namespace GeZi
             if (!BeginBusy(RecheckPlayerBtn, "检测中")) return;
             try
             {
+                // 「重新检测」= 回到自动探测：清掉手动路径，避免旧路径挡住新的安装位置
+                if (!string.IsNullOrEmpty(_settings.VlcPath))
+                {
+                    _settings.VlcPath = "";
+                    SettingsStore.Save(_settings);
+                    Log("已清除手动指定的 VLC 路径，改为自动检测。");
+                }
+                PlayerLocator.PreferredPath = null;
+
                 PlayerLocator.Player p;
                 try
                 {
@@ -5797,6 +6081,29 @@ namespace GeZi
             {
                 await EndBusyAsync(RecheckPlayerBtn, t0);
             }
+        }
+
+        /// <summary>
+        /// 「选择 VLC 位置…」—— 便携版/非常规安装目录的用户手动指定 vlc.exe。
+        /// 路径写入设置并立即生效，之后播放与边下边播都用它。
+        /// </summary>
+        private void OnPickVlc(object sender, RoutedEventArgs e)
+        {
+            var dlg = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = "选择 VLC 播放器（vlc.exe）",
+                Filter = "VLC (vlc.exe)|vlc.exe|可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*",
+                CheckFileExists = true,
+                Multiselect = false,
+            };
+            if (dlg.ShowDialog(this) != true) return;
+
+            string path = dlg.FileName;
+            _settings.VlcPath = path;
+            SettingsStore.Save(_settings);
+            PlayerLocator.PreferredPath = path;
+            RefreshPlayerStatus();
+            Log("已指定 VLC 路径: " + path);
         }
 
         private void OnGetVlc(object sender, RoutedEventArgs e)
@@ -5903,6 +6210,9 @@ namespace GeZi
             // 把诊断日志接进界面日志框：外部启动是否成功、ShellExecute 返回码多少，
             // 都要能看到 —— 否则每次失败都只能猜。
             ShellLaunch.Log = Log;
+            LocalStreamServer.Log = Log;
+            // 手动指定的 VLC 路径优先于自动探测（便携版可能在任何目录）
+            PlayerLocator.PreferredPath = _settings.VlcPath;
             // 探测本机播放器，供设置页展示 + 「打开」按钮选用
             RefreshPlayerStatus();
         }

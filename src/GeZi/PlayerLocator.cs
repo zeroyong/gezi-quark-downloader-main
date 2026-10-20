@@ -1,4 +1,4 @@
-// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
 // Copyright (C) 2026  Yi Yuan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -33,7 +33,8 @@ namespace GeZi
     ///   `--started-from-file`，与资源管理器右键行为对齐；其它播放器不认这个参数），
     ///   用其它播放器可能出现行为不一致的 bug → 索性**只认 VLC**，
     ///   不给用户"还能用 mpv"的预期。
-    ///   （历史实现曾探测 VLC → mpv → PotPlayer，已按下述只留 VLC。）
+    ///   （2026-10-20 曾短暂加入 PotPlayer 用于串流，但用户实测 PotPlayer
+    ///    在窗口失焦时明显卡顿，已按要求回退为只认 VLC。）
     ///
     /// 探测顺序：注册表 App Paths → 常见安装目录 → PATH。
     /// 全部失败返回 null，由调用方回退到"系统默认程序"。
@@ -47,9 +48,30 @@ namespace GeZi
             public bool Recommended; // 保留字段（现在恒为 true，只探测 VLC）
         }
 
+        /// <summary>
+        /// 用户手动指定的 VLC 路径（来自设置页）。由 MainWindow 在加载设置时写入。
+        /// 为空/文件不存在时自动回退到常规探测 —— 便携版装在任意目录也能用。
+        /// </summary>
+        public static string PreferredPath { get; set; }
+
         /// <summary>探测 VLC。没找到返回 null。</summary>
         public static Player Find()
         {
+            string preferred = PreferredPath;
+            if (!string.IsNullOrWhiteSpace(preferred))
+            {
+                try
+                {
+                    if (File.Exists(preferred))
+                        return new Player
+                        {
+                            Name = "VLC",
+                            ExePath = Path.GetFullPath(preferred),
+                            Recommended = true,
+                        };
+                }
+                catch { }
+            }
             return FindVlc();
         }
 
@@ -82,11 +104,13 @@ namespace GeZi
                 catch { }
             }
 
-            // ② 常见安装目录
+            // ② 常见安装目录（含免安装版解压到用户目录的情况）
             foreach (var baseDir in new[]
                      {
                          Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
                          Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                         Path.Combine(Environment.GetFolderPath(
+                             Environment.SpecialFolder.LocalApplicationData), "Programs"),
                      })
             {
                 if (string.IsNullOrEmpty(baseDir)) continue;

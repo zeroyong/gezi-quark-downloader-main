@@ -150,45 +150,55 @@ namespace GeZi
 
             var player = PlayerLocator.Find();
             if (player != null)
-            {
-                Process p = null;
-                try
-                {
-                    // 【2026-10-04 用户反馈】「点播放调用的是 VLC，VLC 开了但没播」。
-                    // 原因：VLC 是**单实例**程序。已经有一个 VLC 在跑时，再执行
-                    // `vlc.exe "文件"` 只会把文件**塞进那个实例的播放列表**就退出 ——
-                    // 窗口出来了、却没有开始播放，正是用户看到的现象。
-                    // 资源管理器双击/右键「用 VLC 打开」为什么正常？因为它用的是
-                    // 文件关联里的命令行，本机实测是：
-                    //     "D://VLC//vlc.exe" --started-from-file "%1"
-                    // `--started-from-file` 就是告诉 VLC「这是从文件关联启动的，直接播」。
-                    // → 这里把参数对齐成资源管理器那一套（VLC 专用参数）。
-                    string args = Quote(file);
-                    if (!string.IsNullOrEmpty(player.ExePath)
-                        && Path.GetFileName(player.ExePath)
-                               .IndexOf("vlc", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        args = "--started-from-file " + args;
-                    }
-
-                    p = Process.Start(new ProcessStartInfo(player.ExePath, args)
-                    {
-                        UseShellExecute = false,
-                        WorkingDirectory = Path.GetDirectoryName(player.ExePath),
-                    });
-                    if (p == null) return false;
-                    p.WaitForExit(700);
-                    return !p.HasExited || p.ExitCode == 0;
-                }
-                catch { return false; }
-                finally { if (p != null) p.Dispose(); }
-            }
+                return LaunchPlayer(player, file);
 
             // 没有播放器：交给系统的"打开方式"
             long code = Fire("openas", file, null);
             if (code > ShellExecuteErrorThreshold) return true;
             Report("OpenFile 失败 ShellExecute=" + code + "  file=" + file);
             return false;
+        }
+
+        /// <summary>
+        /// 用指定播放器打开 URL（边下边播走本地 http://127.0.0.1 串流）。
+        /// 与 OpenFile 共用同一套"单实例播放器参数"处理。
+        /// </summary>
+        public static bool OpenPlayerUrl(PlayerLocator.Player player, string url)
+        {
+            if (player == null || string.IsNullOrWhiteSpace(url)) return false;
+            return LaunchPlayer(player, url);
+        }
+
+        /// <summary>
+        /// 启动播放器。VLC 需要 `--started-from-file` 才会"直接播"而不是
+        /// 塞进已有实例的播放列表（见 OpenFile 里的历史注释）；PotPlayer
+        /// 直接吃 URL 参数即可。
+        /// </summary>
+        private static bool LaunchPlayer(PlayerLocator.Player player, string target)
+        {
+            if (player == null || string.IsNullOrEmpty(player.ExePath)) return false;
+
+            Process p = null;
+            try
+            {
+                string args = Quote(target);
+                if (Path.GetFileName(player.ExePath)
+                        .IndexOf("vlc", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    args = "--started-from-file " + args;
+                }
+
+                p = Process.Start(new ProcessStartInfo(player.ExePath, args)
+                {
+                    UseShellExecute = false,
+                    WorkingDirectory = Path.GetDirectoryName(player.ExePath),
+                });
+                if (p == null) return false;
+                p.WaitForExit(700);
+                return !p.HasExited || p.ExitCode == 0;
+            }
+            catch { return false; }
+            finally { if (p != null) p.Dispose(); }
         }
 
         // ---------------- 供 ShellReveal 复用 ----------------

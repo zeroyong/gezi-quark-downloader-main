@@ -608,11 +608,13 @@
                                                   StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
                                             <TextBox x:Name="FileFilterBox" Grid.Column="1"
                                                      TextChanged="OnFileFilterChanged" BorderThickness="0"
+                                                     KeyDown="OnFileFilterKeyDown"
                                                      Background="Transparent" Padding="6,0,7,0"
                                                      VerticalContentAlignment="Center"
                                                      FontSize="12.5"
+                                                     AutomationProperties.Name="文件搜索框"
                                                      CaretBrush="{DynamicResource PrimaryBrush}"
-                                                     ToolTip="按名称筛选当前目录的文件/文件夹"/>
+                                                     ToolTip="按名称筛选当前目录的文件/文件夹（快捷键 i；Esc 退出）"/>
                                         </Grid>
                                     </Border>
                                     <Button x:Name="DriveUpBtn" Click="OnUp" Style="{StaticResource ToolButton}"
@@ -907,8 +909,49 @@
                                      图标与文案按当前任务状态自动切换（有在跑的就显示"暂停全部"，
                                      否则显示"恢复全部"），由 UpdatePauseAllButton() 在代码里维护。
                                      「取消全部」按钮按用户要求移除 —— 单个任务的「取消」仍在右键菜单里。 -->
-                                <Button x:Name="PauseAllBtn" Click="OnPauseAllOrResume"
-                                        Style="{StaticResource ToolButton}"/>
+                                <!-- 【2026-10-20】方案 B：一个分段胶囊，两段分别是
+                                     「全部暂停 / 全部恢复」。两个动作永远同时可见，
+                                     各自带数量徽标；没有可操作对象时那一半置灰。 -->
+                                <Border Style="{StaticResource PauseSegBorder}" Margin="0,0,8,0">
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button x:Name="PauseAllBtn" Click="OnPauseAll"
+                                                Style="{StaticResource PauseSegButton}"
+                                                AutomationProperties.Name="全部暂停">
+                                            <StackPanel Orientation="Horizontal">
+                                                <Path Data="{StaticResource IconPause}" Stretch="Uniform"
+                                                      Width="11" Height="11" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource TextSecondaryBrush}"
+                                                      StrokeThickness="2"
+                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                                <TextBlock Text="全部暂停" Margin="7,0,0,0"
+                                                           VerticalAlignment="Center"/>
+                                                <Border Style="{StaticResource PauseSegCount}">
+                                                    <TextBlock x:Name="PauseAllCount" Text="0"
+                                                               Style="{StaticResource PauseSegCountText}"/>
+                                                </Border>
+                                            </StackPanel>
+                                        </Button>
+                                        <Border Style="{StaticResource PauseSegDivider}"/>
+                                        <Button x:Name="ResumeAllBtn" Click="OnResumeAll"
+                                                Style="{StaticResource PauseSegButton}"
+                                                AutomationProperties.Name="全部恢复">
+                                            <StackPanel Orientation="Horizontal">
+                                                <Path Data="{StaticResource IconPlay}" Stretch="Uniform"
+                                                      Width="10" Height="10" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource TextSecondaryBrush}"
+                                                      StrokeThickness="1.6"
+                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                      StrokeLineJoin="Round"/>
+                                                <TextBlock Text="全部恢复" Margin="7,0,0,0"
+                                                           VerticalAlignment="Center"/>
+                                                <Border Style="{StaticResource PauseSegCount}">
+                                                    <TextBlock x:Name="ResumeAllCount" Text="0"
+                                                               Style="{StaticResource PauseSegCountText}"/>
+                                                </Border>
+                                            </StackPanel>
+                                        </Button>
+                                    </StackPanel>
+                                </Border>
                                 <Button x:Name="ClearDoneBtn" Content="清空已完成" Click="OnClearDone"
                                         Style="{StaticResource ToolButton}"/>
                                 <!-- 【2026-10-13 移除】「下载历史」按钮已删：
@@ -985,7 +1028,7 @@
                                           StrokeLineJoin="Round"/>
                                     <TextBlock Text="删除选择模式" Margin="8,0,0,0" FontWeight="SemiBold"
                                                Foreground="{DynamicResource PrimaryBrush}" VerticalAlignment="Center"/>
-                                    <TextBlock Text="空白处拖拽框选 · 点击行选择 · 点文件夹行选中整组"
+                                    <TextBlock Text="空白处拖拽框选 · 点文件行单独选择 · 点文件夹头选中整组"
                                                Margin="10,0,0,0" FontSize="11.5"
                                                Foreground="{DynamicResource TextSecondaryBrush}"
                                                VerticalAlignment="Center"/>
@@ -1013,38 +1056,66 @@
                                      PreviewMouseLeftButtonUp="OnTaskListMouseUp"
                                      MouseRightButtonUp="OnTaskListRightClick"
                                      MouseDoubleClick="OnTaskListDoubleClick">
-                                <!-- 文件夹分组（方案 A）：分组头细、靠发丝线分隔。
+                                <!-- 文件夹分组（方案 B）：一个文件夹一张卡片。
+                                     卡片头 48px（图标块 + 名称 + 文件数胶囊 + 折角箭头），
+                                     行是卡内平铺行（见 TaskRowItem 样式）。
                                      GroupDescriptions 由代码按设置里的展示方式增减
-                                     （见 ApplyTaskGrouping）。这里只描述分组头长什么样。 -->
+                                     （见 ApplyTaskGrouping）。 -->
                                 <ListBox.GroupStyle>
                                     <GroupStyle>
                                         <GroupStyle.ContainerStyle>
                                             <Style TargetType="{x:Type GroupItem}">
+                                                <Setter Property="Margin" Value="0,0,0,10"/>
                                                 <Setter Property="Template">
                                                     <Setter.Value>
                                                         <ControlTemplate TargetType="{x:Type GroupItem}">
-                                                            <Expander Style="{StaticResource TaskGroupExpander}"
-                                                                      IsExpanded="True">
-                                                                <Expander.Header>
-                                                                    <StackPanel Orientation="Horizontal">
-                                                                        <Path Data="{StaticResource IconFolder}"
-                                                                              Stretch="Uniform" Width="13" Height="13"
-                                                                              VerticalAlignment="Center"
-                                                                              Stroke="{DynamicResource TextTertiaryBrush}"
-                                                                              StrokeThickness="1.7"
-                                                                              StrokeStartLineCap="Round"
-                                                                              StrokeEndLineCap="Round"
-                                                                              StrokeLineJoin="Round"/>
-                                                                        <TextBlock Text="{Binding Name}"
-                                                                                   Margin="8,0,0,0" MaxWidth="560"
-                                                                                   Style="{StaticResource TaskGroupNameText}"/>
-                                                                        <TextBlock Style="{StaticResource TaskGroupCountText}"
-                                                                                   Text="{Binding ItemCount,
-                                                                                       StringFormat={}{0} 个文件}"/>
-                                                                    </StackPanel>
-                                                                </Expander.Header>
-                                                                <ItemsPresenter/>
-                                                            </Expander>
+                                                            <Border Background="{DynamicResource SurfaceBrush}"
+                                                                    BorderBrush="{DynamicResource BorderBrushSoft}"
+                                                                    BorderThickness="1" CornerRadius="12"
+                                                                    SnapsToDevicePixels="True">
+                                                                <Expander Style="{StaticResource TaskGroupExpander}"
+                                                                          IsExpanded="True">
+                                                                    <Expander.Header>
+                                                                        <Grid>
+                                                                            <Grid.ColumnDefinitions>
+                                                                                <ColumnDefinition Width="Auto"/>
+                                                                                <ColumnDefinition Width="Auto"/>
+                                                                                <ColumnDefinition Width="Auto"/>
+                                                                                <ColumnDefinition Width="*"/>
+                                                                            </Grid.ColumnDefinitions>
+                                                                            <Border Grid.Column="0"
+                                                                                    Style="{StaticResource TaskGroupTile}">
+                                                                                <Path Data="{StaticResource IconFolder}"
+                                                                                      Stretch="Uniform" Width="14" Height="14"
+                                                                                      HorizontalAlignment="Center"
+                                                                                      VerticalAlignment="Center"
+                                                                                      Stroke="{DynamicResource PrimaryBrush}"
+                                                                                      StrokeThickness="1.7"
+                                                                                      StrokeStartLineCap="Round"
+                                                                                      StrokeEndLineCap="Round"
+                                                                                      StrokeLineJoin="Round"/>
+                                                                            </Border>
+                                                                            <TextBlock Grid.Column="1"
+                                                                                       Text="{Binding Name}"
+                                                                                       Margin="11,0,0,0" MaxWidth="560"
+                                                                                       Style="{StaticResource TaskGroupNameText}"/>
+                                                                            <Border Grid.Column="2"
+                                                                                    Style="{StaticResource TaskGroupCountPill}">
+                                                                                <TextBlock
+                                                                                    Text="{Binding ItemCount,
+                                                                                        StringFormat={}{0} 个文件}"
+                                                                                    Style="{StaticResource TaskGroupCountText}"
+                                                                                    Margin="0"/>
+                                                                            </Border>
+                                                                        </Grid>
+                                                                    </Expander.Header>
+                                                                    <!-- 底部留 4px：行的悬停底色不压到卡片圆角 -->
+                                                                    <Border Background="{DynamicResource SurfaceBrush}"
+                                                                            Padding="0,0,0,4">
+                                                                        <ItemsPresenter/>
+                                                                    </Border>
+                                                                </Expander>
+                                                            </Border>
                                                         </ControlTemplate>
                                                     </Setter.Value>
                                                 </Setter>
@@ -1082,6 +1153,25 @@
                                                 </Grid.ColumnDefinitions>
                                                 <StackPanel Grid.Column="0" Orientation="Horizontal"
                                                             VerticalAlignment="Center">
+                                                    <!-- z 删除模式下显示的勾选框：
+                                                         仅是可视提示，选中态由 ListBoxItem.IsSelected 驱动。 -->
+                                                    <Border x:Name="Tick" Width="17" Height="17"
+                                                            CornerRadius="5" Margin="0,0,9,0"
+                                                            Background="Transparent"
+                                                            BorderBrush="{DynamicResource BorderBrushStrong}"
+                                                            BorderThickness="1.5"
+                                                            VerticalAlignment="Center"
+                                                            Visibility="Collapsed">
+                                                        <Path x:Name="TickMark" Data="M3,8 L6.5,11.5 L13,4"
+                                                              Width="10" Height="8" Stretch="Uniform"
+                                                              Stroke="White" StrokeThickness="2"
+                                                              StrokeStartLineCap="Round"
+                                                              StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"
+                                                              HorizontalAlignment="Center"
+                                                              VerticalAlignment="Center"
+                                                              Visibility="Collapsed"/>
+                                                    </Border>
                                                     <Ellipse Width="7" Height="7" VerticalAlignment="Center"
                                                              Margin="0,0,9,0">
                                                         <Ellipse.Style>
@@ -1126,7 +1216,8 @@
                                                 <!-- 行内「播放/暂停」切换按钮（纯图标，图标随状态互换）。
                                                      控制的是**这个下载任务**的暂停/恢复，
                                                      不是控制外部播放器（那做不到）。 -->
-                                                <Button Grid.Column="2" Click="OnTaskTogglePause"
+                                                <Button x:Name="PauseBtn" Grid.Column="2"
+                                                        Click="OnTaskTogglePause"
                                                         Tag="{Binding}" Style="{StaticResource TaskPauseButton}"
                                                         AutomationProperties.Name="暂停或继续"
                                                         Margin="6,0,0,0" VerticalAlignment="Center"/>
@@ -1137,9 +1228,10 @@
                                                        · 共写同一文件 → 预分配的满尺寸空洞文件，播放器打不开 ✗
                                                        · 已完成 → 文件完整，两种模式都能播 ✓
                                                      不能播时整个按钮收起（Collapsed），不留一个点了没用的入口。 -->
-                                                <Button Grid.Column="3" Content="播放" Click="OnOpenTaskFile"
+                                                <Button x:Name="PlayBtn" Grid.Column="3" Content="播放"
+                                                        Click="OnOpenTaskFile"
                                                         Tag="{Binding}" Margin="4,0,0,0" VerticalAlignment="Center"
-                                                        ToolTip="用系统默认程序打开播放。">
+                                                        ToolTip="未下完时通过本地串流边下边播（VLC）；跳转进度会优先下载对应分片。">
                                                     <Button.Style>
                                                         <Style TargetType="Button" BasedOn="{StaticResource GhostButton}">
                                                             <Style.Triggers>
@@ -1150,7 +1242,8 @@
                                                         </Style>
                                                     </Button.Style>
                                                 </Button>
-                                                <Button Grid.Column="4" Content="定位" Click="OnLocateTaskFile"
+                                                <Button x:Name="LocateBtn" Grid.Column="4" Content="定位"
+                                                        Click="OnLocateTaskFile"
                                                         Tag="{Binding}" Style="{StaticResource GhostButton}"
                                                         Margin="2,0,0,0" VerticalAlignment="Center"
                                                         ToolTip="在资源管理器中选中该文件。"/>
@@ -1210,6 +1303,35 @@
                                                            Style="{StaticResource NumericText}"/>
                                             </Grid>
                                         </Grid>
+                                        <DataTemplate.Triggers>
+                                            <!-- TaskList.Tag = "z" 时显示勾选框（由 EnterTaskSelectMode 置位） -->
+                                            <DataTrigger Value="z"
+                                                         Binding="{Binding Tag,
+                                                             RelativeSource={RelativeSource AncestorType=ListBox}}">
+                                                <Setter TargetName="Tick" Property="Visibility"
+                                                        Value="Visible"/>
+                                                <!-- 与 B 原型一致：选择模式下这排动作按钮变淡、不吃点击 -->
+                                                <Setter TargetName="PauseBtn" Property="Opacity" Value="0.3"/>
+                                                <Setter TargetName="PlayBtn" Property="Opacity" Value="0.3"/>
+                                                <Setter TargetName="LocateBtn" Property="Opacity" Value="0.3"/>
+                                                <Setter TargetName="PauseBtn" Property="IsHitTestVisible"
+                                                        Value="False"/>
+                                                <Setter TargetName="PlayBtn" Property="IsHitTestVisible"
+                                                        Value="False"/>
+                                                <Setter TargetName="LocateBtn" Property="IsHitTestVisible"
+                                                        Value="False"/>
+                                            </DataTrigger>
+                                            <DataTrigger Value="True"
+                                                         Binding="{Binding IsSelected,
+                                                             RelativeSource={RelativeSource AncestorType=ListBoxItem}}">
+                                                <Setter TargetName="Tick" Property="Background"
+                                                        Value="{DynamicResource PrimaryBrush}"/>
+                                                <Setter TargetName="Tick" Property="BorderBrush"
+                                                        Value="{DynamicResource PrimaryBrush}"/>
+                                                <Setter TargetName="TickMark" Property="Visibility"
+                                                        Value="Visible"/>
+                                            </DataTrigger>
+                                        </DataTemplate.Triggers>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
                             </ListBox>
@@ -1619,14 +1741,20 @@
                                                    Margin="0,0,0,10"/>
                                         <TextBlock x:Name="PlayerStatusText" TextWrapping="Wrap"
                                                    Style="{StaticResource ProseText}" Margin="0,0,0,10"/>
-                                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                                        <WrapPanel Margin="0,0,0,10">
+                                            <Button x:Name="PickVlcBtn" Content="选择 VLC 位置…"
+                                                    Click="OnPickVlc"
+                                                    Style="{StaticResource SecondaryButton}"
+                                                    Margin="0,0,8,6"
+                                                    ToolTip="便携版 VLC 或装在非常规目录时，手动指定 vlc.exe。"/>
                                             <Button x:Name="GetVlcBtn" Content="打开 VLC 下载页" Click="OnGetVlc"
-                                                    Style="{StaticResource SecondaryButton}" Margin="0,0,8,0"/>
+                                                    Style="{StaticResource SecondaryButton}" Margin="0,0,8,6"/>
                                             <Button x:Name="RecheckPlayerBtn" Content="重新检测"
-                                                    Click="OnRecheckPlayer" Style="{StaticResource SecondaryButton}"/>
-                                        </StackPanel>
+                                                    Click="OnRecheckPlayer" Style="{StaticResource SecondaryButton}"
+                                                    Margin="0,0,0,6"/>
+                                        </WrapPanel>
                                         <TextBlock Style="{StaticResource ProseText}"
-                                                   Text="GeZi 不内置播放器（内置会让安装包大几十 MB）。推荐 VLC：免费、开源、格式全，而且它以共享模式打开文件，不会干扰我们继续写盘。没装 VLC 时，「打开」按钮会回退到系统默认程序。"/>
+                                                   Text="GeZi 不内置播放器（内置会让安装包大几十 MB）。推荐 VLC：它能直接打开本程序提供的本地 HTTP 串流，边下边播不依赖「播放器是否容忍半截文件」。VLC 装在非常规目录时，用「选择 VLC 位置…」指定一次即可（路径会记住）；「重新检测」会清除手动路径并重新自动查找。"/>
                                     </StackPanel>
                                 </Border>
                             </Grid>
@@ -1644,6 +1772,8 @@
                                             <ColumnDefinition Width="*"/>
                                         </Grid.ColumnDefinitions>
                                         <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
@@ -1745,10 +1875,26 @@
                                                    VerticalAlignment="Center" TextWrapping="Wrap"
                                                    Style="{StaticResource SecondaryText}"
                                                    Text="删除选择模式下确认：弹出「仅删除记录」/「删除记录和本地文件」二选一（Esc 取消）"/>
+
+                                        <Border Grid.Row="10" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="F" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="10" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="全屏 / 还原（= 最大化切换，任何页面可用）"/>
+
+                                        <Border Grid.Row="11" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="i" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="11" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center" TextWrapping="Wrap"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="光标聚焦到文件搜索框（仅「下载」页；Esc 退出焦点，筛选内容保留）"/>
                                     </Grid>
 
                                     <TextBlock Style="{StaticResource ProseText}" Margin="0,14,0,0"
-                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史在任何页面都可用；a / d / x / g 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件用 Shift+点击（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
+                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史、全屏在任何页面都可用；a / d / x / g / i 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件用 Shift+点击（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
                                 </StackPanel>
                             </Border>
                         </StackPanel>

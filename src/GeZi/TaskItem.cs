@@ -72,7 +72,13 @@ namespace GeZi
             get
             {
                 string rel = (Job != null && Job.Pending != null) ? (Job.Pending.RelDir ?? "") : "";
-                if (rel.Length == 0) return SingleFileGroupName;
+                if (rel.Length == 0)
+                {
+                    // 直接在当前打开的目录里勾的文件：RelDir 是空串，
+                    // 用下载时所在目录名分类（分享子目录 / 网盘子目录）。见 PendingInfo.GroupName。
+                    string folder = (Job != null && Job.Pending != null) ? (Job.Pending.GroupName ?? "") : "";
+                    return folder.Length == 0 ? SingleFileGroupName : folder;
+                }
                 int i = rel.IndexOfAny(new[] { '\\', '/' });
                 return i <= 0 ? rel : rel.Substring(0, i);
             }

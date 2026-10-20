@@ -29,6 +29,16 @@ using GeZi.Core.Support;
 namespace GeZi.Core.Api
 {
     /// <summary>
+    /// 分享凭证接口的结果：stoken + 分享标题。
+    /// 标题默认是被分享文件夹的名字，用于「任务按文件夹分组」在分享子目录场景下兜底。
+    /// </summary>
+    public class ShareTokenInfo
+    {
+        public string Stoken { get; set; }
+        public string Title { get; set; }
+    }
+
+    /// <summary>
     /// 夸克网页端公开接口客户端，等价于原 Python 核心里 QuarkClient 类的移植。
     /// Cookie 手动维护（与 Python 一样整串下发、按 Set-Cookie 增量合并），
     /// 不依赖 CookieContainer 的域名匹配，避免跨域 Cookie 丢失。
@@ -388,11 +398,30 @@ namespace GeZi.Core.Api
 
         public async Task<string> GetStokenAsync(string pwdId, string passcode = "")
         {
+            return (await GetShareInfoAsync(pwdId, passcode)).Stoken;
+        }
+
+        /// <summary>
+        /// 分享凭证 + 分享标题（2026-10-20 新增）。
+        ///
+        /// 【为什么要标题】分享链接可以带子目录（<c>#/list/share/&lt;fid&gt;</c>），
+        /// 解析后直接进入那个目录。此时任务页的「文件夹分组」拿不到目录名
+        /// （列表里只有它的子项），于是退回到「单独选择的文件」。
+        /// 夸克分享的 title 默认就是**被分享文件夹的名字**，用它兜底最省一次请求。
+        /// 该字段可能不存在（老版本/特殊分享）→ 返回空串，调用方按空处理。
+        /// </summary>
+        public async Task<ShareTokenInfo> GetShareInfoAsync(string pwdId, string passcode = "")
+        {
             var res = await RequestAsync(HttpMethod.Post, QuarkConstants.ApiBase + "/1/clouddrive/share/sharepage/token",
                 new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" } },
                 new { pwd_id = pwdId, passcode = passcode });
             Check(res, "获取分享凭证");
-            return AsString(Get(AsDict(Get(AsDict(res), "data")), "stoken")) ?? "";
+            var data = Get(AsDict(res), "data");
+            return new ShareTokenInfo
+            {
+                Stoken = AsString(Get(AsDict(data), "stoken")) ?? "",
+                Title = AsString(Get(AsDict(data), "title")) ?? "",
+            };
         }
 
         public async Task<List<QuarkFileEntry>> ShareDetailAsync(string pwdId, string stoken, string pdirFid)

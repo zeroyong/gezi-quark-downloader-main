@@ -383,6 +383,9 @@ namespace GeZi
         /// <summary>记录时刻（仅用于排查 / 将来做"保留最近 N 天"）。</summary>
         [DataMember(Order = 16)] public string Time { get; set; }
 
+        /// <summary>任务分组名（下载时所在目录名，2026-10-20 新增）。</summary>
+        [DataMember(Order = 17)] public string GroupName { get; set; }
+
         /// <summary>能不能"点一下就续传"——规则与 <see cref="PendingTask.CanResume"/> 一致。</summary>
         public bool CanResume
         {
@@ -414,6 +417,7 @@ namespace GeZi
                 Stoken = Stoken,
                 Passcode = Passcode,
                 RelDir = RelDir,
+                GroupName = GroupName,
             };
         }
     }
@@ -459,6 +463,12 @@ namespace GeZi
 
         /// <summary>写入模式是否为"边下边播"（独立分片+边合并）。</summary>
         [DataMember(Order = 14)] public bool StreamPlayMode { get; set; }
+
+        /// <summary>
+        /// 任务分组名（下载时所在目录名）；空 = 按 RelDir 推断。
+        /// 只影响任务页分组显示，不参与路径重建。
+        /// </summary>
+        [DataMember(Order = 15)] public string GroupName { get; set; }
 
         /// <summary>
         /// 是否具备"可自动重取链"的完整信息。

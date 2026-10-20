@@ -141,8 +141,21 @@ namespace GeZi.Core.Download
                         dl.LinkRefresher = job.LinkRefresher;
                         // 免转存任务：失败文案不能说"可续传"（stoken 过期就取不到新链）
                         dl.ResumeCannotRefresh = job.ResumeCannotRefresh;
+                        // 边下边播：把流视图与"优先分片"入口挂到 job 上，
+                        // 由 UI 的本地 HTTP 服务按播放器的 Range 请求调用。
+                        job.GetStreamMap = () => dl.CurrentStreamMap;
+                        job.BoostRange = dl.BoostRange;
                         var perFile = new JobProgressAdapter(job, progress);
-                        var res = await dl.DownloadAsync(job.Url, job.Dest, perFile, linked.Token, job.Pause).ConfigureAwait(false);
+                        DownloadResult res;
+                        try
+                        {
+                            res = await dl.DownloadAsync(job.Url, job.Dest, perFile, linked.Token, job.Pause).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            job.GetStreamMap = null;
+                            job.BoostRange = null;
+                        }
 
                         if (res.Ok)
                             Report(progress, job, JobState.Completed);

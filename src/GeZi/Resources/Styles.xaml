@@ -1727,6 +1727,10 @@
          ⚠️ 头部的标题内容由 GroupStyle 的 GroupItem 模板塞进 Expander.Header，
             这里只负责"箭头 + 头部内容 + 展开区"的排布。
          ============================================================ -->
+    <!-- 【2026-10-20 方案 B】分组头改成文件夹卡片的标题栏：
+         · 48px 高、浅一档底色，整块可点（收起 / 展开）
+         · 左侧文件夹图标块、名称、文件数胶囊，右侧折叠箭头
+         · 收起时把标题栏四角都收圆，避免方角溢出卡片圆角 -->
     <Style x:Key="TaskGroupExpander" TargetType="Expander">
         <Setter Property="IsExpanded" Value="True"/>
         <Setter Property="Focusable" Value="False"/>
@@ -1734,51 +1738,111 @@
             <Setter.Value>
                 <ControlTemplate TargetType="Expander">
                     <StackPanel>
-                        <ToggleButton x:Name="HdrToggle" Focusable="False"
-                                      HorizontalContentAlignment="Stretch"
-                                      IsChecked="{Binding IsExpanded,
-                                          RelativeSource={RelativeSource TemplatedParent},
-                                          Mode=TwoWay}">
-                            <ToggleButton.Template>
-                                <ControlTemplate TargetType="ToggleButton">
-                                    <Border x:Name="Bd" Background="Transparent">
+                        <Border x:Name="HdrBd" Background="{DynamicResource SurfaceAltBrush}"
+                                CornerRadius="11,11,0,0">
+                            <ToggleButton x:Name="HdrToggle" Focusable="False"
+                                          HorizontalContentAlignment="Stretch"
+                                          IsChecked="{Binding IsExpanded,
+                                              RelativeSource={RelativeSource TemplatedParent},
+                                              Mode=TwoWay}">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
                                         <ContentPresenter/>
-                                    </Border>
-                                    <ControlTemplate.Triggers>
-                                        <Trigger Property="IsMouseOver" Value="True">
-                                            <Setter TargetName="Bd" Property="Background"
-                                                    Value="{DynamicResource SurfaceAltBrush}"/>
-                                        </Trigger>
-                                    </ControlTemplate.Triggers>
-                                </ControlTemplate>
-                            </ToggleButton.Template>
-                            <Grid Height="36" Background="Transparent">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto"/>
-                                    <ColumnDefinition Width="*"/>
-                                </Grid.ColumnDefinitions>
-                                <Path x:Name="Chev" Grid.Column="0"
-                                      Data="{StaticResource IconChevronDown}"
-                                      Width="13" Height="13" Margin="4,0,8,0"
-                                      Stretch="Uniform" VerticalAlignment="Center"
-                                      Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="2"
-                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"
-                                      StrokeLineJoin="Round"
-                                      RenderTransformOrigin="0.5,0.5"/>
-                                <ContentPresenter Grid.Column="1" Content="{TemplateBinding Header}"
-                                                  VerticalAlignment="Center"/>
-                            </Grid>
-                        </ToggleButton>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                                <Grid Height="48" Background="Transparent">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <ContentPresenter Grid.Column="0" Content="{TemplateBinding Header}"
+                                                      VerticalAlignment="Center" Margin="12,0,8,0"/>
+                                    <Path x:Name="Chev" Grid.Column="1"
+                                          Data="{StaticResource IconChevronDown}"
+                                          Width="13" Height="13" Margin="0,0,12,0"
+                                          Stretch="Uniform" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="2"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                          StrokeLineJoin="Round"
+                                          RenderTransformOrigin="0.5,0.5"/>
+                                </Grid>
+                            </ToggleButton>
+                        </Border>
                         <ContentPresenter x:Name="Body"/>
                     </StackPanel>
                     <ControlTemplate.Triggers>
+                        <Trigger SourceName="HdrToggle" Property="IsMouseOver" Value="True">
+                            <Setter TargetName="HdrBd" Property="Background"
+                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                        </Trigger>
                         <Trigger Property="IsExpanded" Value="False">
                             <Setter TargetName="Body" Property="Visibility" Value="Collapsed"/>
+                            <Setter TargetName="HdrBd" Property="CornerRadius" Value="11"/>
                             <Setter TargetName="Chev" Property="RenderTransform">
                                 <Setter.Value>
                                     <RotateTransform Angle="-90"/>
                                 </Setter.Value>
                             </Setter>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 分组头左侧的文件夹图标块（28×28，主色浅底） -->
+    <Style x:Key="TaskGroupTile" TargetType="Border">
+        <Setter Property="Width" Value="28"/>
+        <Setter Property="Height" Value="28"/>
+        <Setter Property="CornerRadius" Value="8"/>
+        <Setter Property="Background" Value="{DynamicResource PrimaryLightBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource PrimarySoftBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
+    <!-- 分组头里的「N 个文件」胶囊 -->
+    <Style x:Key="TaskGroupCountPill" TargetType="Border">
+        <Setter Property="Height" Value="18"/>
+        <Setter Property="Padding" Value="8,0"/>
+        <Setter Property="Margin" Value="10,0,0,0"/>
+        <Setter Property="CornerRadius" Value="9"/>
+        <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushSoft}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
+    <!-- 【2026-10-20 方案 B】卡片里面的任务行：
+         不再自带卡片边框，靠顶部分隔线与悬停/选中底色区分；
+         选中时左侧 3px 主色条（与 B 原型一致）。 -->
+    <Style x:Key="TaskRowItem" TargetType="ListBoxItem">
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ListBoxItem">
+                    <Border x:Name="Bd" Background="Transparent"
+                            BorderBrush="{DynamicResource BorderBrushSoft}"
+                            BorderThickness="0,1,0,0" Padding="14,10,14,11">
+                        <Grid>
+                            <Border x:Name="SelBar" Width="3" Margin="-14,0,0,0"
+                                    HorizontalAlignment="Left"
+                                    Background="{DynamicResource PrimaryBrush}"
+                                    Visibility="Collapsed"/>
+                            <ContentPresenter/>
+                        </Grid>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource PrimaryLightBrush}"/>
+                            <Setter TargetName="SelBar" Property="Visibility" Value="Visible"/>
                         </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>
@@ -1803,6 +1867,84 @@
         <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
         <Setter Property="VerticalAlignment" Value="Center"/>
         <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+    </Style>
+
+    <!-- ============================================================
+         任务页「全部暂停 / 全部恢复」的分段胶囊（方案 B / 2026-10-20）
+         ============================================================
+         一个圆角外框里并排放两段，两个动作**同时可见**，各自带数量徽标；
+         没有可操作对象时那一半置灰（不是整颗消失），避免用户以为功能没了。
+         外框用 1px BorderSoft，内部按钮 hover 才浮出底色，与工具栏其它按钮同一套语言。
+         ============================================================ -->
+    <Style x:Key="PauseSegBorder" TargetType="Border">
+        <Setter Property="Height" Value="30"/>
+        <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushSoft}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="CornerRadius" Value="8"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
+    <Style x:Key="PauseSegButton" TargetType="Button">
+        <Setter Property="Height" Value="28"/>
+        <Setter Property="Padding" Value="11,0,10,0"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <!-- 点完会拿到键盘焦点，不清掉会留下虚线框 -->
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd" CornerRadius="6" Background="{TemplateBinding Background}"
+                            Padding="{TemplateBinding Padding}">
+                        <ContentPresenter VerticalAlignment="Center" HorizontalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource PrimaryLightBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Opacity" Value="0.32"/>
+                            <Setter Property="Cursor" Value="Arrow"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 分段里的数量徽标（"3" / "1"） -->
+    <Style x:Key="PauseSegCount" TargetType="Border">
+        <Setter Property="MinWidth" Value="18"/>
+        <Setter Property="Height" Value="16"/>
+        <Setter Property="CornerRadius" Value="8"/>
+        <Setter Property="Background" Value="{DynamicResource SurfaceSunkenBrush}"/>
+        <Setter Property="Padding" Value="4,0"/>
+        <Setter Property="Margin" Value="7,0,0,0"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
+    <Style x:Key="PauseSegCountText" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource MonoFontFamily}"/>
+        <Setter Property="FontSize" Value="10"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextTertiaryBrush}"/>
+        <Setter Property="TextAlignment" Value="Center"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
+    <!-- 分段中间那条竖分隔线 -->
+    <Style x:Key="PauseSegDivider" TargetType="Border">
+        <Setter Property="Width" Value="1"/>
+        <Setter Property="Background" Value="{DynamicResource BorderBrushSoft}"/>
+        <Setter Property="Margin" Value="0,4"/>
     </Style>
 
 </ResourceDictionary>
