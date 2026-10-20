@@ -5741,9 +5741,11 @@ namespace GeZi
             long curSize = 0;
             try { curSize = new System.IO.FileInfo(dest).Length; } catch { }
 
-            // ---- 非视频（zip / pdf / jpg / mp3 …）：直接交给系统默认程序 ----
-            // 【2026-10-20 用户要求】这类文件交给 VLC 毫无意义（只会弹"无法播放"），
-            // 所以不走进串流分支，也不做"0 字节"的视频提示，直接用 ShellLaunch 打开。
+            // ---- 非视频（zip / pdf / jpg / epub / mp3 …）：交给系统默认程序 ----
+            // 【2026-10-20 用户要求】这类文件交给 VLC 毫无意义（只会弹"无法播放"）。
+            // ⚠️ 必须用 OpenWithDefaultApp 而**不是** OpenFile —— 后者只要探测到 VLC
+            //    就会一律用 VLC 打开（那是为视频设计的），epub 会被错误地丢给 VLC
+            //    （用户实测反馈：「epub 点击打开还是用 VLC 打开，正常应该用 Readest」）。
             if (!isVideo)
             {
                 if (curSize <= 0)
@@ -5753,7 +5755,7 @@ namespace GeZi
                 }
                 try
                 {
-                    if (!ShellLaunch.OpenFile(dest))
+                    if (!ShellLaunch.OpenWithDefaultApp(dest))
                     {
                         Log("打开失败（文件当前 " + Util.FormatSize(curSize) + "），请手动到下载目录查看：" + dest);
                         AppDialog.Show(this,
@@ -5944,10 +5946,16 @@ namespace GeZi
                 Log("定位失败：找不到该文件或所在目录（" + dest + "）");
         }
 
-        /// <summary>按路径打开文件（供历史窗口复用「打开」逻辑）。</summary>
+        /// <summary>
+        /// 按路径打开文件（供历史窗口复用「打开」逻辑）。
+        /// 同样按格式分流：视频用播放器，其它用系统默认程序（见 OpenTaskFileCore 的说明）。
+        /// </summary>
         private void OpenTaskFileByPath(string path)
         {
-            if (!ShellLaunch.OpenFile(path))
+            bool ok = MediaProbe.IsVideo(path)
+                ? ShellLaunch.OpenFile(path)              // 视频：优先 VLC
+                : ShellLaunch.OpenWithDefaultApp(path);   // 其它：系统默认关联程序
+            if (!ok)
                 Log("打开失败，请手动到下载目录查看：" + path);
         }
 

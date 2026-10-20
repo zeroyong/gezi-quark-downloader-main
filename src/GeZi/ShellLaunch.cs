@@ -160,6 +160,52 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 用**系统默认关联程序**打开文件（不经过内置播放器探测）。
+        ///
+        /// <para>【2026-10-20 用户反馈】「epub 文件点打开还是用 VLC 打开，正常应该用 Readest」。
+        /// 根因：<see cref="OpenFile"/> 只要探测到 VLC 就**一律**用它打开 —— 那是为视频设计的，
+        /// 对 epub/pdf/zip 这类文件完全错误（VLC 只会弹「无法播放」）。
+        /// 所以非视频文件必须走这个入口，让 Windows 自己按文件关联选程序。</para>
+        ///
+        /// <para>实现用 <c>Process.Start(UseShellExecute=true)</c>：这是"交给外壳关联"
+        /// 的标准做法，能正确处理 epub→Readest、pdf→阅读器、zip→压缩软件 等关联。
+        /// 不走 <c>ShellExecuteW("openas")</c> —— 那个动词是"弹出打开方式对话框"，
+        /// 用户每次都要手动选一次，不是我们想要的。</para>
+        /// </summary>
+        public static bool OpenWithDefaultApp(string file)
+        {
+            if (string.IsNullOrWhiteSpace(file) || !File.Exists(file)) return false;
+            try { file = Path.GetFullPath(file); } catch { }
+
+            // ① 首选：UseShellExecute=true 交给外壳（正确处理文件关联 + 已运行实例复用）
+            try
+            {
+                var p = Process.Start(new ProcessStartInfo(file)
+                {
+                    UseShellExecute = true,
+                    Verb = "open",
+                });
+                if (p != null) { try { p.Dispose(); } catch { } }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Report("OpenWithDefaultApp 直接启动失败: " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            // ② 兜底：ShellExecuteW("open")（与 os.startfile 等价）
+            long code = Fire("open", file, null);
+            if (code > ShellExecuteErrorThreshold) return true;
+
+            // ③ 最后兜底：让用户自己选程序（比彻底失败强）
+            long code2 = Fire("openas", file, null);
+            if (code2 > ShellExecuteErrorThreshold) return true;
+
+            Report("OpenWithDefaultApp 失败 open=" + code + " openas=" + code2 + "  file=" + file);
+            return false;
+        }
+
+        /// <summary>
         /// 用指定播放器打开 URL（边下边播走本地 http://127.0.0.1 串流）。
         /// 与 OpenFile 共用同一套"单实例播放器参数"处理。
         /// </summary>
