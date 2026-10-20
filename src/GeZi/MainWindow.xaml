@@ -1248,18 +1248,59 @@
                                                         Margin="2,0,0,0" VerticalAlignment="Center"
                                                         ToolTip="在资源管理器中选中该文件。"/>
                                             </Grid>
+                                            <!-- 【连接车道】任务行第二排 = 车道格子 + 连接数 + 进度条 + 速度/已完成/百分比。
+                                                 车道用一排小格子显示「活跃连接 / 工作线程」的填充比例：
+                                                   格子几乎全亮 + 速度低  → 服务端限速（客户端无解）
+                                                   格子只亮一小截 + 速度低 → 客户端没把连接发满（可调高线程数） -->
                                             <Grid Grid.Row="1" Margin="16,8,0,0">
                                                 <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="*"/>
                                                     <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="Auto"/>
                                                 </Grid.ColumnDefinitions>
+                                                <!-- 20 格车道：固定宽度，按比例点亮 -->
+                                                <ItemsControl Grid.Column="0" ItemsSource="{Binding Lanes}"
+                                                              VerticalAlignment="Center"
+                                                              ToolTip="{Binding LaneText}">
+                                                    <ItemsControl.ItemsPanel>
+                                                        <ItemsPanelTemplate>
+                                                            <UniformGrid Rows="1"/>
+                                                        </ItemsPanelTemplate>
+                                                    </ItemsControl.ItemsPanel>
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <Border Width="3" Height="10" Margin="0,0,2,0"
+                                                                    CornerRadius="1.5">
+                                                                <Border.Style>
+                                                                    <Style TargetType="Border">
+                                                                        <Setter Property="Background"
+                                                                                Value="{DynamicResource BorderBrushSoft}"/>
+                                                                        <Style.Triggers>
+                                                                            <DataTrigger Binding="{Binding}" Value="True">
+                                                                                <Setter Property="Background"
+                                                                                        Value="{DynamicResource TextSecondaryBrush}"/>
+                                                                            </DataTrigger>
+                                                                        </Style.Triggers>
+                                                                    </Style>
+                                                                </Border.Style>
+                                                            </Border>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                                <!-- 连接数文字：如「12/32 连接」 -->
+                                                <TextBlock Grid.Column="1" Text="{Binding LaneText}"
+                                                           Margin="8,0,0,0" MinWidth="66"
+                                                           FontSize="11" VerticalAlignment="Center"
+                                                           Style="{StaticResource TertiaryText}"/>
                                                 <!-- 【2026-10-13】进度条按状态上色（与方案 A 一致）：
                                                      下载中 = 主色靛蓝；完成 = 绿；暂停 = 橙；失败 = 红；
                                                      已取消 = 中性灰。轨道统一改成凹槽色，避免整条都是蓝。 -->
-                                                <ProgressBar Value="{Binding Percent}"
-                                                             VerticalAlignment="Center">
+                                                <ProgressBar Grid.Column="2" Value="{Binding Percent}"
+                                                             VerticalAlignment="Center"
+                                                             Margin="4,0,0,0">
                                                     <ProgressBar.Style>
                                                         <Style TargetType="ProgressBar"
                                                                BasedOn="{StaticResource SlimProgressBar}">
@@ -1288,15 +1329,15 @@
                                                         </Style>
                                                     </ProgressBar.Style>
                                                 </ProgressBar>
-                                                <TextBlock Grid.Column="1" Text="{Binding SpeedText}"
+                                                <TextBlock Grid.Column="3" Text="{Binding SpeedText}"
                                                            Margin="12,0,0,0" FontWeight="SemiBold"
                                                            VerticalAlignment="Center" MinWidth="72"
                                                            Foreground="{DynamicResource PrimaryBrush}"
                                                            Style="{StaticResource NumericText}"/>
-                                                <TextBlock Grid.Column="2" Text="{Binding DoneText}"
+                                                <TextBlock Grid.Column="4" Text="{Binding DoneText}"
                                                            Margin="12,0,0,0" VerticalAlignment="Center"
                                                            Style="{StaticResource TertiaryText}"/>
-                                                <TextBlock Grid.Column="3" Text="{Binding PercentText}"
+                                                <TextBlock Grid.Column="5" Text="{Binding PercentText}"
                                                            Margin="12,0,0,0" VerticalAlignment="Center"
                                                            MinWidth="48" TextAlignment="Right"
                                                            Foreground="{DynamicResource TextSecondaryBrush}"
@@ -1373,13 +1414,27 @@
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="132"/>
                             </Grid.RowDefinitions>
-                            <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,6">
-                                <TextBlock Text="运行日志" Style="{StaticResource SectionLabel}"
-                                           Margin="0"/>
-                                <TextBlock Text="下载 / 解析 / 报错都会打在这里" Margin="8,0,0,0"
-                                           FontSize="11" VerticalAlignment="Center"
-                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
-                            </StackPanel>
+                            <Grid Grid.Row="0" Margin="0,0,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0" Orientation="Horizontal">
+                                    <TextBlock Text="运行日志" Style="{StaticResource SectionLabel}"
+                                               Margin="0"/>
+                                    <TextBlock Text="下载 / 解析 / 报错都会打在这里" Margin="8,0,0,0"
+                                               FontSize="11" VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                </StackPanel>
+                                <!-- 两级日志开关（2026-10-20）：默认只看日常信息，
+                                     点开才显示目录加载 / 连接分配 / 缓存命中等过程细节 -->
+                                <Button x:Name="LogDetailBtn" Grid.Column="1"
+                                        Content="详细"
+                                        Click="OnToggleLogVerbose"
+                                        Style="{StaticResource GhostButton}"
+                                        FontSize="11" Padding="8,3"
+                                        ToolTip="切换日志详细程度：默认只显示日常必要信息，&#10;点此显示全部过程细节（目录加载、连接分配等）"/>
+                            </Grid>
                             <TextBox x:Name="LogBox" Grid.Row="1" Style="{StaticResource LogTextBox}"/>
                         </Grid>
                     </Grid>
@@ -1606,67 +1661,60 @@
                                          格式细节压成卡片下面一行小字。 -->
                                     <Border Style="{StaticResource InfoBanner}" Margin="150,0,0,14">
                                         <StackPanel>
-                                            <Grid>
+                                            <!-- 【2026-10-20】落盘方式已唯一化为「独立分片 + 边合并」。
+                                                 原来的「共写同一文件」已物理移除：多 worker 各自 seek 写
+                                                 同一个目标文件是随机 I/O，机械盘上会把磁盘占用打满、
+                                                 下载速度也被拖住。独立分片全程顺序追加，机械盘/固态盘
+                                                 都友好，且天然支持边下边看。
+                                                 两个 RadioButton 仍保留（代码里有引用），但隐藏且只
+                                                 允许 SegmentedFiles 一种取值。 -->
+                                            <Grid Visibility="Collapsed">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="*"/>
                                                     <ColumnDefinition Width="*"/>
                                                 </Grid.ColumnDefinitions>
 
-                                                <!-- 左：推荐（整块可点，选中态 = 主色描边加粗） -->
                                                 <RadioButton x:Name="WriteModeSharedRadio"
                                                              GroupName="WriteMode"
                                                              Checked="OnSettingChanged"
+                                                             IsEnabled="False"
                                                              Style="{StaticResource WriteModeCard}"
-                                                             Margin="0,0,5,0">
-                                                    <StackPanel>
-                                                        <StackPanel Orientation="Horizontal">
-                                                            <TextBlock Text="共写同一文件" FontSize="12.5"
-                                                                       FontWeight="SemiBold"
-                                                                       Foreground="{DynamicResource TextPrimaryBrush}"/>
-                                                            <Border Margin="6,0,0,0" CornerRadius="4"
-                                                                    Padding="5,0,5,1"
-                                                                    VerticalAlignment="Center"
-                                                                    Background="{DynamicResource SuccessLightBrush}">
-                                                                <TextBlock Text="推荐" FontSize="10"
-                                                                           Foreground="{DynamicResource SuccessBrush}"/>
-                                                            </Border>
-                                                        </StackPanel>
-                                                        <TextBlock Text="边下边写同一个文件，不多占空间。"
-                                                                   Style="{StaticResource ProseText}"
-                                                                   FontSize="11.5" Margin="0,5,0,0"
-                                                                   TextWrapping="Wrap"/>
-                                                        <TextBlock Text="下载时无法进行边下边看。"
-                                                                   Style="{StaticResource TertiaryText}"
-                                                                   FontSize="11" Margin="0,3,0,0"
-                                                                   TextWrapping="Wrap"/>
-                                                    </StackPanel>
-                                                </RadioButton>
+                                                             Margin="0,0,5,0"/>
 
-                                                <!-- 右：可选 -->
                                                 <RadioButton x:Name="WriteModeSegmentedRadio"
                                                              Grid.Column="1" GroupName="WriteMode"
                                                              Checked="OnSettingChanged"
                                                              Style="{StaticResource WriteModeCard}"
-                                                             Margin="5,0,0,0">
-                                                    <StackPanel>
+                                                             Margin="5,0,0,0"/>
+                                            </Grid>
+
+                                            <Border CornerRadius="8" Padding="12,10"
+                                                    Background="{DynamicResource SurfaceSunkenBrush}"
+                                                    BorderBrush="{DynamicResource BorderBrushSoft}"
+                                                    BorderThickness="1">
+                                                <StackPanel>
+                                                    <StackPanel Orientation="Horizontal">
                                                         <TextBlock Text="独立分片 + 边合并" FontSize="12.5"
                                                                    FontWeight="SemiBold"
                                                                    Foreground="{DynamicResource TextPrimaryBrush}"/>
-                                                        <TextBlock Text="每片先下成小文件，再按顺序拼成完整文件。"
-                                                                   Style="{StaticResource ProseText}"
-                                                                   FontSize="11.5" Margin="0,5,0,0"
-                                                                   TextWrapping="Wrap"/>
-                                                        <TextBlock Text="临时多占一份空间，但能边下边看。"
-                                                                   Style="{StaticResource TertiaryText}"
-                                                                   FontSize="11" Margin="0,3,0,0"
-                                                                   TextWrapping="Wrap"/>
+                                                        <Border Margin="6,0,0,0" CornerRadius="4"
+                                                                Padding="5,0,5,1"
+                                                                VerticalAlignment="Center"
+                                                                Background="{DynamicResource SuccessLightBrush}">
+                                                            <TextBlock Text="推荐" FontSize="10"
+                                                                       Foreground="{DynamicResource SuccessBrush}"/>
+                                                        </Border>
                                                     </StackPanel>
-                                                </RadioButton>
-                                            </Grid>
-
-                                            <TextBlock Style="{StaticResource TertiaryText}" FontSize="11"
-                                                       Margin="1,8,0,0" TextWrapping="Wrap"
-                                                       Text="两种方式下载速度一样快。想下完再看的，选「共写同一文件」就够了；想边下边看，选「独立分片」。"/>
+                                                    <TextBlock Text="每片先下成小文件，再按顺序拼成完整文件 —— 全程顺序读写，机械硬盘也不卡。"
+                                                               Style="{StaticResource ProseText}"
+                                                               FontSize="11.5" Margin="0,5,0,0"
+                                                               TextWrapping="Wrap"/>
+                                                    <TextBlock Text="临时多占约一片空间，但可以边下边看。"
+                                                               Style="{StaticResource TertiaryText}"
+                                                               FontSize="11" Margin="0,3,0,0"
+                                                               TextWrapping="Wrap"/>
+                                                </StackPanel>
+                                            </Border>
                                         </StackPanel>
                                     </Border>
 
@@ -1675,12 +1723,16 @@
                                               Style="{StaticResource AppCheckBox}"
                                               Click="OnSettingChanged"/>
 
-                                    <!-- 跟随系统代理：默认关闭（直连），公司网络/只能经代理出口时才开 -->
+                                    <!-- 跟随系统代理：默认关闭（直连），公司网络/只能经代理出口时才开。
+                                         【2026-10-20】走独立处理器 OnSystemProxyChanged，**不**走 OnSettingChanged ——
+                                         后者会 RecreateScheduler() 重建下载调度器，把在途任务全打断。
+                                         代理开关只影响"此后新建的 HttpClientHandler"，不需要重建调度器。 -->
                                     <CheckBox x:Name="SystemProxyCheck"
                                               Content="跟随系统代理"
                                               Style="{StaticResource AppCheckBox}"
                                               Margin="0,8,0,0"
-                                              Click="OnSettingChanged"
+                                              Click="OnSystemProxyChanged"
+                                              AutomationProperties.Name="跟随系统代理"
                                               ToolTip="默认直连。只有公司网络或必须经代理上网时才需要开启；只影响此后新建的连接（重新登录 / 新建任务后生效）。"/>
                                 </StackPanel>
                             </Border>

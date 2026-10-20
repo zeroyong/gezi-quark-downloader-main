@@ -386,6 +386,12 @@ namespace GeZi
         /// <summary>任务分组名（下载时所在目录名，2026-10-20 新增）。</summary>
         [DataMember(Order = 17)] public string GroupName { get; set; }
 
+        /// <summary>进入分享时的起点目录 fid（stoken 过期后重新下钻用，2026-10-20 新增）。</summary>
+        [DataMember(Order = 18)] public string StartFid { get; set; }
+
+        /// <summary>文件相对分享根目录的路径（stoken 过期后重新下钻用，2026-10-20 新增）。</summary>
+        [DataMember(Order = 19)] public string ShareRelDir { get; set; }
+
         /// <summary>能不能"点一下就续传"——规则与 <see cref="PendingTask.CanResume"/> 一致。</summary>
         public bool CanResume
         {
@@ -418,6 +424,8 @@ namespace GeZi
                 Passcode = Passcode,
                 RelDir = RelDir,
                 GroupName = GroupName,
+                StartFid = StartFid,
+                ShareRelDir = ShareRelDir,
             };
         }
     }
@@ -469,6 +477,12 @@ namespace GeZi
         /// 只影响任务页分组显示，不参与路径重建。
         /// </summary>
         [DataMember(Order = 15)] public string GroupName { get; set; }
+
+        /// <summary>进入分享时的起点目录 fid（stoken 过期后重新下钻用，2026-10-20 新增）。</summary>
+        [DataMember(Order = 16)] public string StartFid { get; set; }
+
+        /// <summary>文件相对分享根目录的路径（stoken 过期后重新下钻用，2026-10-20 新增）。</summary>
+        [DataMember(Order = 17)] public string ShareRelDir { get; set; }
 
         /// <summary>
         /// 是否具备"可自动重取链"的完整信息。

@@ -189,28 +189,28 @@ namespace GeZi.Core.Api
         ///
         /// <para>【两条路径】</para>
         /// <list type="number">
-        /// <item><b>首选：Python 桥</b>。登录态只能由 <c>pan.quark.cn/account/info?st=</c> 下发，
+        /// <item><b>首选：OpenSSL 桥</b>。登录态只能由 <c>pan.quark.cn/account/info?st=</c> 下发，
         ///       而该域把 .NET 的 SChannel 全部 RST 掉（按 ClientHello 指纹过滤）。
-        ///       本机若存在"较新 OpenSSL"的 Python，就借它跑这一步 —— 这是唯一能真正拿到
-        ///       <c>__pus</c> 的正路。详见 <see cref="QuarkPythonBridge"/>。</item>
-        /// <item><b>回退：纯 .NET</b>。没有可用 Python 时，退到 uop 域尝试（只能拿到
+        ///       这里用 P/Invoke 直调固化的 OpenSSL 3.5.7 跑这一步 —— 这是唯一能真正拿到
+        ///       <c>__pus</c> 的正路。详见 <see cref="PanAccountBridge"/>。</item>
+        /// <item><b>回退：纯 .NET</b>。OpenSSL 通道不可用时，退到 uop 域尝试（只能拿到
         ///       <c>_UP_*</c> 系列，通常无法完成登录），并如实说明原因。</item>
         /// </list>
         /// </summary>
         public async Task<(bool ok, string cookie, string error)> ExchangeTicketAsync(string ticket)
         {
-            // ---- 路径 1：Python 桥（正路） ----
-            var viaPython = await ExchangeViaPythonAsync(ticket).ConfigureAwait(false);
-            if (viaPython.HasValue)
+            // ---- 路径 1：OpenSSL 桥（正路） ----
+            var viaBridge = await ExchangeViaBridgeAsync(ticket).ConfigureAwait(false);
+            if (viaBridge.HasValue)
             {
-                var r = viaPython.Value;
+                var r = viaBridge.Value;
                 if (r.Ok) return (true, r.Cookie, "");
                 // 桥可用但换失败 → 带上原因继续走回退，让错误信息更完整
-                _pythonFailure = r.Error + (string.IsNullOrEmpty(r.Detail) ? "" : "（" + r.Detail + "）");
+                _bridgeFailure = r.Error + (string.IsNullOrEmpty(r.Detail) ? "" : "（" + r.Detail + "）");
             }
             else
             {
-                _pythonFailure = "本机未找到可用的 Python（需要自带 OpenSSL 3.2+ 的解释器）";
+                _bridgeFailure = "OpenSSL 通道不可用（" + PanAccountBridge.Diagnostics + "）";
             }
 
             // ---- 路径 2：纯 .NET 回退 ----
@@ -333,25 +333,25 @@ namespace GeZi.Core.Api
             }
         }
 
-        // 上一次 Python 桥的失败原因（无 Python 时也会填）。用于拼装最终错误文案。
-        private string _pythonFailure;
+        // 上一次 OpenSSL 桥的失败原因（通道不可用时也会填）。用于拼装最终错误文案。
+        private string _bridgeFailure;
 
         /// <summary>调用 Python 桥换 Cookie。返回 null 表示"本机没有可用 Python，此路不通"。</summary>
-        private static Task<QuarkPythonBridge.ExchangeOutcome?> ExchangeViaPythonAsync(string ticket)
+        private static Task<PanAccountBridge.ExchangeOutcome?> ExchangeViaBridgeAsync(string ticket)
         {
-            // 探测 + 进程调用都是阻塞式的，放到线程池跑，避免卡住 UI。
-            return Task.Run<QuarkPythonBridge.ExchangeOutcome?>(() =>
+            // P/Invoke 直调 OpenSSL 是阻塞式的，放到线程池跑，避免卡住 UI。
+            return Task.Run<PanAccountBridge.ExchangeOutcome?>(() =>
             {
                 try
                 {
-                    return QuarkPythonBridge.Exchange(ticket);
+                    return PanAccountBridge.Exchange(ticket);
                 }
                 catch (Exception ex)
                 {
-                    return new QuarkPythonBridge.ExchangeOutcome
+                    return new PanAccountBridge.ExchangeOutcome
                     {
                         Ok = false,
-                        Error = "Python 桥调用异常: " + ex.Message,
+                        Error = "OpenSSL 桥调用异常: " + ex.Message,
                     };
                 }
             });
@@ -362,8 +362,8 @@ namespace GeZi.Core.Api
         {
             var sb = new System.Text.StringBuilder();
             sb.Append("扫码登录未能取回登录态");
-            if (!string.IsNullOrEmpty(_pythonFailure))
-                sb.Append("；Python 通道: ").Append(_pythonFailure);
+            if (!string.IsNullOrEmpty(_bridgeFailure))
+                sb.Append("；OpenSSL 通道: ").Append(_bridgeFailure);
             sb.Append("；.NET 通道: 未取回 ")
               .Append(QuarkConstants.LoginCookieKey).Append(netDetail);
             return sb.ToString();

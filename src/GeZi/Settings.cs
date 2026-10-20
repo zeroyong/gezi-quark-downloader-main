@@ -35,11 +35,17 @@ namespace GeZi
         public bool AutoClean { get; set; } = true;
 
         /// <summary>
-        /// 分片落盘方式。SharedFile = 直写同一文件（默认，峰值 1×）；
-        /// SegmentedFiles = 独立分片 + 边合并（可边下边播，峰值 1×+单片）。
-        /// 老配置文件里没有这个字段，反序列化后保持默认值 SharedFile，行为与旧版一致。
+        /// 分片落盘方式。**已唯一化为 SegmentedFiles（独立分片 + 边合并）**。
+        ///
+        /// <para>【2026-10-20】原来还有 SharedFile（多 worker 各自 seek 写同一目标文件）：
+        /// 那是随机 I/O，机械硬盘上磁头疯狂寻道 → 磁盘占用 100%、下载速度被拖住
+        /// （用户实测反馈「2.0 后版本都会导致磁盘占用 100%」）。
+        /// 而独立分片全程**顺序追加**，是唯一同时满足机械盘与固态盘的方案
+        /// （夸克 CDN 上限 ~16MB/s，远低于 HDD 顺序写 ~150MB/s）。
+        /// 因此共写模式已物理移除，此字段**仅为兼容老配置文件**而保留，
+        /// 读入后一律强制按 SegmentedFiles 执行（见 DownloadJob 构造处）。</para>
         /// </summary>
-        public GeZi.Core.Download.WriteMode WriteMode { get; set; } = GeZi.Core.Download.WriteMode.SharedFile;
+        public GeZi.Core.Download.WriteMode WriteMode { get; set; } = GeZi.Core.Download.WriteMode.SegmentedFiles;
 
         /// <summary>
         /// 分片/续传元数据的根目录。留空 = 与目标文件同级（`{目标}.qparts`），即原有行为。

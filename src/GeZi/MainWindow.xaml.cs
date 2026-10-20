@@ -135,6 +135,17 @@ namespace GeZi
         private string _pwdId;
         private string _stoken;
         private string _curFid = "0";
+
+        // ==================== stoken 过期自愈用的稳定快照（2026-10-20） ====================
+        // _curFid 会随用户导航变化（进子目录就变），不能当"分享进入点"用；
+        // 提取码框里的内容用户也可能改。所以要单独记一份"解析这个分享时的起点"，
+        // 供 TryReResolveShareTokenAsync 从正确位置逐级下钻。
+
+        /// <summary>解析分享时用的提取码（无码为空串）。重解析分享时需要。</summary>
+        private string _sharePasscode = "";
+
+        /// <summary>分享进入目录的 fid（"0" = 根）。重解析时的下钻起点。</summary>
+        private string _shareStartFid = "0";
         private AppSettings _settings;
         private DownloadScheduler _scheduler;
 
@@ -513,9 +524,31 @@ namespace GeZi
 
         // ---------------- 基础 ----------------
 
+        /// <summary>
+        /// 一条日志：文本 + 是否属于「详细」级（2026-10-20 新增两级日志）。
+        ///
+        /// <para>【为什么分两级】目录加载、连接分配、缓存命中等过程细节每秒钟几十行，
+        /// 全打出来会把真正有用的（开始/完成/报错）淹掉。默认只显示 <c>Detail=false</c> 的
+        /// 日常信息，用户点「详细」才把 <c>Detail=true</c> 的过程细节一并显示。</para>
+        /// </summary>
+        private sealed class LogLine
+        {
+            public string Text;
+            public bool Detail;
+        }
+
         /// <summary>待刷入 LogBox 的日志行（跨线程入队，UI 定时器出队）。</summary>
-        private readonly System.Collections.Concurrent.ConcurrentQueue<string> _logQueue =
-            new System.Collections.Concurrent.ConcurrentQueue<string>();
+        private readonly System.Collections.Concurrent.ConcurrentQueue<LogLine> _logQueue =
+            new System.Collections.Concurrent.ConcurrentQueue<LogLine>();
+
+        /// <summary>
+        /// 全量日志历史（含详细级）。切「详细」时要能把之前被过滤掉的行补显出来，
+        /// 所以不能只留 LogBox 里那份文本 —— 必须另存一份完整列表。
+        /// </summary>
+        private readonly List<LogLine> _logAll = new List<LogLine>();
+
+        /// <summary>是否显示详细日志（「详细」按钮切换）。默认关 = 只看日常信息。</summary>
+        private bool _logVerbose;
 
         /// <summary>日志攒批刷新器。见 <see cref="Log"/> 的注释。</summary>
         private System.Windows.Threading.DispatcherTimer _logFlushTimer;
@@ -556,9 +589,27 @@ namespace GeZi
         /// </summary>
         private void Log(string msg)
         {
+            EnqueueLog(msg, detail: false);
+        }
+
+        /// <summary>
+        /// 详细级日志：只在用户点开「详细」时显示（过程细节，如目录加载、连接分配、缓存命中）。
+        /// </summary>
+        private void LogDetail(string msg)
+        {
+            EnqueueLog(msg, detail: true);
+        }
+
+        /// <summary>把一条日志入队（线程安全，下载线程可直接调用）。</summary>
+        private void EnqueueLog(string msg, bool detail)
+        {
             try
             {
-                _logQueue.Enqueue(DateTime.Now.ToString("HH:mm:ss") + "  " + msg);
+                _logQueue.Enqueue(new LogLine
+                {
+                    Text = DateTime.Now.ToString("HH:mm:ss") + "  " + msg,
+                    Detail = detail,
+                });
             }
             catch { }
         }
@@ -566,7 +617,9 @@ namespace GeZi
         /// <summary>来自下载工作线程的日志。入队线程安全，无需再切 UI 线程。</summary>
         private void LogFromWorker(string msg)
         {
-            Log(msg);
+            // 下载内核的日志整体算「专业级」：分片规划、连接分配、直链刷新等
+            // 每秒可能几十行，默认藏起来，点「详细」才看。
+            EnqueueLog(msg, detail: true);
         }
 
         /// <summary>LogBox 保留的最大行数（超出后从头砍）。</summary>
@@ -649,51 +702,74 @@ namespace GeZi
             if (_logQueue.IsEmpty)
                 return;
             var sb = new StringBuilder();
-            string line;
+            LogLine item;
             int n = 0;
             // 单次上限 500 条：万一积压太多，也不让一次刷新占住 UI 太久
-            while (n < 500 && _logQueue.TryDequeue(out line))
+            while (n < 500 && _logQueue.TryDequeue(out item))
             {
-                sb.Append(line).Append(Environment.NewLine);
+                // 全量历史始终收着 —— 切到「详细」时才能把之前过滤掉的行补显出来
+                _logAll.Add(item);
+                // 详细级只在「详细」模式下进文本框
+                if (_logVerbose || !item.Detail)
+                    sb.Append(item.Text).Append(Environment.NewLine);
                 n++;
             }
             if (sb.Length > 0)
             {
                 LogBox.AppendText(sb.ToString());
-                TrimLogBox();
-                LogBox.ScrollToEnd();
             }
+            TrimLogLines();
+            LogBox.ScrollToEnd();
         }
 
-        /// <summary>日志超过 <see cref="LogMaxLines"/> 时，从头部砍掉多余的整行。</summary>
-        private void TrimLogBox()
+        /// <summary>
+        /// 日志超过 <see cref="LogMaxLines"/> 时，从头部砍掉多余的整行。
+        ///
+        /// <para>【为什么要按 <see cref="_logAll"/> 而不是 LogBox.Text 截】两级日志下，
+        /// LogBox 里只是"当前可见的子集"，按它算行数会算少；而且切「详细」需要从
+        /// 全量列表重建，如果只截了可见文本，被砍掉的详细行就永久丢了。</para>
+        /// </summary>
+        private void TrimLogLines()
         {
             try
             {
-                string text = LogBox.Text;
-                if (text.Length == 0) return;
-
-                // 先按行数粗判，避免每 200ms 都全量扫一遍字符串
-                int lines = 0;
-                for (int i = 0; i < text.Length; i++)
-                    if (text[i] == '\n') lines++;
-                if (lines <= LogMaxLines) return;
-
-                int cut = lines - LogMaxLines;
-                int idx = -1;
-                for (int k = 0; k < cut; k++)
-                {
-                    idx = text.IndexOf('\n', idx + 1);
-                    if (idx < 0) break;
-                }
-                if (idx >= 0 && idx + 1 < text.Length)
-                {
-                    // 只在开头提示一次，让用户知道上面被截了
-                    LogBox.Text = "…（更早的日志已省略，仅保留最近 " + LogMaxLines + " 行）"
-                                  + Environment.NewLine + text.Substring(idx + 1);
-                }
+                if (_logAll.Count <= LogMaxLines) return;
+                int cut = _logAll.Count - LogMaxLines;
+                _logAll.RemoveRange(0, cut);
+                RebuildLogBox();
             }
             catch { }
+        }
+
+        /// <summary>按当前 <see cref="_logVerbose"/> 从全量历史重建 LogBox 文本。</summary>
+        private void RebuildLogBox()
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.Append("…（更早的日志已省略，仅保留最近 ").Append(LogMaxLines).Append(" 行）")
+                  .Append(Environment.NewLine);
+                foreach (var item in _logAll)
+                {
+                    if (_logVerbose || !item.Detail)
+                        sb.Append(item.Text).Append(Environment.NewLine);
+                }
+                LogBox.Text = sb.ToString();
+                LogBox.ScrollToEnd();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 「详细」按钮：切换是否显示详细级日志（目录加载、连接分配、缓存命中等过程细节）。
+        /// 切换时从全量历史重建，所以打开后能立刻看到之前被过滤掉的行。
+        /// </summary>
+        private void OnToggleLogVerbose(object sender, RoutedEventArgs e)
+        {
+            _logVerbose = !_logVerbose;
+            if (LogDetailBtn != null)
+                LogDetailBtn.Content = _logVerbose ? "详细 · 开" : "详细";
+            RebuildLogBox();
         }
 
         /// <summary>
@@ -751,6 +827,18 @@ namespace GeZi
         /// </remarks>
         private bool BeginBusy(Button btn, string busyText)
         {
+            return BeginBusy(btn, busyText, cancelable: false);
+        }
+
+        /// <summary>
+        /// 把按钮切成「加载中」，可选**保持可点击**（用于「入队中（点此终止）」）。
+        ///
+        /// <para>【cancelable 的用途】入队要递归展开目录 + 逐个取直链，大目录可能要几十秒。
+        /// 用户反馈「点了下载后一直卡在『入队中』」，希望能中止。此时按钮保持可点，
+        /// 再点一次 = 触发取消（见 <see cref="RequestCancelEnqueue"/>）。</para>
+        /// </summary>
+        private bool BeginBusy(Button btn, string busyText, bool cancelable)
+        {
             if (btn == null) return true;                 // 没有按钮就只当普通执行
             if (_busyButtons.Contains(btn)) return false; // 已在加载 → 拒绝重入
 
@@ -760,7 +848,8 @@ namespace GeZi
             if (btn.ActualWidth > 0)
                 btn.MinWidth = Math.Max(btn.MinWidth, btn.ActualWidth);
             btn.Content = UiBusy.BuildContent(busyText, btn);
-            btn.IsHitTestVisible = false;
+            // 可终止的加载态：按钮仍可点击（点击 = 终止）；普通加载态则挡住重入。
+            btn.IsHitTestVisible = cancelable;
             return true;
         }
 
@@ -779,6 +868,69 @@ namespace GeZi
             _busySavedContent.Remove(btn);
             _busyButtons.Remove(btn);
             btn.IsHitTestVisible = true;
+        }
+
+        // ---------------- 终止入队（2026-10-20 移植） ----------------
+        //
+        // 【为什么需要】用户反馈「点击下载后一直卡在『入队中』」。
+        // 入队要递归展开目录（大目录几十页）+ 逐个取直链，中途还可能撞上限流。
+        // 原来这段时间按钮是死的，用户只能干等或强杀进程。
+        // 现在：入队期间把「下载」按钮就地变成**可点**的「入队中（点此终止）」，
+        // 再点一次即触发下面的取消源，立即停下（已加入的任务不受影响）。
+
+        /// <summary>入队按钮的忙时文案。</summary>
+        private const string EnqueueBusyText = "入队中";
+
+        /// <summary>非 null = 正在入队；取消它会立刻中止本次入队。</summary>
+        private CancellationTokenSource _enqueueCts;
+
+        /// <summary>正在入队的那个按钮（终止时要把它的文案改成「正在终止…」）。</summary>
+        private Button _enqueueBusyBtn;
+
+        /// <summary>
+        /// 开始一次入队。返回 false 表示"本次点击不该继续执行"。
+        /// 若已有入队在跑，本次点击视为**终止**，返回 false。
+        /// </summary>
+        private bool BeginEnqueue(Button btn)
+        {
+            if (_enqueueCts != null)
+            {
+                // 已在入队 → 再点一次 = 终止
+                RequestCancelEnqueue();
+                return false;
+            }
+            if (btn != null && _busyButtons.Contains(btn)) return false;   // 拒绝重入
+
+            _enqueueCts = new CancellationTokenSource();
+            _enqueueBusyBtn = btn;
+            if (btn != null) BeginBusy(btn, EnqueueBusyText, cancelable: true);
+            return true;
+        }
+
+        /// <summary>请求终止入队（不阻塞，供 UI 点击直接调用）。</summary>
+        private void RequestCancelEnqueue()
+        {
+            try
+            {
+                Log("正在终止入队…");
+                if (_enqueueCts != null) _enqueueCts.Cancel();
+                // 收回可点，防连点反复 Cancel；文案改成「正在终止…」
+                if (_enqueueBusyBtn != null && _busyButtons.Contains(_enqueueBusyBtn))
+                {
+                    _enqueueBusyBtn.Content = UiBusy.BuildContent("正在终止…", _enqueueBusyBtn);
+                    _enqueueBusyBtn.IsHitTestVisible = false;
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>结束入队：释放取消源并还原按钮。</summary>
+        private async Task EndEnqueueAsync(Button btn, long startedTicks)
+        {
+            try { if (_enqueueCts != null) _enqueueCts.Dispose(); } catch { }
+            _enqueueCts = null;
+            _enqueueBusyBtn = null;
+            await EndBusyAsync(btn, startedTicks);
         }
 
         /// <summary>造一个"小转圈"（缺口圆弧 + 无限旋转）。Stroke 由调用方设置。</summary>
@@ -1092,6 +1244,10 @@ namespace GeZi
                 }
                 ResetNav();
                 _curFid = info.StartFid;
+                // stoken 过期自愈用（2026-10-20）：记下"这次解析的起点"。
+                // _curFid 之后会随用户导航变化，不能当分享起点用。
+                _sharePasscode = passcode ?? "";
+                _shareStartFid = string.IsNullOrEmpty(info.StartFid) ? "0" : info.StartFid;
                 // 链接直接指向某个子目录（#/list/share/<fid>）时，列表里只有它的子项，
                 // 拿不到它自己的名字 —— 用分享标题兜底，作为任务分组的名字。
                 _shareRootName = info.StartFid != "0" ? (shareInfo.Title ?? "") : "";
@@ -2178,7 +2334,7 @@ namespace GeZi
                 if (_dirCache.TryGetValue(DirCacheKey(fid), out hit))
                 {
                     ApplyDirView(hit, restore: true);
-                    Log("目录来自缓存: 共 " + hit.Items.Count + " 项，已恢复 "
+                    LogDetail("目录来自缓存: 共 " + hit.Items.Count + " 项，已恢复 "
                         + hit.RevealCount + " 项（未重新请求）");
                     return;
                 }
@@ -2195,7 +2351,7 @@ namespace GeZi
                 };
                 _dirCache[DirCacheKey(fid)] = entry;
                 ApplyDirView(entry);
-                Log("目录加载完成: 本页 " + entry.Items.Count + " 项"
+                LogDetail("目录加载完成: 本页 " + entry.Items.Count + " 项"
                     + (entry.HasMore ? "，下面还有（往下滑继续加载）" : ""));
             }
             catch (Exception ex)
@@ -2433,15 +2589,20 @@ namespace GeZi
                 return;
             }
             long t0 = BusyClock();
-            if (!BeginBusy(DownloadSelBtn, "入队中")) return;
+            if (!BeginEnqueue(DownloadSelBtn)) return;
             try
             {
                 await StartDownloadAsync(
-                    FileList.SelectedItems.Cast<ShareFileItem>().ToList(), forceNoSave: true);
+                    FileList.SelectedItems.Cast<ShareFileItem>().ToList(), forceNoSave: true,
+                    ct: _enqueueCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Log("已终止入队（未加入任何下载任务）。");
             }
             finally
             {
-                await EndBusyAsync(DownloadSelBtn, t0);
+                await EndEnqueueAsync(DownloadSelBtn, t0);
             }
         }
 
@@ -2829,30 +2990,39 @@ namespace GeZi
 
         private async void OnDownloadSelected(object sender, RoutedEventArgs e)
         {
-            // 下载前要先递归展开目录 + 取直链（网络）→ 按钮就地变成"入队中…"
+            // 下载前要先递归展开目录 + 取直链（网络）→ 按钮就地变成"入队中（点此终止）"
             long t0 = BusyClock();
-            if (!BeginBusy(DownloadSelBtn, "入队中")) return;
+            if (!BeginEnqueue(DownloadSelBtn)) return;
             try
             {
-                await StartDownloadAsync(FileList.SelectedItems.Cast<ShareFileItem>().ToList());
+                await StartDownloadAsync(FileList.SelectedItems.Cast<ShareFileItem>().ToList(),
+                    ct: _enqueueCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Log("已终止入队（未加入任何下载任务）。");
             }
             finally
             {
-                await EndBusyAsync(DownloadSelBtn, t0);
+                await EndEnqueueAsync(DownloadSelBtn, t0);
             }
         }
 
         private async void OnDownloadAll(object sender, RoutedEventArgs e)
         {
             long t0 = BusyClock();
-            if (!BeginBusy(DownloadAllBtn, "入队中")) return;
+            if (!BeginEnqueue(DownloadAllBtn)) return;
             try
             {
-                await StartDownloadAsync(_files.ToList());
+                await StartDownloadAsync(_files.ToList(), ct: _enqueueCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Log("已终止入队（未加入任何下载任务）。");
             }
             finally
             {
-                await EndBusyAsync(DownloadAllBtn, t0);
+                await EndEnqueueAsync(DownloadAllBtn, t0);
             }
         }
 
@@ -3302,7 +3472,7 @@ namespace GeZi
                     Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
                     // 写入方式统一取设置页的全局值（原来靠下载区的「边下边播」勾选框，
                     // 与设置页重复且容易误导，已移除该勾选框）。
-                    WriteMode = _settings.WriteMode,
+                    WriteMode = WriteMode.SegmentedFiles,   // 落盘方式唯一化
                     PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
                     LinkRefresher = ct => RefreshLinkAsync(item, ct),
                     // 免转存（从分享直接取链）→ 续传取不到新链，失败文案别承诺"可续传"
@@ -3329,7 +3499,8 @@ namespace GeZi
             RunJobs(jobs);
         }
 
-        private async Task StartDownloadAsync(List<ShareFileItem> selected, bool forceNoSave = false)
+        private async Task StartDownloadAsync(List<ShareFileItem> selected, bool forceNoSave = false,
+            CancellationToken ct = default(CancellationToken))
         {
             if (_client == null)
             {
@@ -3346,7 +3517,8 @@ namespace GeZi
             try
             {
                 // 把选中的文件夹递归展开成文件列表（保留相对目录）
-                var files = await CollectFilesAsync(selected, "", 0);
+                var files = await CollectFilesAsync(selected, "", 0, ct);
+                ct.ThrowIfCancellationRequested();
                 if (files.Count == 0)
                 {
                     Log("没有要下载的文件");
@@ -3414,7 +3586,7 @@ namespace GeZi
                         Cookie = _client.CookieStr,
                         Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
                         // 写入方式统一取设置页的全局值（原下载区「边下边播」勾选框已移除）。
-                        WriteMode = _settings.WriteMode,
+                        WriteMode = WriteMode.SegmentedFiles,   // 落盘方式唯一化
                         // 分片根目录：留空 = 与目标同级（默认）。非空则分片集中存放，
                         // 下载目录不被 .qparts 污染，也支持分片跨盘（如放 SSD）。
                         PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
@@ -3456,11 +3628,13 @@ namespace GeZi
             }
         }
 
-        private async Task<List<ShareFileItem>> CollectFilesAsync(IEnumerable<ShareFileItem> items, string relPrefix, int depth)
+        private async Task<List<ShareFileItem>> CollectFilesAsync(IEnumerable<ShareFileItem> items, string relPrefix, int depth,
+            CancellationToken ct = default(CancellationToken))
         {
             var result = new List<ShareFileItem>();
             foreach (var it in items)
             {
+                ct.ThrowIfCancellationRequested();   // 「终止入队」能立刻停下（大目录展开时尤其重要）
                 if (it.IsDir)
                 {
                     if (depth >= 40)
@@ -3472,6 +3646,10 @@ namespace GeZi
                             ? await _client.ShareDetailAsync(_pwdId, _stoken, it.Fid)
                             : await _client.ListDirAsync(it.Fid);
                     }
+                    catch (OperationCanceledException)
+                    {
+                        throw;   // 取消要原样上抛，不能被下面的 catch 吞掉
+                    }
                     catch
                     {
                         continue;
@@ -3480,7 +3658,7 @@ namespace GeZi
                     {
                         Fid = c.Fid, Name = c.Name, Size = c.Size, IsDir = c.IsDir, Token = c.Token,
                     }).ToList();
-                    var sub = await CollectFilesAsync(kids, Path.Combine(relPrefix, PathUtil.SanitizeFileName(it.Name)), depth + 1);
+                    var sub = await CollectFilesAsync(kids, Path.Combine(relPrefix, PathUtil.SanitizeFileName(it.Name)), depth + 1, ct);
                     result.AddRange(sub);
                 }
                 else
@@ -3553,6 +3731,10 @@ namespace GeZi
                     {
                         Name = f.Name, Size = f.Size, Url = url, RelDir = f.RelDir,
                         Fid = f.Fid, Token = f.Token, FromShare = true,
+                        // stoken 过期自愈用（2026-10-20）：重解析时按这三个字段逐级找回文件
+                        Passcode = _sharePasscode,
+                        StartFid = _shareStartFid,
+                        ShareRelDir = f.RelDir,
                     });
                 else
                     Log("跳过（无直链）: " + f.Name);
@@ -3812,26 +3994,190 @@ namespace GeZi
             // 因此不用 _linkCache.Get，而是直接取新链后刷新缓存。
             _linkCache.Invalidate(item.Fid);
 
-            List<DownloadLink> links;
+            string url;
             if (item.FromShare)
             {
-                links = await _client.GetShareDownloadAsync(
-                    new List<string> { item.Fid },
-                    new List<string> { item.Token ?? "" },
-                    _pwdId, _stoken);
+                // 免转存：走"先试旧凭证 → 失败自动重解析分享"的自愈路径（2026-10-20）。
+                // stoken 一般几小时就过期，原来一过期任务就卡死，用户只能手动重新解析。
+                url = await GetShareLinkWithReResolveAsync(
+                    _client, item.Fid, item.Token, _pwdId, _stoken, item.Passcode,
+                    item.StartFid, item.ShareRelDir,
+                    (freshStoken, freshToken) =>
+                    {
+                        _stoken = freshStoken;      // 回填会话级
+                        item.Token = freshToken;    // 回填任务级
+                    }, ct).ConfigureAwait(false);
             }
             else
             {
-                links = await _client.GetDownloadAsync(new List<string> { item.Fid });
+                var links = await _client.GetDownloadAsync(new List<string> { item.Fid }).ConfigureAwait(false);
+                if (links == null) return null;
+                var hit = links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
+                url = hit == null ? null : hit.DownloadUrl;
             }
 
-            if (links == null)
-                return null;
-            var hit = links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
-            string url = hit == null ? null : hit.DownloadUrl;
             if (url != null)
                 _linkCache.Put(item.Fid, url);   // 新链写回缓存，供后续同类操作复用
             return url;
+        }
+
+        // ---------------- 免转存续传：stoken 过期自愈（2026-10-20 移植） ----------------
+
+        /// <summary>
+        /// 免转存取链：先用手头的（可能已过期的）stoken / share_fid_token 试一次；
+        /// 失败就**自动重解析分享** —— 重新申请 stoken、沿 ShareRelDir 逐级展开定位
+        /// 目标文件拿到新的 share_fid_token，再取一次链。
+        ///
+        /// <para>免转存续传原先只认"保存下来的旧 stoken"，它一般几小时~几天就过期，
+        /// 过期后 <see cref="QuarkClient.GetShareDownloadAsync"/> 一律失败：
+        /// 点续传 → 该任务被跳过；下载中换链 → 任务中止。用户只能手动重新解析分享。
+        /// 现在改成点一次续传/换链即自愈（分享被取消/改密码仍救不回，如实返回 null
+        /// 让上层按原逻辑提示）。</para>
+        /// </summary>
+        /// <param name="client">取链用的客户端（续传路径可能是局部 client，不能假设是 _client）。</param>
+        /// <param name="fid">分享内文件 fid（分享内稳定不变，重解析后仍用它定位）。</param>
+        /// <param name="token">share_fid_token。</param>
+        /// <param name="pwdId">分享 ID。</param>
+        /// <param name="stoken">分享凭证。</param>
+        /// <param name="passcode">提取码；无码分享为空串/null。</param>
+        /// <param name="startFid">分享进入目录 fid（普通分享为 "0"）。</param>
+        /// <param name="shareRelDir">文件在分享内的完整相对目录（相对 startFid；"" = 进入目录本身）。</param>
+        /// <param name="onReResolved">重解析成功时回调，把 (新 stoken, 新 token) 写回调用方记录。</param>
+        /// <returns>直链；彻底失败返回 null（调用方按原逻辑提示"需重新解析分享"）。</returns>
+        private async Task<string> GetShareLinkWithReResolveAsync(
+            QuarkClient client, string fid, string token, string pwdId, string stoken,
+            string passcode, string startFid, string shareRelDir,
+            Action<string, string> onReResolved, CancellationToken ct)
+        {
+            if (client == null || string.IsNullOrEmpty(fid) || string.IsNullOrEmpty(pwdId))
+                return null;
+
+            // ① 先用现有凭据试一次 —— 绝大多数情况这一步就成，不值得惊动重解析
+            string url = await TryShareDownloadAsync(client, fid, token, pwdId, stoken).ConfigureAwait(false);
+            if (url != null)
+                return url;
+
+            ct.ThrowIfCancellationRequested();
+
+            // ② 自动重解析：换新 stoken + 新 share_fid_token
+            //    （async 方法不能用 out 参数，用 Tuple 回传：Item1 = 新 stoken，Item2 = 新 token）
+            var fresh = await TryReResolveShareTokenAsync(
+                client, pwdId, passcode, startFid, shareRelDir, fid, ct).ConfigureAwait(false);
+            if (fresh == null)
+            {
+                Log("分享直链获取失败，自动重新解析分享也没有成功（分享可能已被取消、删除或改了提取码）。");
+                return null;
+            }
+
+            if (onReResolved != null)
+                onReResolved(fresh.Item1, fresh.Item2);
+
+            // ③ 用新凭据再取一次
+            url = await TryShareDownloadAsync(client, fid, fresh.Item2, pwdId, fresh.Item1).ConfigureAwait(false);
+            if (url != null)
+                Log("分享凭证已过期，已自动重新解析分享并拿到新直链。");
+            return url;
+        }
+
+        /// <summary>取分享直链；吞掉一切接口异常，失败只返回 null（由上层决定提示文案）。</summary>
+        private async Task<string> TryShareDownloadAsync(
+            QuarkClient client, string fid, string token, string pwdId, string stoken)
+        {
+            try
+            {
+                var links = await client.GetShareDownloadAsync(
+                    new List<string> { fid },
+                    new List<string> { token ?? "" },
+                    pwdId, stoken).ConfigureAwait(false);
+                if (links == null) return null;
+                var hit = links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
+                return hit == null ? null : hit.DownloadUrl;
+            }
+            catch (Exception ex)
+            {
+                Log("获取分享直链失败: " + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 重新解析分享：申请新 stoken → 从 startFid 起沿 shareRelDir 逐级进目录 →
+        /// 在最终目录里**按 fid** 找到目标文件的**新** share_fid_token。
+        /// 按 fid 匹配而不是按名字：fid 在分享内不变，比文件名可靠。
+        /// </summary>
+        /// <returns>null = 失败；否则 Item1 = 新 stoken，Item2 = 新 share_fid_token。
+        /// 用 Tuple 而不是 out 参数：async 方法不允许 ref/out。</returns>
+        private async Task<Tuple<string, string>> TryReResolveShareTokenAsync(
+            QuarkClient client, string pwdId, string passcode, string startFid,
+            string shareRelDir, string fid, CancellationToken ct)
+        {
+            try
+            {
+                // ① 重新申请分享凭证（分享取消/改密码都会在这一步失败）
+                string stoken = await client.GetStokenAsync(pwdId, passcode ?? "").ConfigureAwait(false);
+                if (string.IsNullOrEmpty(stoken))
+                    return null;
+
+                // ② 从进入目录开始，沿完整相对路径逐级下钻。
+                //    名字匹配做两手准备：目录列表里存的是目录原名，而 RelDir 系列
+                //    字段是 SanitizeFileName 规范化过的，原名带非法字符时两者不同。
+                string pdirFid = string.IsNullOrEmpty(startFid) ? "0" : startFid;
+                string rel = (shareRelDir ?? "").Replace('/', '\\').Trim('\\');
+                if (rel.Length > 0)
+                {
+                    foreach (string seg in rel.Split('\\'))
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        if (seg.Length == 0)
+                            continue;
+                        var dir = await FindShareEntryAsync(client, pwdId, stoken, pdirFid,
+                            e => e.IsDir
+                                 && (e.Name == seg || PathUtil.SanitizeFileName(e.Name) == seg),
+                            ct).ConfigureAwait(false);
+                        if (dir == null)
+                            return null;   // 目录被改名/移动/删除 → 按路径找不到了
+                        pdirFid = dir.Fid;
+                    }
+                }
+
+                // ③ 最终目录里按 fid 定位文件，拿它的新 share_fid_token
+                var file = await FindShareEntryAsync(client, pwdId, stoken, pdirFid,
+                    e => !e.IsDir && e.Fid == fid, ct).ConfigureAwait(false);
+                if (file == null || string.IsNullOrEmpty(file.Token))
+                    return null;
+
+                return Tuple.Create(stoken, file.Token);
+            }
+            catch (Exception ex)
+            {
+                Log("自动重新解析分享失败: " + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 在分享的一个目录里**逐页**找第一个满足条件的条目，找到即停。
+        /// 用一页一页的 <see cref="QuarkClient.ShareDetailPageAsync"/> 而不是整目录
+        /// 拉完的 <see cref="QuarkClient.ShareDetailAsync"/>：目标文件常在靠前的页，
+        /// 逐页找能少拉几十页（几千项的分享整目录拉完要十几秒）。
+        /// </summary>
+        private async Task<QuarkFileEntry> FindShareEntryAsync(
+            QuarkClient client, string pwdId, string stoken, string pdirFid,
+            Func<QuarkFileEntry, bool> pred, CancellationToken ct)
+        {
+            for (int page = 1; page <= 200; page++)   // 200 页兜底，与 ShareDetailAsync 一致
+            {
+                ct.ThrowIfCancellationRequested();
+                var dir = await client.ShareDetailPageAsync(pwdId, stoken, pdirFid, page).ConfigureAwait(false);
+                if (dir == null || dir.Items == null)
+                    return null;
+                foreach (var e in dir.Items)
+                    if (pred(e))
+                        return e;
+                if (!dir.HasMore)
+                    break;
+            }
+            return null;
         }
 
         /// <summary>转存后校验：等文件异步落盘，过滤不在目标目录里的 fid（对应原版 _resolve_saved_fids）。</summary>
@@ -4056,7 +4402,7 @@ namespace GeZi
                         Passcode = pi == null ? null : pi.Passcode,
                         RelDir = pi == null ? null : pi.RelDir,
                         GroupName = pi == null ? null : pi.GroupName,
-                        Segmented = job != null && job.WriteMode == WriteMode.SegmentedFiles,
+                        Segmented = true,   // 落盘方式唯一化：恒为独立分片
                         Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                     });
                 }
@@ -4091,7 +4437,7 @@ namespace GeZi
                         Url = s.Url,
                         Dest = s.Dest,
                         Threads = _settings.Threads,
-                        WriteMode = s.Segmented ? WriteMode.SegmentedFiles : WriteMode.SharedFile,
+                        WriteMode = WriteMode.SegmentedFiles,   // 落盘方式唯一化
                         PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
                         ResumeCannotRefresh = s.FromShare,
                         Pending = new PendingInfo
@@ -4179,8 +4525,8 @@ namespace GeZi
                             Token = pi?.Token,
                             FromShare = pi?.FromShare ?? false,
                             Size = t.Total,
-                            StreamPlay = t.Job.WriteMode == WriteMode.SegmentedFiles,
-                            StreamPlayMode = t.Job.WriteMode == WriteMode.SegmentedFiles,
+                            StreamPlay = true,   // 落盘方式唯一化：恒可边下边播
+                            StreamPlayMode = true,   // 落盘方式唯一化：恒可边下边播
                             Status = t.StatusText,
                             // ---- 续传所需（重启后重取链）----
                             PwdId = pi?.PwdId,
@@ -4988,8 +5334,8 @@ namespace GeZi
                 Token = p.Token,
                 FromShare = p.FromShare,
                 Size = t.Total,
-                StreamPlay = t.Job.WriteMode == WriteMode.SegmentedFiles,
-                StreamPlayMode = t.Job.WriteMode == WriteMode.SegmentedFiles,
+                StreamPlay = true,   // 落盘方式唯一化：恒可边下边播
+                StreamPlayMode = true,   // 落盘方式唯一化：恒可边下边播
                 Status = t.StatusText,
                 PwdId = p.PwdId,
                 Stoken = p.Stoken,
@@ -5415,12 +5761,8 @@ namespace GeZi
             if (item == null || item.Job == null) return false;
             if (!MediaProbe.IsVideo(dest)) return false;
 
-            if (item.Job.WriteMode != WriteMode.SegmentedFiles)
-            {
-                Log("该任务使用「共写同一文件」，目标文件不是连续前缀，无法边下边播；"
-                    + "请在设置里改成「独立分片 + 边合并」。");
-                return false;
-            }
+            // 【2026-10-20】落盘方式已唯一化为「独立分片 + 边合并」，
+            // 目标文件从 0 连续增长，恒可边下边播，不再需要判 WriteMode。
 
             // 上次运行留下的占位行没有活动下载器，流视图取不到 —— 先恢复，
             // 恢复后是新的一行，再点播放即可。
@@ -5552,7 +5894,15 @@ namespace GeZi
         private DiagnosticsSnapshot _diagLast;
         private Window _diagWindow;
 
-        /// <summary>下载器诊断回调（在下载线程上执行，只做存储）。</summary>
+        /// <summary>
+        /// 下载器诊断回调（在下载线程上执行）。
+        ///
+        /// <para>【2026-10-20 修】原来这里只写字典，**不碰 UI**；而"连接车道"必须把
+        /// 活跃连接数喂给对应的 <see cref="TaskItem"/>。但这里是**下载线程**，
+        /// 直接改 TaskItem 会抛跨线程异常 —— 而外层有 <c>catch {}</c> 兜底，
+        /// 异常会被**静默吞掉**，表现为"车道永远不亮"（原仓库踩过这个坑，注释有记录）。
+        /// 所以：先封送到 UI 线程再写属性。</para>
+        /// </summary>
         private void OnDiagnostics(DiagnosticsSnapshot snap)
         {
             if (snap == null) return;
@@ -5561,8 +5911,59 @@ namespace GeZi
                 _diagLast = snap;
                 string key = string.IsNullOrEmpty(snap.Name) ? "(未命名)" : snap.Name;
                 _diagLatest[key] = snap;
+
+                // 喂连接车道：必须回到 UI 线程（TaskItem 的属性变更通知绑定在界面上）
+                if (!Dispatcher.CheckAccess())
+                {
+                    Dispatcher.BeginInvoke(new Action<DiagnosticsSnapshot>(OnDiagnostics), snap);
+                    return;
+                }
+                ApplyDiagnosticsToTask(snap);
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 把一条诊断快照喂给对应的任务行（连接车道）。
+        ///
+        /// <para>匹配键必须用**目标文件完整路径** <c>Job.Dest</c>，不能用文件名 ——
+        /// SanitizeFileName / UniquePath 会改名，按名字匹配会串到别的任务上。
+        /// 找不到再退一步按名字兜底（仅当名字唯一时）。</para>
+        /// </summary>
+        private void ApplyDiagnosticsToTask(DiagnosticsSnapshot snap)
+        {
+            if (snap == null) return;
+
+            TaskItem hit = null;
+            if (!string.IsNullOrEmpty(snap.Dest))
+            {
+                foreach (var t in _tasks)
+                {
+                    if (t.Job != null && !string.IsNullOrEmpty(t.Job.Dest)
+                        && string.Equals(t.Job.Dest, snap.Dest, StringComparison.OrdinalIgnoreCase))
+                    {
+                        hit = t;
+                        break;
+                    }
+                }
+            }
+            if (hit == null && !string.IsNullOrEmpty(snap.Name))
+            {
+                foreach (var t in _tasks)
+                {
+                    if (t.Job != null && string.Equals(t.Job.Name, snap.Name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (hit != null) { hit = null; break; }   // 名字不唯一 → 放弃兜底
+                        hit = t;
+                    }
+                }
+            }
+
+            if (hit != null)
+            {
+                hit.ActiveConnections = snap.ActiveConnections;
+                hit.WorkerCount = snap.WorkerCount;
+            }
         }
 
         /// <summary>
@@ -5914,14 +6315,16 @@ namespace GeZi
 
                         if (p.FromShare)
                         {
-                            // 分享模式：直接用记录里的 pwd_id/stoken 重取（GetShareDownloadAsync
-                            // 的参数是显式传入的，不依赖客户端的"当前分享"状态）。
-                            string stoken = p.Stoken;
-                            var links = await client.GetShareDownloadAsync(
-                                new List<string> { p.Fid },
-                                new List<string> { p.Token ?? "" },
-                                p.PwdId, stoken);
-                            url = links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                            // 分享模式：走"先试旧凭证 → 失败自动重解析分享"的自愈路径（2026-10-20）。
+                            // stoken 一般几小时就过期，原来一过期续传就整批跳过，用户只能手动重解析。
+                            url = await GetShareLinkWithReResolveAsync(
+                                client, p.Fid, p.Token, p.PwdId, p.Stoken, p.Passcode,
+                                p.StartFid, p.ShareRelDir,
+                                (freshStoken, freshToken) =>
+                                {
+                                    p.Stoken = freshStoken;   // 回填到续传记录，后续 job.Pending 用的就是新值
+                                    p.Token = freshToken;
+                                }, CancellationToken.None);
                         }
                         else
                         {
@@ -5931,7 +6334,7 @@ namespace GeZi
 
                         if (string.IsNullOrEmpty(url))
                         {
-                            Log("[" + p.Name + "] 续传取链失败（可能分享已失效或需要重新解析）。");
+                            Log("[" + p.Name + "] 续传取链失败（分享可能已被取消、删除或改了提取码）。");
                             continue;
                         }
 
@@ -5945,7 +6348,7 @@ namespace GeZi
                             Dest = dest,
                             Cookie = client.CookieStr,
                             Threads = _settings.Threads,
-                            WriteMode = p.StreamPlayMode ? WriteMode.SegmentedFiles : WriteMode.SharedFile,
+                            WriteMode = WriteMode.SegmentedFiles,   // 落盘方式唯一化
                             PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
                             Pending = new PendingInfo
                             {
@@ -5953,6 +6356,7 @@ namespace GeZi
                                 Fid = p.Fid, Token = p.Token, FromShare = p.FromShare,
                                 RelDir = p.RelDir ?? "", Dest = dest, Size = p.Size,
                                 GroupName = p.GroupName ?? "",
+                                StartFid = p.StartFid, ShareRelDir = p.ShareRelDir,
                             },
                         };
                         var captured = job;
@@ -6218,8 +6622,8 @@ namespace GeZi
                 AutoCleanCheck.IsChecked = _settings.AutoClean;
                 SystemProxyCheck.IsChecked = _settings.UseSystemProxy;
                 // 写入方式改成两张可点击的卡片（下拉框已删）
-                WriteModeSegmentedRadio.IsChecked = _settings.WriteMode == WriteMode.SegmentedFiles;
-                WriteModeSharedRadio.IsChecked = _settings.WriteMode != WriteMode.SegmentedFiles;
+                WriteModeSegmentedRadio.IsChecked = true;   // 落盘方式唯一化
+                WriteModeSharedRadio.IsChecked = false;   // 落盘方式唯一化（共写模式已移除）
                 PartsRootBox.Text = _settings.PartsRoot ?? "";
                 HidePartsCheck.IsChecked = _settings.HideParts;
                 CloseActionBox.SelectedIndex = (int)_settings.OnCloseButton;
@@ -6364,6 +6768,33 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 「跟随系统代理」勾选变更（2026-10-20 新增独立处理器）。
+        ///
+        /// <para>【为什么不用 OnSettingChanged】那条路最后会 <c>RecreateScheduler()</c>
+        /// 重建下载调度器 —— 只为切换代理就把**在途任务全打断**，代价太大。
+        /// 而代理开关只影响"此后新建的 HttpClientHandler"（见 NetworkOptions.ApplyTo），
+        /// 根本不需要重建调度器。</para>
+        /// </summary>
+        private void OnSystemProxyChanged(object sender, RoutedEventArgs e)
+        {
+            if (_applyingSettings) return;
+            try
+            {
+                bool on = SystemProxyCheck.IsChecked == true;
+                _settings.UseSystemProxy = on;
+                NetworkOptions.UseSystemProxy = on;
+                SettingsStore.Save(_settings);
+                Log(on
+                    ? "已开启「跟随系统代理」：之后新建的连接会走 Windows 系统代理（重新开始下载 / 重新登录后生效）。"
+                    : "已关闭「跟随系统代理」：之后的连接一律直连。");
+            }
+            catch (Exception ex)
+            {
+                Log("代理设置保存失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// 从界面读取全部设置项 → 落盘 → 重建调度器。
         /// 由 OnSettingChanged / OnSettingKeyDown 调用；没有"保存"按钮了。
         /// </summary>
@@ -6388,8 +6819,7 @@ namespace GeZi
                 _settings.AutoClean = AutoCleanCheck.IsChecked == true;
                 _settings.UseSystemProxy = SystemProxyCheck.IsChecked == true;
                 NetworkOptions.UseSystemProxy = _settings.UseSystemProxy;
-                _settings.WriteMode = WriteModeSegmentedRadio.IsChecked == true
-                    ? WriteMode.SegmentedFiles : WriteMode.SharedFile;
+                _settings.WriteMode = WriteMode.SegmentedFiles;   // 落盘方式唯一化（共写模式已移除）
                 // 分片根目录变了 → 把**旧值**记入历史清单，否则旧目录里的残留分片
                 // 之后既扫不到、也没入口清理（用户只能自己去翻磁盘删）。
                 string newPartsRoot = (PartsRootBox.Text ?? "").Trim();
@@ -7341,12 +7771,12 @@ namespace GeZi
             var (valid, nick) = await client.ValidateAsync();
             if (!valid) return (false, null, null);
 
-            // 昵称是兜底值、或还没有头像 → 借 Python 桥补真实信息
+            // 昵称是兜底值、或还没有头像 → 借 OpenSSL 桥补真实信息
             if (nick == FallbackNick || string.IsNullOrEmpty(client.AvatarUrl))
             {
                 try
                 {
-                    var info = await Task.Run(() => QuarkPythonBridge.FetchAccountInfo(cookie));
+                    var info = await Task.Run(() => PanAccountBridge.FetchAccountInfo(cookie));
                     if (info.HasValue && info.Value.Ok)
                     {
                         if (!string.IsNullOrEmpty(info.Value.Nickname))

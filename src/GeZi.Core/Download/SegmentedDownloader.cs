@@ -151,6 +151,43 @@ namespace GeZi.Core.Download
         /// </summary>
         private const int MaxLinkRefreshes = 5;
 
+        /// <summary>动态刷新上限的**封顶值**（见 <see cref="ComputeMaxLinkRefreshes"/>）。</summary>
+        private const int MaxLinkRefreshesCap = 60;
+
+        /// <summary>直链的保守 TTL（秒）。夸克实测 5~10 分钟，按 5 分钟估最坏情况。</summary>
+        private const int LinkTtlSeconds = 300;
+
+        /// <summary>
+        /// 最近一次探测到的文件总大小（字节，0 = 还没探到）。
+        /// <para>用于按文件大小动态决定"允许刷新几次直链"：大文件要下很久，
+        /// 固定 5 次会在中途耗尽 → 卡在 99% 再也刷不到新链。</para>
+        /// </summary>
+        private long _lastProbedTotal;
+
+        /// <summary>
+        /// 按文件大小动态算出"最多允许刷新几次直链"。
+        ///
+        /// <para>【为什么需要】原来写死 <see cref="MaxLinkRefreshes"/> = 5。
+        /// 一个 30GB 文件按 2MB/s 要下 4 小时，而直链 TTL 只有 5~10 分钟 →
+        /// 需要刷新 24 次以上，5 次远远不够，表现就是"下到 99% 卡住不动"。</para>
+        ///
+        /// <para>【算法】用**悲观速度 2MB/s** 估算总耗时，除以 TTL 得到需要的次数，再 +1 兜底。
+        /// 夹到 [<see cref="MaxLinkRefreshes"/>, <see cref="MaxLinkRefreshesCap"/>] ——
+        /// 下限保证小文件行为不变，上限防止接口被刷爆。</para>
+        /// </summary>
+        private static int ComputeMaxLinkRefreshes(long totalBytes)
+        {
+            if (totalBytes <= 0) return MaxLinkRefreshes;
+
+            const double pessimisticBytesPerSec = 2.0 * 1024 * 1024;   // 2MB/s 悲观估计
+            double estSeconds = totalBytes / pessimisticBytesPerSec;
+            double need = Math.Ceiling(estSeconds / LinkTtlSeconds) + 1;
+
+            if (need < MaxLinkRefreshes) return MaxLinkRefreshes;
+            if (need > MaxLinkRefreshesCap) return MaxLinkRefreshesCap;
+            return (int)need;
+        }
+
         /// <summary>
         /// 合并线程收到收尾信号后，还要连续多少轮读不到新数据才真的退出。
         /// 每轮约 100ms，10 轮 ≈ 1 秒宽限 —— 用来覆盖"worker 最后一段还在它自己的
@@ -511,13 +548,17 @@ namespace GeZi.Core.Download
         }
 
         public SegmentedDownloader(int threads = 0, string ua = null, string referer = null, string cookie = "",
-            WriteMode writeMode = WriteMode.SharedFile, string partsRoot = null)
+            WriteMode writeMode = WriteMode.SegmentedFiles, string partsRoot = null)
         {
             _threads = Math.Max(1, threads > 0 ? threads : QuarkConstants.DownloadThreads);
             _ua = string.IsNullOrEmpty(ua) ? QuarkConstants.DlUa : ua;
             _referer = string.IsNullOrEmpty(referer) ? QuarkConstants.Referer : referer;
             _cookie = cookie ?? "";
-            _writeMode = writeMode;
+            // 【2026-10-20】落盘方式已唯一化：共写同一文件（SharedFile）物理移除。
+            // 多 worker 各自 seek 写同一文件 = 随机 I/O，机械盘上磁盘占用打满、下载被拖慢；
+            // 独立分片全程顺序追加，机械盘/固态盘都友好，且天然支持边下边播。
+            // 这里强制覆盖（而不是报错），保证老配置文件/老调用点仍能正常下载。
+            _writeMode = WriteMode.SegmentedFiles;
             _partsRoot = string.IsNullOrWhiteSpace(partsRoot) ? null : partsRoot.Trim();
             _jar = new CookieContainer { Capacity = 500, PerDomainCapacity = 200 };
             SeedCookies(_jar, _cookie);
@@ -578,14 +619,19 @@ namespace GeZi.Core.Download
                     return new DownloadResult { Ok = true };
                 msg = m;
 
-                if (LinkRefresher == null || refreshed >= MaxLinkRefreshes || !IsSignatureExpired(msg))
+                // 【2026-10-20】刷新上限按文件大小**动态**算，不再写死 5。
+                // 30GB 文件按 2MB/s 要 4 小时，而直链 TTL 只有 5~10 分钟 →
+                // 需要 24+ 次刷新，固定 5 次会在中途耗尽，表现就是"卡在 99%"。
+                int maxRefreshes = ComputeMaxLinkRefreshes(_lastProbedTotal);
+
+                if (LinkRefresher == null || refreshed >= maxRefreshes || !IsSignatureExpired(msg))
                     break;
 
                 refreshed++;
                 cancel.ThrowIfCancellationRequested();
                 Log?.Invoke(string.Format(
                     "直链已失效（{0}），正在重新获取第 {1}/{2} 次…已下载的部分会保留，换新链后自动续传。",
-                    Trim(msg, 60), refreshed, MaxLinkRefreshes));
+                    Trim(msg, 60), refreshed, maxRefreshes));
 
                 string fresh = null;
                 try
@@ -625,12 +671,14 @@ namespace GeZi.Core.Download
                 return new DownloadResult
                 {
                     Ok = false,
-                    // 【2026-10-06】免转存任务不能承诺"可续传" —— 它依赖分享 stoken，
-                    // 而续传不会重新换 stoken（详见 ResumeCannotRefresh 的注释）。
-                    // 说清楚"要重新解析分享"，比让用户反复点重试强。
+                    // 【2026-10-20】免转存任务现在**会自动重新解析分享**（stoken 过期自愈）：
+                    // 上层通过 LinkRefresher 回调 → MainWindow.GetShareLinkWithReResolveAsync
+                    // 重新申请 stoken、逐级下钻找回文件、拿新 share_fid_token，再续上。
+                    // 只有连"重新解析"都失败（分享被取消/删除/改密码）才需要用户手动处理。
                     Message = msg + (ResumeCannotRefresh
-                        ? "（已保留断点与已下载部分。注意：这是「免转存下载」，"
-                          + "分享凭证过期后无法续传 —— 需要重新解析分享后再下。）"
+                        ? "（已保留断点与已下载部分。这是「免转存下载」：若分享凭证已过期，"
+                          + "程序会尝试自动重新解析分享并续传；若分享已被取消、删除或改了提取码，"
+                          + "则需要重新解析分享后再下。）"
                         : "（已保留断点与已下载部分，重新获取直链后可续传）"),
                 };
             }
@@ -698,6 +746,9 @@ namespace GeZi.Core.Download
             CancellationToken cancel, PauseToken pause, DateTime taskStart)
         {
             var (total, supports) = await ProbeAsync(url, headers, cancel).ConfigureAwait(false);
+            // 记下探测到的总大小：主循环据此动态决定"允许刷新几次直链"
+            // （大文件要下几小时，直链 TTL 只有 5~10 分钟，固定 5 次会不够）。
+            if (total > 0) _lastProbedTotal = total;
             if (supports && total > 0)
             {
                 // 落盘方式（直写 / 独立分片+边合并）由 _writeMode 决定，
@@ -1114,6 +1165,55 @@ namespace GeZi.Core.Download
                 long e = Math.Min(s + finalSeg - 1, total - 1);
                 parts.Add((s, e));
             }
+
+            // ==================== 头部变长分片（2026-10-14） ====================
+            //
+            // 【为什么】大文件整片 16MB 时，"开始下载 → 能边看第一段"要等一整片下完。
+            // 头部切小片（1MB）可以让播放器**几秒内**就有连续前缀可读。
+            //
+            // 🚨 实测踩坑（用户 4.97GB 文件，并发 512 档）：
+            // 变长分支里 headParts(64) + nMid(4096) = 4160 > maxSegments(4096)
+            // → nMid 被夹成 4032 → 若按 4032 重算 midSeg 会更大、被夹回 finalSeg，
+            // 但 4032 × 1301609 + 67108864 = 5315594752 够不到 total，
+            // 而循环靠 `if (ms >= total) break` 提前退出 → **尾部 15.4MB 被静默丢掉**。
+            // ✅ 正解两条：
+            //   ① 中后部片大小**直接用 finalSeg**（它对整个 total 是精确的），不按被夹小的 nMid 重算；
+            //   ② 用 `while (s < total)` 而不是 `for (nMid)` —— 片数由覆盖关系自然决定。
+            const long HeadZoneMinTotal = 1L * 1024 * 1024 * 1024;  // 只在 ≥1GB 的文件启用
+            const long HeadZoneBytes = 64L * 1024 * 1024;           // 头部区域最大 64MB
+            const long HeadSegBytes = 1L * 1024 * 1024;             // 头部分片 1MB
+            const int HeadMaxParts = 64;                            // 头部最多 64 片
+
+            if (total >= HeadZoneMinTotal)
+            {
+                long headZone = Math.Min(HeadZoneBytes, total / 16);
+                long headParts = headZone / HeadSegBytes;
+                if (headParts > HeadMaxParts) headParts = HeadMaxParts;
+                long headEnd = headParts * HeadSegBytes - 1;
+                long remainTotal = total - (headEnd + 1);
+                if (headParts >= 2 && remainTotal >= MinSegBytes)
+                {
+                    long midSeg = finalSeg;   // ← 关键：不按 nMid 重算（见上面踩坑说明）
+
+                    var v = new List<(long Start, long End)>((int)(headParts + n));
+                    long s = 0;
+                    for (long i = 0; i < headParts; i++)
+                    {
+                        v.Add((s, s + HeadSegBytes - 1));
+                        s += HeadSegBytes;
+                    }
+                    // 中后部：从 headEnd+1 起按 midSeg 连续切，最后一片吃到 total-1。
+                    // 用 while 而不是 for(nMid) —— 片数由覆盖关系自然决定，绝不会丢尾部。
+                    while (s < total)
+                    {
+                        long e = Math.Min(s + midSeg - 1, total - 1);
+                        v.Add((s, e));
+                        s = e + 1;
+                    }
+                    return v;
+                }
+            }
+
             return parts;
         }
 
@@ -1314,8 +1414,48 @@ namespace GeZi.Core.Download
                 }
             }
 
+            // ==================== 分片规划覆盖性断言（2026-10-14） ====================
+            // 🚨 分片规划**必须完整覆盖 [0, total)**。
+            // 出过一次：变长分片的 nMid 被 maxSegments 夹小后按它重算片大小，
+            // 导致尾部 15.4MB 根本没被切出来 → 分片全部下完、meta 完整、目标文件却差一截，
+            // 而且 .qparts 已清空、无法续传，只能整文件重下（用户实测 4.97GB 文件踩中）。
+            // 这里在进入下载前就把"有没有缺口"暴露到日志，别再让用户自己发现文件短了。
+            if (parts.Count > 0)
+            {
+                long covered = 0;
+                bool contiguous = true;
+                long expect = 0;
+                foreach (var p in parts)
+                {
+                    if (p.Start != expect) { contiguous = false; break; }
+                    covered = p.End + 1;
+                    expect = p.End + 1;
+                }
+                if (!contiguous || covered != total)
+                {
+                    Log?.Invoke(string.Format(
+                        "⚠️ 分片规划异常：{0} 片、覆盖到 {1}，而文件应为 {2}（缺口 {3} 字节）。"
+                        + "这会导致目标文件缺失尾部数据且无法续传 —— 请把此行日志反馈给开发者。",
+                        parts.Count, covered, total, total - covered));
+                }
+            }
+
             var plan = LoadPlan(metaPath);
-            if (plan == null || plan.Total != total || plan.Parts.Count != parts.Count || !PartsEqual(plan.Parts, parts))
+
+            // ==================== 老任务进度保护（2026-10-14） ====================
+            // 有旧进度时**绝不重建 plan**：分片算法升级（如头部变长分片）后，
+            // 同一文件重算出来的 parts 与旧 .qmeta 必然不同。若不保护，
+            // 升级后所有未完成任务都会从 0 重新下载（用户看到"进度清零"）。
+            bool hasOldProgress = plan != null && plan.Total == total
+                                  && plan.Parts != null && plan.Parts.Count > 0
+                                  && System.Linq.Enumerable.Any(plan.Parts, p => p.W > 0);
+            if (hasOldProgress)
+            {
+                Log?.Invoke(string.Format(
+                    "续传: 沿用 .qmeta 中已有的分片规划（{0} 片），不因算法升级而重下。",
+                    plan.Parts.Count));
+            }
+            else if (plan == null || plan.Total != total || plan.Parts.Count != parts.Count || !PartsEqual(plan.Parts, parts))
             {
                 plan = new DownloadPlan { Total = total, Parts = new List<PartPlan>() };
                 foreach (var p in parts)
@@ -1958,6 +2098,7 @@ namespace GeZi.Core.Download
                                 Diagnostics?.Invoke(new DiagnosticsSnapshot
                                 {
                                     Name = Path.GetFileName(dest),
+                                    Dest = dest,
                                     Speed = speed,
                                     ActiveConnections = Volatile.Read(ref activeConns),
                                     WorkerCount = Volatile.Read(ref workerCountBox),
@@ -2068,8 +2209,38 @@ namespace GeZi.Core.Download
                         {
                             while (true)
                             {
-                                if (next >= plan.Parts.Count)
-                                    break;                        // 全部分片合并完毕
+                                // 🚨🚨 每轮按"目标文件当前长度落在哪个片区间里"**重新定位**下一片。
+                                // 动态窃取（见 SplitLongestPartIfNeeded）会往 plan.Parts **追加**新片 ——
+                                // 新片的 idx 排在最后，但它的区间落在被切那片的后半段。若仍按 idx 递增合并，
+                                // 就会把"后半段"拼到"前半段"之前，**目标文件直接损坏**（而且是静默损坏）。
+                                //
+                                // ⛔⛔ 这里原来写的是 `S == target`（严格等号），**那是错的**：
+                                // 边下边合时 target 经常落在某一片的**中间** ——
+                                // 第一片只落盘 80854 字节就被合并进来，target=80854，而没有任何一片的
+                                // S 等于 80854（S 只会是 0、15MB、30MB…）→ `pick < 0` → 合并线程
+                                // **静默退出**，之后走到收尾校验才报「合并后目标文件大小不符」。
+                                // 实录症状：进度 96~98% 但目标文件不足一片、errors.Count==0、无任何日志、
+                                // 两次失败实际值不同、重试无效（续传后 target 仍不匹配，立刻再 break）。
+                                //
+                                // ✅ 区间覆盖同时满足两头：容忍追加片 + 允许合并进度停在分片中间。
+                                long target = mfs.Length;
+                                int pick = -1;
+                                for (int i = 0; i < plan.Parts.Count; i++)
+                                {
+                                    if (plan.Parts[i].S <= target && target <= plan.Parts[i].E)
+                                    { pick = i; break; }
+                                }
+                                if (pick < 0)
+                                {
+                                    // target 落在所有片区之外。正常只有一种情况：已全部合并完（target == total）。
+                                    if (target != total)
+                                        Log?.Invoke(string.Format(
+                                            "合并提前退出：目标文件已有 {0} 字节，但没有任何分片覆盖该偏移（期望 {1}）。"
+                                            + "未合并的分片已保留，重试会自动续传。", target, total));
+                                    break;
+                                }
+                                next = pick;
+                                inPart = target - plan.Parts[next].S;   // ← 由覆盖片反推片内偏移
 
                                 long sz = plan.Parts[next].E - plan.Parts[next].S + 1;
                                 string pp = PartPath(partsDir, next);
@@ -2155,9 +2326,11 @@ namespace GeZi.Core.Download
                                     }
                                     stallRounds = 0;
                                     try { File.Delete(pp); } catch { }
-                                    next++;
-                                    inPart = 0;
-                                    continue;                     // 立刻看下一片，可能已经就绪
+                                    // 不再 `next++` / `inPart = 0` ——
+                                    // 循环头会按"区间覆盖目标文件当前长度"重新定位下一片。
+                                    // 这样即使动态窃取往 plan.Parts 末尾追加了新片（idx 顺序 ≠ 区间顺序），
+                                    // 也能正确按偏移继续拼接，不会把后半段拼到前半段之前。
+                                    continue;
                                 }
 
                                 if (mergeStop.IsCancellationRequested)
@@ -3103,6 +3276,17 @@ namespace GeZi.Core.Download
     {
         /// <summary>任务名（文件名）。</summary>
         public string Name { get; set; }
+        /// <summary>
+        /// 目标文件**完整路径**。
+        /// <para>为什么必须单独带一个：UI 侧要拿它把快照**精确**对到某个任务行上。
+        /// 用 <see cref="Name"/> 对是错的 —— 那个名字经过 <c>PathUtil.SanitizeFileName</c>
+        /// 与 <c>PathUtil.UniquePath</c> 加工，和网盘上的原始文件名（= <c>TaskItem.Name</c>）
+        /// 经常不相等：同名文件已存在时会加 <c> (1)</c> 后缀，含 <c>\ / : * ? " &lt; &gt; |</c>
+        /// 的会被替换成 <c>_</c>。对不上 ⇒ 连接车道永远不亮。</para>
+        /// <para>完整路径在"同时下载的任务"之间天然唯一（<c>DownloadScheduler</c> 的同路径互斥
+        /// 也是拿它当 key），所以做匹配键最合适。</para>
+        /// </summary>
+        public string Dest { get; set; }
         /// <summary>即时速度（字节/秒，EWMA 平滑值）。</summary>
         public double Speed { get; set; }
         /// <summary>当前活跃连接数。</summary>

@@ -1,8 +1,8 @@
 ﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
 // Copyright (C) 2026  Yi Yuan
-// This program is free software; you can redistribute it and/or modify
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
-// the Free Software Foundation; either version 3 of the License, or
+// the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -18,22 +18,25 @@ using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using GeZi.Core.Support;
 
 namespace GeZi.Core.Update
 {
     /// <summary>
-    /// 查 GitHub Releases 的「最新发布」。
+    /// 查 GitHub Releases 的「最新发布」（2026-10-18 新一代检查更新）。
+    /// 项目已开源（github.com/huaotem-bot/gezi-quark-downloader），
     /// Release 天然带 tag_name（版本号）、body（更新说明）、html_url（下载页），
-    /// 不依赖夸克登录态、不写用户网盘、无中转清理。
+    /// 不依赖夸克登录态、不写用户网盘、无中转清理 —— 旧那套网盘更新源整套退役。
     /// GitHub API 对没有 User-Agent 的请求直接 403。
-    /// 启动检查要快；国内访问 api.github.com 偶发不通，失败时由上层静默跳过。
+    /// 启动检查要快；国内访问 api.github.com 偶发不通，
+    /// 失败时启动检查静默跳过（手动检查才如实报错），10 秒足够区分"慢"和"不通"。
     /// </summary>
     public sealed class GitHubReleaseChecker
     {
-        // 发布仓库：本 fork 的 GitHub 地址。换仓库只改这两行（发布 tag 需为 vX.Y.Z）。
-        public const string RepoOwner = "zeroyong";
-        public const string RepoName = "gezi-quark-downloader-main";
+        /// <summary>仓库归属（与 README 的开源地址一致）。</summary>
+        public const string RepoOwner = "huaotem-bot";
+
+        /// <summary>仓库名（与 README 的开源地址一致）。</summary>
+        public const string RepoName = "gezi-quark-downloader";
 
         /// <summary>最新发布接口（GitHub 固定语义：永远指向 latest release）。</summary>
         public const string LatestApiUrl =
@@ -62,6 +65,10 @@ namespace GeZi.Core.Update
             return Parse(json);
         }
 
+        /// <summary>
+        /// GET 一个 URL 并返回响应体；HTTP 非 2xx / 超时 / 网络错误一律返回 null
+        /// （由上层决定"静默跳过"还是"如实报错"）。
+        /// </summary>
         private async Task<string> GetStringAsync(string url, CancellationToken ct)
         {
             var request = (HttpWebRequest)WebRequest.Create(url);
@@ -70,25 +77,8 @@ namespace GeZi.Core.Update
             request.Accept = "application/vnd.github+json";
             request.Timeout = (int)_timeout.TotalMilliseconds;
             request.ReadWriteTimeout = (int)_timeout.TotalMilliseconds;
-
-            // 与下载器一致：默认直连；只有用户显式开启「跟随系统代理」才读 WinINET
-            if (NetworkOptions.UseSystemProxy)
-            {
-                try
-                {
-                    var proxy = WebRequest.GetSystemWebProxy();
-                    if (proxy != null)
-                    {
-                        try { proxy.Credentials = CredentialCache.DefaultCredentials; } catch { }
-                        request.Proxy = proxy;
-                    }
-                }
-                catch { request.Proxy = null; }
-            }
-            else
-            {
-                request.Proxy = null;
-            }
+            // 与下载器同一套纪律：本机开着代理会拖慢/卡死直连
+            request.Proxy = null;
 
             try
             {
@@ -121,31 +111,32 @@ namespace GeZi.Core.Update
 
                     var rel = new GitHubRelease
                     {
-                        TagName = dto.TagName ?? "",
-                        Title = dto.Name ?? "",
-                        Body = dto.Body ?? "",
-                        HtmlUrl = dto.HtmlUrl ?? "",
+                        TagName = dto.tag_name ?? "",
+                        Title = dto.name ?? "",
+                        Body = dto.body ?? "",
+                        HtmlUrl = dto.html_url ?? "",
                     };
 
                     UpdateVersion v;
-                    if (!UpdateVersion.TryParse(dto.TagName, out v) || v == null)
+                    if (!UpdateVersion.TryParse(dto.tag_name, out v) || v == null)
                         return null;   // tag 不符合 v主.次.补 → 当作没有（不误报）
                     rel.Version = v;
 
                     DateTime pub;
-                    if (!string.IsNullOrEmpty(dto.PublishedAt)
-                        && DateTime.TryParse(dto.PublishedAt,
+                    if (!string.IsNullOrEmpty(dto.published_at)
+                        && DateTime.TryParse(dto.published_at,
                             System.Globalization.CultureInfo.InvariantCulture,
                             System.Globalization.DateTimeStyles.RoundtripKind, out pub))
                         rel.PublishedAt = pub;
 
-                    // assets 里挑 win64 安装包（发版附件名约定 GeZi-vX.Y.Z-win64.zip）
-                    foreach (var a in NonNull(dto.Assets))
+                    // assets 里挑 win64 安装包（发版附件名固定 GeZi-vX.Y.Z-win64.zip）
+                    foreach (var a in NonNull(dto.assets))
                     {
-                        if (a != null && !string.IsNullOrEmpty(a.Name)
-                            && a.Name.EndsWith("-win64.zip", StringComparison.OrdinalIgnoreCase))
+                        if (a != null && !string.IsNullOrEmpty(a.name)
+                            && a.name.StartsWith("GeZi-v", StringComparison.OrdinalIgnoreCase)
+                            && a.name.EndsWith("-win64.zip", StringComparison.OrdinalIgnoreCase))
                         {
-                            rel.AssetSize = a.Size;
+                            rel.AssetSize = a.size;
                             break;
                         }
                     }
@@ -167,19 +158,19 @@ namespace GeZi.Core.Update
         [DataContract]
         internal sealed class ReleaseDto
         {
-            [DataMember(Name = "tag_name")] public string TagName { get; set; }
-            [DataMember(Name = "name")] public string Name { get; set; }
-            [DataMember(Name = "body")] public string Body { get; set; }
-            [DataMember(Name = "html_url")] public string HtmlUrl { get; set; }
-            [DataMember(Name = "published_at")] public string PublishedAt { get; set; }
-            [DataMember(Name = "assets")] public List<AssetDto> Assets { get; set; }
+            [DataMember(Name = "tag_name")] public string tag_name;
+            [DataMember(Name = "name")] public string name;
+            [DataMember(Name = "body")] public string body;
+            [DataMember(Name = "html_url")] public string html_url;
+            [DataMember(Name = "published_at")] public string published_at;
+            [DataMember(Name = "assets")] public List<AssetDto> assets;
         }
 
         [DataContract]
         internal sealed class AssetDto
         {
-            [DataMember(Name = "name")] public string Name { get; set; }
-            [DataMember(Name = "size")] public long Size { get; set; }
+            [DataMember(Name = "name")] public string name;
+            [DataMember(Name = "size")] public long size;
         }
     }
 }

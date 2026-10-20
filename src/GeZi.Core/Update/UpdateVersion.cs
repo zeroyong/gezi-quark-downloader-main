@@ -1,8 +1,8 @@
 ﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
 // Copyright (C) 2026  Yi Yuan
-// This program is free software; you can redistribute it and/or modify
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
-// the Free Software Foundation; either version 3 of the License, or
+// the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -13,13 +13,15 @@
 
 using System;
 using System.Globalization;
+using System.Text.RegularExpressions;
 
 namespace GeZi.Core.Update
 {
     /// <summary>
     /// 三段式版本号（主.次.补），用于更新检查。
-    /// 程序集版本可能带第 4 段（2.7.0.0），需求只按三段比较；这里收窄成三段，
-    /// 语义明确、便于单测。
+    /// <see cref="Version"/> 会带第 4 段
+    /// （<c>2.2.0.0</c>），而需求只按三段比；而且它比较的是 Revision，容易和发布号混淆。
+    /// 这里收窄成三段，语义明确、也便于单测。
     /// </summary>
     public sealed class UpdateVersion : IComparable<UpdateVersion>, IEquatable<UpdateVersion>
     {
@@ -34,7 +36,15 @@ namespace GeZi.Core.Update
             Patch = patch;
         }
 
-        /// <summary>解析 2.2.0 / v2.2.0 / 2.2.0.0；1~4 段，只用前三段。</summary>
+        /// <summary>
+        /// 解析版本字符串，如 <c>2.2.0</c> / <c>v2.2.0</c> / <c>2.2.0.0</c>。
+        /// </summary>
+        /// <remarks>
+        /// · 允许可选的 <c>v</c>/<c>V</c> 前缀；
+        /// · 接受 1~4 段，<b>只用前三段</b>，第 4 段（AssemblyRevision）忽略 ——
+        ///   <see cref="Version.ToString()"/> 默认会输出 4 段，这里要能直接吃；
+        /// · 缺的段按 0 补（<c>"2"</c> → 2.0.0）。
+        /// </remarks>
         public static bool TryParse(string text, out UpdateVersion result)
         {
             result = null;
@@ -56,6 +66,7 @@ namespace GeZi.Core.Update
                     return false;
                 nums[i] = v;
             }
+            // 第 4 段若存在也要能解析（否则是格式错误，不是"忽略"）
             if (parts.Length == 4)
             {
                 int dummy;
@@ -67,7 +78,7 @@ namespace GeZi.Core.Update
             return true;
         }
 
-        /// <summary>把程序集版本（可能带第 4 段）转成三段式。</summary>
+        /// <summary>把 <see cref="Version"/>（程序集版本）转成三段式。</summary>
         public static UpdateVersion FromVersion(Version v)
         {
             if (v == null) return null;

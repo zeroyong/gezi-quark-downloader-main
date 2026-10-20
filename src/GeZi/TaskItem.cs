@@ -40,6 +40,75 @@ namespace GeZi
 
         private static long _nextSeq;
 
+        // ==================== 连接车道（Ketch 式） ====================
+        //
+        // 【为什么要有】任务行原本只有一根进度条：速度掉了只能看到"慢"，
+        // 看不出"是不是根本没把连接发满"。服务端限速 vs 客户端没发满连接，
+        // 两者的处置完全不同，必须能一眼区分。
+        // 这里用一排小格子显示"活跃连接 / 工作线程"的填充比例：
+        //   · 格子几乎全亮 + 速度低  → 服务端限速（客户端无解）
+        //   · 格子只亮一小截 + 速度低 → 客户端没把连接发出去（可调高线程数）
+
+        /// <summary>车道格子总数（固定，按比例填充，避免宽度随连接数跳动）。</summary>
+        public const int LaneSlots = 20;
+
+        private int _activeConns;
+        /// <summary>当前活跃连接数（由 MainWindow.OnDiagnostics 从内核快照喂入）。</summary>
+        public int ActiveConnections
+        {
+            get => _activeConns;
+            set
+            {
+                if (value == _activeConns) return;
+                _activeConns = value;
+                OnChanged(nameof(Lanes));
+                OnChanged(nameof(LaneText));
+            }
+        }
+
+        private int _workerCount;
+        /// <summary>本任务分配到的 worker 数（并发上限）。</summary>
+        public int WorkerCount
+        {
+            get => _workerCount;
+            set
+            {
+                if (value == _workerCount) return;
+                _workerCount = value;
+                OnChanged(nameof(Lanes));
+                OnChanged(nameof(LaneText));
+            }
+        }
+
+        /// <summary>
+        /// 车道格子的填充状态（true = 亮）。按 活跃/上限 的比例填充前 N 格。
+        /// </summary>
+        public System.Collections.Generic.IEnumerable<bool> Lanes
+        {
+            get
+            {
+                int wc = _workerCount;
+                int ac = _activeConns;
+                if (ac < 0) ac = 0;
+                if (wc > 0 && ac > wc) ac = wc;      // 活跃数偶尔会短暂超过上限（收尾竞态），夹一下
+
+                int filled = wc > 0 ? (int)System.Math.Round((double)ac / wc * LaneSlots) : 0;
+                var arr = new bool[LaneSlots];
+                for (int i = 0; i < filled && i < LaneSlots; i++) arr[i] = true;
+                return arr;
+            }
+        }
+
+        /// <summary>车道旁边的文字，如「12/32 连接」。没有数据时返回空串（不占位）。</summary>
+        public string LaneText
+        {
+            get
+            {
+                if (_workerCount > 0) return _activeConns + "/" + _workerCount + " 连接";
+                return _activeConns > 0 ? _activeConns + " 连接" : "";
+            }
+        }
+
         /// <summary>
         /// 构造次序（进程内自增，仅用于任务列表排序）。
         ///
@@ -102,24 +171,18 @@ namespace GeZi
         /// 这个任务现在能不能「播放」—— 决定任务行右边那个「播放」按钮显不显示。
         /// </summary>
         /// <remarks>
-        /// 【2026-10-03】用户要求：「我希望当我选择边下边播的模式的时候文件的右边才会有播放选项」。
-        ///
-        /// 为什么要有这个判断（两种写入方式看到的文件不一样）：
-        /// · **共写同一文件**：目标文件一开始就 `SetLength(total)` **预分配成完整大小**，
-        ///   未下完时中间是大片全 0 的空洞 → 播放器要么判损坏，要么一拖进度条就花屏。
-        /// · **独立分片+边合并**：不预分配，目标文件**从 0 连续增长** → 播放器看到的是
-        ///   "被截断但内容连续"的文件，这才是能正常边下边播的情况。
-        ///
-        /// ⚠️ 但**已完成的任务两种模式都能播**（文件是完整的），所以完成态一律显示 ——
-        /// 否则共写模式下下完的文件反而没有播放入口了，那是功能倒退。
+        /// 【2026-10-20】落盘方式已唯一化为「独立分片 + 边合并」：
+        /// 目标文件从偏移 0 起**连续增长**，未下完时也是"被截断但内容连续"的文件，
+        /// 播放器能正常读，所以**恒可边下边播**。
+        /// （原来的「共写同一文件」会预分配满尺寸空洞文件，中间大片全 0，
+        /// 播放器判损坏 —— 该模式已物理移除，这个判断也随之失去意义。）
         /// </remarks>
         public bool CanPlay
         {
             get
             {
                 if (Job == null) return false;
-                if (State == JobState.Completed) return true;
-                return Job.WriteMode == WriteMode.SegmentedFiles;
+                return true;
             }
         }
 

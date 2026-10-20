@@ -52,33 +52,34 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!--
-      换 Cookie 辅助脚本：以嵌入资源随程序集分发，运行时释放到 %TEMP% 再调用本机 Python。
-      之所以要走 Python，是因为夸克 pan.quark.cn 的 ALB 按 TLS ClientHello 指纹过滤，
-      .NET Framework 的 SChannel 必然被 RST，只有足够新的 OpenSSL 才放行。
-      嵌入资源不增加部署文件数量；脚本仅用标准库，体积可忽略。
-    -->
-    <EmbeddedResource Include="Api\quark_cookie_helper.py">
-      <LogicalName>GeZi.Core.Api.quark_cookie_helper.py</LogicalName>
-    </EmbeddedResource>
+    <!-- （2026-10-11）原「换 Cookie 辅助脚本 + 内置 CPython」已整体移除 ——
+         改用 P/Invoke 直调固化的 OpenSSL 3.5.7（见 lib/OpenSSL 与 Support/OpenSslTls.cs），
+         指纹与原来完全一致，但不再需要解释器/脚本/子进程。 -->
   </ItemGroup>
 
   <ItemGroup>
-    <!--
-      ★ 内置 Python 运行时（win-x64，约 20MB）
-      ==================================================================
-      为什么要内置：pan.quark.cn 的 ALB 按 TLS ClientHello 的 supported_groups
-      扩展大小过滤（阈值约 1600 字节）。.NET SChannel 只声明 X25519+P-256+P-384
-      （约 300 到 350B），必被 TCP RST；且 OpenSSL 3.0.x 也不行（约 1500B 仍被拒），
-      只有 OpenSSL 3.2+ 才放行。所以只能随身带一个足够新的 OpenSSL。
 
-      运行时来源：官方 CPython 3.13（OpenSSL 3.5.7），去掉 site-packages/test/
-      tkinter/ensurepip 等，标准库压成 python313.zip（2.4MB），核心约 20MB。
+    <!-- ============================================================
+         OpenSSL 3.5.7 —— 取代内置 CPython 的通道
+         ============================================================
+         用途：P/Invoke 发**唯一一个**必须过 pan.quark.cn 那道墙的请求
+              （扫码登录换登录态 + 取账号昵称/头像）。见 Support/OpenSslTls.cs
+              与 Api/PanAccountBridge.cs。
 
-      分发策略：随主程序复制到输出目录，用户机器上即使没有 Python 也能扫码登录。
+         ⚠️ 为什么必须是这一份、不能换：
+             pan.quark.cn 的 ALB 按 TLS ClientHello 的 **supported_groups 扩展大小**
+             过滤（阈值约 1600 字节）。实测（2026-10-11，均强制直连）：
+               SChannel（.NET / Windows curl）      ❌ RST
+               OpenSSL 3.0.18（系统 Python 3.14）    ❌ 连接被强制关闭（约 1500B）
+               BouncyCastle 2.7（纯托管 TLS）        ❌
+               OpenSSL 3.5.7（本目录这份）           ✅ HTTP 200
+             3.5.7 默认启用后量子混合密钥交换（X25519MLKEM768），扩展才够大。
+
+         ⚠️ 必须复制到**输出根目录**：DllImport("libssl-3-x64.dll") 只在 exe 同目录找。
+         ⚠️ 是 x64 DLL → 进程必须 64 位（AnyCPU 在 64 位系统上即为 x64）。
     -->
-    <None Include="Runtime\win-x64\**\*">
-      <Link>Runtime\win-x64\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    <None Include="lib\OpenSSL\*.dll">
+      <Link>%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

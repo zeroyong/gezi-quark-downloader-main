@@ -16,8 +16,13 @@
         UseLayoutRounding="True"
         SnapsToDevicePixels="True">
 
-    <!-- 更新详情窗：只展示版本对比 + GitHub Release 更新说明，
-         「前往下载」打开 Release 页交给浏览器（不自行下载/覆盖安装）。 -->
+    <!--
+        「更新详情」窗口（2026-10-18 新一代）：用户点「检查更新」发现新版本后弹出。
+        不再由程序下载/安装更新包（旧那套绑在夸克网盘转存上，已整套退役）——
+        本窗口负责展示版本对比 + GitHub Release 更新说明，「前往下载」直接打开
+        Release 页交给浏览器。
+        ⚠️ 跟关于/主窗一样走 WindowChrome（非分层窗口 → 文字清晰），圆角交给 DWM。
+    -->
     <shell:WindowChrome.WindowChrome>
         <shell:WindowChrome CaptionHeight="44" ResizeBorderThickness="0"
                             CornerRadius="0" GlassFrameThickness="0"
@@ -76,7 +81,8 @@
                              Foreground="{DynamicResource TextSecondaryBrush}"/>
                 </Border>
 
-                <!-- 底部按钮：左「忽略此版本」，右「暂不 / 前往下载」 -->
+                <!-- 底部按钮：左「忽略此版本」，右「暂不 / 前往下载」。
+                     要忽略必须明确点它（以前挂在别处，容易手滑永久屏蔽）。 -->
                 <Grid Margin="0,18,0,0">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto"/>

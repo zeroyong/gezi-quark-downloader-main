@@ -32,10 +32,14 @@ namespace GeZi.Core.Download
         public int Threads { get; set; } = 0;
 
         /// <summary>
-        /// 分片数据的落盘方式。默认直写同一文件（峰值 1×、速度与另一种相当）；
-        /// 需要"边下边播"时改为 SegmentedFiles。
+        /// 分片数据的落盘方式。**已唯一化为 SegmentedFiles**（独立分片 + 边合并）。
+        ///
+        /// <para>【2026-10-20】共写同一文件（SharedFile）已物理移除：多 worker 各自 seek 写
+        /// 同一个目标文件是随机 I/O，机械盘上会把磁盘占用打满、下载也被拖慢。
+        /// 独立分片全程顺序追加，机械盘与固态盘都友好，且天然支持边下边播。
+        /// 此字段仅为兼容旧调用点保留，构造函数会强制覆盖为 SegmentedFiles。</para>
         /// </summary>
-        public WriteMode WriteMode { get; set; } = WriteMode.SharedFile;
+        public WriteMode WriteMode { get; set; } = WriteMode.SegmentedFiles;
 
         /// <summary>
         /// 分片/续传元数据的根目录覆盖。null/空 = 与目标文件同级（默认）。
@@ -113,6 +117,21 @@ namespace GeZi.Core.Download
         public bool FromShare { get; set; }
         /// <summary>相对目录（含尾部分隔符时也算合法），用于重建目标路径。</summary>
         public string RelDir { get; set; }
+
+        // ==================== stoken 过期自愈用（2026-10-20） ====================
+        /// <summary>
+        /// 进入分享时的起点目录 fid（"0" 或空 = 根目录）。
+        /// <para>stoken 过期后要重新解析分享，必须知道"当初从哪个目录进来的"，
+        /// 才能从那里沿 <see cref="ShareRelDir"/> 逐级下钻找回文件。</para>
+        /// </summary>
+        public string StartFid { get; set; }
+
+        /// <summary>
+        /// 文件相对于分享根目录的相对路径（形如 "A\B"）。
+        /// <para>重新解析时用于逐级下钻；按 <see cref="Fid"/> 定位文件拿新 token
+        /// （fid 在同一分享内不变，名字可能被改）。</para>
+        /// </summary>
+        public string ShareRelDir { get; set; }
 
         /// <summary>
         /// 任务分组名（可选，2026-10-20 新增）：**下载时所在目录的名字**。
