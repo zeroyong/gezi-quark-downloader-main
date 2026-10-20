@@ -1124,12 +1124,15 @@
                                     </GroupStyle>
                                 </ListBox.GroupStyle>
                                 <ListBox.ContextMenu>
-                                    <ContextMenu>
+                                    <ContextMenu Opened="OnTaskMenuOpened">
                                         <MenuItem Header="暂停" Click="OnTaskPause"/>
                                         <MenuItem Header="恢复" Click="OnTaskResume"/>
                                         <MenuItem Header="取消" Click="OnTaskCancel"/>
                                         <Separator Style="{StaticResource MenuSeparator}"/>
-                                        <MenuItem Header="播放文件" Click="OnOpenTaskFile"/>
+                                        <!-- 文案随文件格式变化：「播放文件」（视频，用 VLC）/「打开文件」（其它，系统默认程序）。
+                                             由 Opened 事件在弹出前改写（见 OnTaskMenuOpened）。 -->
+                                        <MenuItem x:Name="TaskOpenMenuItem" Header="播放文件"
+                                                  Click="OnOpenTaskFile"/>
                                         <MenuItem Header="在资源管理器中定位" Click="OnLocateTaskFile"/>
                                         <Separator Style="{StaticResource MenuSeparator}"/>
                                         <MenuItem Header="删除本地文件…" Click="OnTaskDeleteLocal"/>
@@ -1221,22 +1224,26 @@
                                                         Tag="{Binding}" Style="{StaticResource TaskPauseButton}"
                                                         AutomationProperties.Name="暂停或继续"
                                                         Margin="6,0,0,0" VerticalAlignment="Center"/>
-                                                <!-- 「播放」= 交给系统默认程序打开（装了 VLC 就用 VLC）。
-                                                     【2026-10-03】按用户要求：只有**能播**的时候才显示这个按钮
-                                                     （见 TaskItem.CanPlay）——
-                                                       · 独立分片+边合并 → 目标文件从 0 连续增长，未下完也能边下边播 ✓
-                                                       · 共写同一文件 → 预分配的满尺寸空洞文件，播放器打不开 ✗
-                                                       · 已完成 → 文件完整，两种模式都能播 ✓
-                                                     不能播时整个按钮收起（Collapsed），不留一个点了没用的入口。 -->
-                                                <Button x:Name="PlayBtn" Grid.Column="3" Content="播放"
+                                                <!-- 【2026-10-20】按文件格式分流（用户要求）：
+                                                     · 视频（mkv/mp4/avi…）→ 显示「播放」，点击用 VLC 打开
+                                                       （未下完走本地串流边下边播，跳进度会优先下对应分片）
+                                                     · 其它格式（zip/pdf/jpg/mp3…）→ 显示「打开」，点击用系统默认程序打开
+                                                     文案与提示都由 CanPlay / CanOpen 驱动（见 TaskItem）。
+                                                     两者互斥且总有一个成立，所以按钮始终可见、不会留空入口。 -->
+                                                <Button x:Name="PlayBtn" Grid.Column="3"
                                                         Click="OnOpenTaskFile"
-                                                        Tag="{Binding}" Margin="4,0,0,0" VerticalAlignment="Center"
-                                                        ToolTip="未下完时通过本地串流边下边播（VLC）；跳转进度会优先下载对应分片。">
+                                                        Tag="{Binding}" Margin="4,0,0,0" VerticalAlignment="Center">
                                                     <Button.Style>
                                                         <Style TargetType="Button" BasedOn="{StaticResource GhostButton}">
+                                                            <Setter Property="Content" Value="打开"/>
+                                                            <Setter Property="ToolTip"
+                                                                    Value="用系统默认程序打开该文件。"/>
                                                             <Style.Triggers>
-                                                                <DataTrigger Binding="{Binding CanPlay}" Value="False">
-                                                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                                                <!-- 视频 → 「播放」（VLC） -->
+                                                                <DataTrigger Binding="{Binding CanPlay}" Value="True">
+                                                                    <Setter Property="Content" Value="播放"/>
+                                                                    <Setter Property="ToolTip"
+                                                                            Value="用 VLC 播放；未下完时会边下边播，跳转进度会优先下载对应分片。"/>
                                                                 </DataTrigger>
                                                             </Style.Triggers>
                                                         </Style>

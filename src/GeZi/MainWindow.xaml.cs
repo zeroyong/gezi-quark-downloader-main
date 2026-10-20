@@ -5241,6 +5241,30 @@ namespace GeZi
                    ?? ((sender as System.Windows.Controls.MenuItem)?.Tag as TaskItem);
         }
 
+        /// <summary>
+        /// 任务行右键菜单弹出前，按目标文件格式改写「播放文件 / 打开文件」文案。
+        ///
+        /// 【2026-10-20 用户要求】视频（mkv/mp4…）显示「播放文件」，用 VLC 打开；
+        /// 其它格式（zip/pdf/jpg…）显示「打开文件」，用系统默认程序打开。
+        /// 菜单项在 XAML 里只写一份，靠这里动态改 Header，避免维护两套菜单。
+        /// </summary>
+        private void OnTaskMenuOpened(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (TaskOpenMenuItem == null) return;
+
+                // 右键点在某一行上时，选中项已由 WPF 切换为该行；没有选中项就用首项兜底。
+                var item = TaskList.SelectedItem as TaskItem
+                           ?? TaskList.Items.Cast<TaskItem>().FirstOrDefault();
+                string dest = item?.Job?.Dest;
+
+                bool isVideo = MediaProbe.IsVideo(dest);
+                TaskOpenMenuItem.Header = isVideo ? "播放文件" : "打开文件";
+            }
+            catch { }
+        }
+
         private void OnTaskPause(object sender, RoutedEventArgs e)
         {
             foreach (var t in TasksFromMenu(sender)) PauseTask(t);
@@ -5712,6 +5736,39 @@ namespace GeZi
                 return;
             }
 
+            bool isVideo = MediaProbe.IsVideo(dest);
+
+            long curSize = 0;
+            try { curSize = new System.IO.FileInfo(dest).Length; } catch { }
+
+            // ---- 非视频（zip / pdf / jpg / mp3 …）：直接交给系统默认程序 ----
+            // 【2026-10-20 用户要求】这类文件交给 VLC 毫无意义（只会弹"无法播放"），
+            // 所以不走进串流分支，也不做"0 字节"的视频提示，直接用 ShellLaunch 打开。
+            if (!isVideo)
+            {
+                if (curSize <= 0)
+                {
+                    Log("文件还是 0 字节，暂时打不开：" + dest);
+                    return;
+                }
+                try
+                {
+                    if (!ShellLaunch.OpenFile(dest))
+                    {
+                        Log("打开失败（文件当前 " + Util.FormatSize(curSize) + "），请手动到下载目录查看：" + dest);
+                        AppDialog.Show(this,
+                            "无法打开文件，请手动到下载目录查看。\n\n" + dest,
+                            "需要手动打开",
+                            System.Windows.MessageBoxButton.OK,
+                            System.Windows.MessageBoxImage.Information);
+                    }
+                }
+                catch (Exception ex) { Log("打开失败: " + ex.Message); }
+                return;
+            }
+
+            // ---- 以下都是视频 ----
+
             // 【2026-10-04 用户反馈】「在软件内点播放无法播放这个文件，但从下载目录里
             //  右键用播放器打开又能看」。
             //  实测：文件本身是**完好的**（987.72MB 全盘扫描无空洞），VLC 也能正常打开。
@@ -5719,8 +5776,6 @@ namespace GeZi
             //  是从头**按序拼**出来的：前面的分片还没下到时，文件可能是 0 字节或只有一小段，
             //  播放器只会甩一句「无法播放此文件」，用户很容易误以为文件坏了、白删重下。
             //  → 先看一眼实际长度：还是空的就直接说清楚，别把播放器的报错丢给用户。
-            long curSize = 0;
-            try { curSize = new System.IO.FileInfo(dest).Length; } catch { }
             if (curSize <= 0)
             {
                 Log("这个文件目前是 0 字节，还没到能播放的程度：" + dest);

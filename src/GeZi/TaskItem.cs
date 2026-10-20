@@ -168,21 +168,34 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 这个任务现在能不能「播放」—— 决定任务行右边那个「播放」按钮显不显示。
+        /// 这个任务是**视频**、且可以「播放」—— 决定任务行显示「播放」按钮还是「打开」按钮。
         /// </summary>
         /// <remarks>
-        /// 【2026-10-20】落盘方式已唯一化为「独立分片 + 边合并」：
-        /// 目标文件从偏移 0 起**连续增长**，未下完时也是"被截断但内容连续"的文件，
-        /// 播放器能正常读，所以**恒可边下边播**。
-        /// （原来的「共写同一文件」会预分配满尺寸空洞文件，中间大片全 0，
-        /// 播放器判损坏 —— 该模式已物理移除，这个判断也随之失去意义。）
+        /// 【2026-10-20】按文件格式分流：
+        /// · mkv / mp4 / avi … → 显示「播放」，点击用 VLC 打开（未下完走本地串流边下边播）
+        /// · 其它（zip / pdf / jpg / mp3 …）→ 显示「打开」，点击用系统默认程序打开
+        ///
+        /// 为什么区分：非视频文件交给 VLC 毫无意义（VLC 只会弹"无法播放"），
+        /// 而视频文件用系统默认程序打开又可能关联到不支持的播放器。
         /// </remarks>
         public bool CanPlay
         {
             get
             {
                 if (Job == null) return false;
-                return true;
+                return MediaProbe.IsVideo(Job.Dest);
+            }
+        }
+
+        /// <summary>
+        /// 这个任务**不是视频**、可以「打开」（用系统默认应用）—— 与 <see cref="CanPlay"/> 互斥。
+        /// </summary>
+        public bool CanOpen
+        {
+            get
+            {
+                if (Job == null) return false;
+                return !MediaProbe.IsVideo(Job.Dest);
             }
         }
 
