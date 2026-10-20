@@ -4327,7 +4327,15 @@ namespace GeZi
             if (u.Progress != null)
             {
                 item.Percent = u.Progress.Percent;
-                item.Speed = u.Progress.Speed;
+                // 【2026-10-20 移植】暂停期间**冻结速度**，不接收核心上报的渐降值。
+                // 闸门式暂停的语义是"worker 跑完手上那一次读才阻塞"，所以在途请求
+                // 还会回来一点数据、核心层会继续上报 EWMA 渐降的速度。
+                // UI 若照单全收，用户看到的就是「按了暂停、速度从 20MB/s 慢慢滑到 0」
+                // （实测反馈：点了暂停 5 秒后日志还在打「总速度 81.45 KB/s」）→ 以为没生效。
+                // 暂停那一刻已把 Speed 置 0（见 OnPauseAll / OnPauseTask），这里再守住，
+                // 界面就**一按即**「已暂停 / 0 B/s」。
+                // 进度（Percent/Done）照常更新：那是真实已下载字节，且暂停后本来就不再增长。
+                if (!keepPaused) item.Speed = u.Progress.Speed;
                 item.Done = u.Progress.Done;
                 item.Total = u.Progress.Total;
                 // 阶段说明（如「正在合并分片」）。非下载态一律清空，
@@ -4574,6 +4582,12 @@ namespace GeZi
                     // 与单个暂停同理：先置标志再改状态，否则进度上报会把 Paused 覆盖掉
                     t.PauseRequested = true;
                     t.State = JobState.Paused;
+                    // 【2026-10-20 移植】立刻把速度归零。
+                    // 闸门式暂停的语义是"worker 跑完手上那一次读才阻塞"，在途请求还会
+                    // 回来一点数据、核心层会继续上报 EWMA 渐降的速度。UI 若照单全收，
+                    // 用户看到的就是「按了暂停、速度慢慢滑到 0」，以为没生效。
+                    // 置 0 后配合 OnJobUpdate 里的 keepPaused 冻结，界面**一按就**是 0 B/s。
+                    t.Speed = 0;
                     n++;
                 }
             }
@@ -5263,6 +5277,9 @@ namespace GeZi
                 //    没有这个标志的话下一帧就会把 Paused 覆盖掉（图标会来回跳）。
                 t.PauseRequested = true;
                 t.State = JobState.Paused;
+                // 【2026-10-20 移植】立刻把速度归零（配合 OnJobUpdate 的 keepPaused 冻结），
+                // 否则在途请求还会让核心上报渐降速度，界面看着像"慢慢停"。
+                t.Speed = 0;
                 Log("已暂停: " + t.Name);
             }
             else
