@@ -119,6 +119,21 @@ namespace GeZi
         public CloseAction OnCloseButton { get; set; } = CloseAction.Ask;
 
         /// <summary>
+        /// 全部任务下载完成后是否自动关机（2026-10-20 新增）。
+        ///
+        /// <para>【为什么需要】用户常把大文件挂着下一整夜，希望下完自动关机省电。
+        /// 原来只能自己盯进度、或者用第三方关机工具。</para>
+        ///
+        /// <para>⚠️ 默认 false：这是有副作用的破坏性动作，绝不能默认开启。
+        /// XmlSerializer 反序列化不执行字段初始化器，老配置里没这个节点时
+        /// 属性保持 default(bool) = false —— 正好符合预期。</para>
+        ///
+        /// <para>⚠️ 只在**本次运行**有效，不跨重启：重启后任务列表可能已变，
+        /// 贸然沿用上次的"关机"意图很危险（用户可能忘了）。</para>
+        /// </summary>
+        public bool ShutdownAfterAll { get; set; }
+
+        /// <summary>
         /// 是否跟随 Windows 系统代理（WinINET 设置，含 PAC）。
         /// 默认 false = 直连，与旧版本行为完全一致：本机代理软件常把夸克接口劫持到
         /// 127.0.0.1，且代理会改变 TLS 指纹，可能直接触发 WAF。

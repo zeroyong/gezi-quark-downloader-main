@@ -1,4 +1,4 @@
-﻿<!--
+<!--
     Icons.xaml —— 图标（Path Geometry）
     ============================================================
     规格要求：图标用 Path 的 Data 属性内嵌 Geometry，不引图标字体库
@@ -162,5 +162,8 @@
 
     <!-- 「平铺」视图图标（三条横线） -->
     <Geometry x:Key="IconList">M4,7 H20 M4,12 H20 M4,17 H20</Geometry>
+
+    <!-- 【2026-10-20】「完成后关机」图标：经典电源符号（竖线 + 缺口圆弧） -->
+    <Geometry x:Key="IconShutdown">M12,3 V12 M7.5,6.5 A7,7 0 1 0 16.5,6.5</Geometry>
 
 </ResourceDictionary>

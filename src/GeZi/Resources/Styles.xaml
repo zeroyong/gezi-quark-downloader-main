@@ -1,4 +1,4 @@
-﻿<!--
+<!--
     Styles.xaml —— 通用控件样式
     ============================================================
     规格要求：
@@ -335,6 +335,55 @@
         <Setter Property="Padding" Value="12,5"/>
         <Setter Property="FontSize" Value="12"/>
         <Setter Property="Margin" Value="0,0,8,0"/>
+    </Style>
+
+    <!-- ============================================================
+         「完成后关机」胶囊（2026-10-20 · 方案 A 行内内联）
+         ============================================================
+         工具栏里的一枚胶囊：左边图标 + 文字，右侧一个迷你开关。
+         关闭态 = 普通工具按钮的样子；开启态 = 警告色底 + 主色文字，
+         一眼能看出"关机已挂上"。
+         用 Border 包 Button 是为了让开关和文字整体有同一个圆角底，
+         且开启时整块变色（Button 自己的模板不好塞右侧开关）。
+         ============================================================ -->
+    <Style x:Key="ShutdownPillBorder" TargetType="Border">
+        <Setter Property="CornerRadius" Value="7"/>
+        <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Style.Triggers>
+            <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="on">
+                <Setter Property="Background" Value="{DynamicResource WarningLightBrush}"/>
+                <Setter Property="BorderBrush" Value="Transparent"/>
+            </DataTrigger>
+        </Style.Triggers>
+    </Style>
+
+    <Style x:Key="ShutdownPillButton" TargetType="Button">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Padding" Value="11,5"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border Background="{TemplateBinding Background}" CornerRadius="7"
+                            Padding="{TemplateBinding Padding}">
+                        <ContentPresenter VerticalAlignment="Center"
+                                          HorizontalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter Property="Foreground"
+                                    Value="{DynamicResource TextPrimaryBrush}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
     </Style>
 
     <!-- ============================================================

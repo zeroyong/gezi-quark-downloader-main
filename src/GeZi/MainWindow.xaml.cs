@@ -4252,14 +4252,15 @@ namespace GeZi
             Log("本批下载结束");
 
             // 整批结束时在日志里汇总一次（原托盘气泡通知已随"后台功能"一起移除）。
+            int ok = 0, fail = 0;
             try
             {
-                int ok = jobs.Count(j =>
+                ok = jobs.Count(j =>
                 {
                     var t = _tasks.FirstOrDefault(x => x.Job == j);
                     return t != null && t.State == JobState.Completed;
                 });
-                int fail = jobs.Count - ok;
+                fail = jobs.Count - ok;
                 if (ok > 0 && fail == 0)
                     Log(string.Format("全部完成：{0} 个文件已下载完成。", ok));
                 else if (ok > 0)
@@ -4269,7 +4270,137 @@ namespace GeZi
             }
             catch { }
 
+            // 【2026-10-20 新增】全部完成后关机（方案 A）。
+            // 必须放在"本批下载结束"之后、清理转存文件之前判断 ——
+            // 但真正的关机要**延后到清理完成**，否则可能把清理到一半的文件留在盘上。
+            bool shouldShutdown = false;
+            if (_settings != null && _settings.ShutdownAfterAll)
+            {
+                // 只有"全部成功"才关机：有失败时用户多半想留下来看错误，
+                // 直接关机会让人完全不知道发生了什么。
+                shouldShutdown = fail == 0 && ok > 0 && !_exiting;
+                if (!shouldShutdown && fail > 0)
+                {
+                    Log("有任务未完成，「完成后关机」已跳过（避免关机后看不到失败原因）。");
+                }
+            }
+
             await CleanupTransferredAsync();
+
+            if (shouldShutdown)
+            {
+                PerformShutdown();
+            }
+        }
+
+        // ---------------- 完成后关机（2026-10-20 新增 · 方案 A） ----------------
+
+        /// <summary>
+        /// 关机开关的状态镜像（真正的意图存在 <see cref="AppSettings.ShutdownAfterAll"/>）。
+        /// 单独留一个字段是为了让 UI 刷新不必反复读设置对象。
+        /// </summary>
+        private bool _shutdownAfterAll;
+
+        /// <summary>
+        /// 「完成后关机」开关：切换状态、落盘、刷新胶囊外观。
+        /// </summary>
+        private void OnToggleShutdownAfterAll(object sender, RoutedEventArgs e)
+        {
+            SetShutdownAfterAll(!_shutdownAfterAll, announce: true);
+        }
+
+        /// <summary>
+        /// 设置「完成后关机」状态（供开关与恢复设置时共用）。
+        /// </summary>
+        /// <param name="announce">是否在日志里说明（恢复设置时不需要）。</param>
+        private void SetShutdownAfterAll(bool on, bool announce)
+        {
+            _shutdownAfterAll = on;
+            if (_settings != null)
+            {
+                _settings.ShutdownAfterAll = on;
+                SettingsStore.Save(_settings);
+            }
+            RefreshShutdownPill();
+
+            if (announce)
+            {
+                Log(on
+                    ? "已开启「完成后关机」：全部任务下载完成后将自动关机。"
+                    : "已关闭「完成后关机」。");
+            }
+        }
+
+        /// <summary>按当前状态刷新关机胶囊的外观（底与边框、文字颜色）。</summary>
+        private void RefreshShutdownPill()
+        {
+            try
+            {
+                if (ShutdownPill == null) return;
+                // 用 Tag 驱动 Styles.xaml 里的 DataTrigger（"on" = 开启态）
+                ShutdownPill.Tag = _shutdownAfterAll ? "on" : null;
+                if (ShutdownLabel != null)
+                {
+                    ShutdownLabel.Text = _shutdownAfterAll ? "已开启关机" : "完成后关机";
+                    ShutdownLabel.Foreground = _shutdownAfterAll
+                        ? (System.Windows.Media.Brush)FindResource("WarningBrush")
+                        : (System.Windows.Media.Brush)FindResource("TextSecondaryBrush");
+                }
+                ShutdownPill.ToolTip = _shutdownAfterAll
+                    ? "已开启：全部任务下载完成后自动关机。再点一次取消。"
+                    : "全部任务下载完成后自动关机";
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 执行关机：先给用户一个可取消的确认，再调用系统 shutdown。
+        ///
+        /// <para>【为什么要确认】关机会打断用户正在做的其它事情，而且是不可逆的。
+        /// 即便他刚才主动开了开关，真到执行那一刻也应该有一次"临门一脚"的机会 ——
+        /// 何况他可能早就忘了自己开过。</para>
+        ///
+        /// <para>【为什么用 shutdown.exe 而不是 WMI】shutdown.exe /s /t 60 让系统自己
+        /// 提供倒计时与"取消"入口（shutdown /a），比程序自己 Sleep 60 秒更可靠
+        /// —— 程序可能在这 60 秒里被用户关掉。</para>
+        /// </summary>
+        private void PerformShutdown()
+        {
+            try
+            {
+                var ans = AppDialog.Show(this,
+                    "全部任务已下载完成。\n\n"
+                    + "你之前开启了「完成后关机」，现在要关机吗？\n"
+                    + "（点「否」则本次不关机，开关保持开启）",
+                    "完成后关机",
+                    System.Windows.MessageBoxButton.YesNo,
+                    System.Windows.MessageBoxImage.Question,
+                    System.Windows.MessageBoxResult.Yes);
+
+                if (ans != System.Windows.MessageBoxResult.Yes)
+                {
+                    Log("已跳过关机（任务已完成）。");
+                    return;
+                }
+
+                Log("正在关机：系统将在 60 秒后关闭。要取消请运行 shutdown /a 。");
+
+                // /s = 关机；/t 60 = 60 秒倒计时（给用户反悔的机会）；/c = 注释
+                var psi = new System.Diagnostics.ProcessStartInfo("shutdown.exe",
+                    "/s /t 60 /c \"鸽子下载：全部任务已完成，即将关机。\"")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                System.Diagnostics.Process.Start(psi);
+            }
+            catch (Exception ex)
+            {
+                Log("关机失败: " + ex.Message);
+                AppDialog.Show(this,
+                    "调用系统关机失败，请手动关机。\n\n" + ex.Message,
+                    "关机失败");
+            }
         }
 
         private async Task CleanupTransferredAsync()
@@ -6701,6 +6832,8 @@ namespace GeZi
                 OutDirBox.Text = _settings.OutDir;
                 AutoCleanCheck.IsChecked = _settings.AutoClean;
                 SystemProxyCheck.IsChecked = _settings.UseSystemProxy;
+                // 【2026-10-20】恢复「完成后关机」开关（不写日志，避免启动时刷屏）
+                SetShutdownAfterAll(_settings.ShutdownAfterAll, announce: false);
                 // 写入方式改成两张可点击的卡片（下拉框已删）
                 WriteModeSegmentedRadio.IsChecked = true;   // 落盘方式唯一化
                 WriteModeSharedRadio.IsChecked = false;   // 落盘方式唯一化（共写模式已移除）

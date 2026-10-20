@@ -237,8 +237,14 @@ namespace GeZi
         {
             get => _speed;
             // SpeedText 要看它决定显示速度还是留空；StatusText 也要看它决定
-            // 显示「暂停中…」还是「已暂停」（见下）。
-            set { _speed = value; OnChanged(nameof(SpeedText)); OnChanged(nameof(StatusText)); }
+            // 显示「暂停中…」还是「已暂停」（见下）。EtaText 也依赖它。
+            set
+            {
+                _speed = value;
+                OnChanged(nameof(SpeedText));
+                OnChanged(nameof(StatusText));
+                OnChanged(nameof(EtaText));
+            }
         }
 
         /// <summary>
@@ -380,6 +386,62 @@ namespace GeZi
         public string DoneText => _total > 0
             ? Util.FormatSize(_done) + " / " + Util.FormatSize(_total)
             : Util.FormatSize(_done);
+
+        /// <summary>
+        /// 预计剩余时间文本（2026-10-20 新增，方案 A 行内内联）。
+        ///
+        /// <para>【为什么需要】用户下载大文件时最想知道的是"还要多久"，而不是"下了多少"。
+        /// 百分比只说明进度，剩余时间才决定"要不要等"。</para>
+        ///
+        /// <para>【算法】剩余字节 ÷ 当前速度。速度来自核心层的 EWMA 平滑值，
+        /// 已经滤掉了瞬时抖动，所以算出来不会乱跳。速度 ≤ 0（刚启动 / 暂停）时返回空串，
+        /// 不显示"—"这种噪音。超过 24 小时显示「> 1 天」，避免出现"37 小时"这种怪数字。</para>
+        /// </summary>
+        public string EtaText
+        {
+            get
+            {
+                // 完成态由 XAML 的 DataTrigger 单独显示「已完成」，这里不再重复
+                if (State == JobState.Completed) return "";
+
+                // 只在"真正在下载"时估算：暂停/失败/取消时速度是 0 或无意义
+                if (State != JobState.Downloading) return "";
+
+                if (_total <= 0 || _done >= _total) return "";
+                if (_speed <= 1024) return "";      // 速度太低（<1KB/s）时估算没有意义
+
+                double remainBytes = _total - _done;
+                double seconds = remainBytes / _speed;
+                if (seconds < 0) return "";
+
+                return "剩 " + FormatEta(seconds);
+            }
+        }
+
+        /// <summary>把秒数格式化成人类可读的「15 分」/「1 小时 38 分」/「> 1 天」。</summary>
+        internal static string FormatEta(double seconds)
+        {
+            if (seconds < 60) return "不到 1 分";
+
+            double minutes = seconds / 60.0;
+            if (minutes < 60)
+                return (int)Math.Round(minutes) + " 分";
+
+            double hours = minutes / 60.0;
+            if (hours < 24)
+            {
+                int h = (int)hours;
+                int m = (int)Math.Round(minutes - h * 60);
+                // 四舍五入到 60 分时进位，避免出现「1 小时 60 分」
+                if (m >= 60) { h++; m = 0; }
+                return m == 0 ? h + " 小时" : h + " 小时 " + m + " 分";
+            }
+
+            double days = hours / 24.0;
+            if (days < 99)
+                return (int)Math.Round(days) + " 天";
+            return "> 99 天";
+        }
 
         public event PropertyChangedEventHandler PropertyChanged;
         private void OnChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));

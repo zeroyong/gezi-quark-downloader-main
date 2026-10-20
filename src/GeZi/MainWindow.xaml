@@ -957,27 +957,25 @@
                                 <!-- 【2026-10-13 移除】「下载历史」按钮已删：
                                      任务页现在会跨重启保留已完成的任务（见 RestoreTaskList），
                                      再看一个单独的"历史窗口"是重复入口。 -->
-                                <Button x:Name="DiagBtn" Click="OnOpenDiagnostics" Style="{StaticResource ToolButton}">
-                                    <StackPanel Orientation="Horizontal">
-                                        <Path Data="{StaticResource IconDiagnostics}" Stretch="Uniform" Width="12"
-                                              Height="12" VerticalAlignment="Center"
-                                              Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
-                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                                        <TextBlock Text="诊断面板" Margin="6,0,0,0" VerticalAlignment="Center"/>
-                                    </StackPanel>
-                                </Button>
-                                <!-- 【2026-10-03 新增】用户要求任务页也能直接打开下载目录（原来只有设置页有） -->
-                                <Button x:Name="OpenTaskDirBtn" Click="OnOpenOutDir" Style="{StaticResource ToolButton}"
-                                        Margin="0" ToolTip="在资源管理器中打开下载目录">
-                                    <StackPanel Orientation="Horizontal">
-                                        <Path Data="{StaticResource IconFolder}" Stretch="Uniform" Width="12"
-                                              Height="12" VerticalAlignment="Center"
-                                              Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
-                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
-                                              StrokeLineJoin="Round"/>
-                                        <TextBlock Text="打开下载目录" Margin="6,0,0,0" VerticalAlignment="Center"/>
-                                    </StackPanel>
-                                </Button>
+                                <!-- 【2026-10-20 替换】原「诊断面板」与「打开下载目录」两个按钮基本用不到，
+                                     按要求换成「完成后关机」开关（用户选择方案 A · 行内内联）。
+                                     诊断面板入口仍保留在设置页；下载目录入口仍在设置页与任务行右键菜单。 -->
+                                <Border x:Name="ShutdownPill" Style="{StaticResource ShutdownPillBorder}"
+                                        Margin="4,0,0,0" ToolTip="全部任务下载完成后自动关机">
+                                    <Button x:Name="ShutdownBtn" Click="OnToggleShutdownAfterAll"
+                                            Style="{StaticResource ShutdownPillButton}"
+                                            AutomationProperties.Name="完成后关机">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Path Data="{StaticResource IconShutdown}" Stretch="Uniform"
+                                                  Width="12" Height="12" VerticalAlignment="Center"
+                                                  Stroke="{DynamicResource TextSecondaryBrush}"
+                                                  StrokeThickness="1.9"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                            <TextBlock x:Name="ShutdownLabel" Text="完成后关机" Margin="6,0,0,0"
+                                                       VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
+                                </Border>
                             </StackPanel>
 
                             <StackPanel Grid.Column="1" Orientation="Horizontal">
@@ -1267,6 +1265,7 @@
                                                     <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="Auto"/>
                                                 </Grid.ColumnDefinitions>
                                                 <!-- 20 格车道：固定宽度，按比例点亮 -->
                                                 <ItemsControl Grid.Column="0" ItemsSource="{Binding Lanes}"
@@ -1349,6 +1348,29 @@
                                                            MinWidth="48" TextAlignment="Right"
                                                            Foreground="{DynamicResource TextSecondaryBrush}"
                                                            Style="{StaticResource NumericText}"/>
+                                                <!-- 【2026-10-20 新增】预计剩余时间（方案 A · 行内内联）。
+                                                     紧跟在百分比后面，等宽字体、低调色，不抢进度条的主视觉。
+                                                     完成态改显示「已完成」（绿色）；无速度时为空串，不占视觉噪音。 -->
+                                                <TextBlock x:Name="EtaLabel" Grid.Column="6"
+                                                           Margin="12,0,0,0" VerticalAlignment="Center"
+                                                           MinWidth="74" TextAlignment="Right"
+                                                           Text="{Binding EtaText}">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock"
+                                                               BasedOn="{StaticResource NumericText}">
+                                                            <Setter Property="Foreground"
+                                                                    Value="{DynamicResource TextTertiaryBrush}"/>
+                                                            <Setter Property="FontSize" Value="11"/>
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding State}" Value="Completed">
+                                                                    <Setter Property="Text" Value="已完成"/>
+                                                                    <Setter Property="Foreground"
+                                                                            Value="{DynamicResource SuccessBrush}"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
                                             </Grid>
                                         </Grid>
                                         <DataTemplate.Triggers>
