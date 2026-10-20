@@ -893,6 +893,10 @@
                              本项目其它按钮都是"图标在左"，这一颗在右，一眼就能认出是
                              「状态开关」而不是普通动作按钮。 -->
                         <Grid Grid.Row="1" Margin="0,0,0,12">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
                                 <ColumnDefinition Width="Auto"/>
@@ -907,15 +911,9 @@
                                         Style="{StaticResource ToolButton}"/>
                                 <Button x:Name="ClearDoneBtn" Content="清空已完成" Click="OnClearDone"
                                         Style="{StaticResource ToolButton}"/>
-                                <Button x:Name="HistoryBtn" Click="OnOpenHistory" Style="{StaticResource ToolButton}">
-                                    <StackPanel Orientation="Horizontal">
-                                        <Path Data="{StaticResource IconHistory}" Stretch="Uniform" Width="12"
-                                              Height="12" VerticalAlignment="Center"
-                                              Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.8"
-                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                                        <TextBlock Text="下载历史" Margin="6,0,0,0" VerticalAlignment="Center"/>
-                                    </StackPanel>
-                                </Button>
+                                <!-- 【2026-10-13 移除】「下载历史」按钮已删：
+                                     任务页现在会跨重启保留已完成的任务（见 RestoreTaskList），
+                                     再看一个单独的"历史窗口"是重复入口。 -->
                                 <Button x:Name="DiagBtn" Click="OnOpenDiagnostics" Style="{StaticResource ToolButton}">
                                     <StackPanel Orientation="Horizontal">
                                         <Path Data="{StaticResource IconDiagnostics}" Stretch="Uniform" Width="12"
@@ -939,20 +937,67 @@
                                 </Button>
                             </StackPanel>
 
-                            <Button x:Name="TaskSortBtn" Grid.Column="1" Click="OnToggleTaskSort"
-                                    Style="{StaticResource ToolButton}" Margin="0"
-                                    AutomationProperties.Name="任务排序">
+                            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                <!-- 展示方式：文件夹分组 / 平铺（用户要求「可选并记忆」）。
+                                     图标同样放文字右边，与旁边的排序按钮一致。 -->
+                                <Button x:Name="TaskViewBtn" Click="OnToggleTaskView"
+                                        Style="{StaticResource ToolButton}" Margin="0,0,8,0"
+                                        AutomationProperties.Name="任务视图">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock x:Name="TaskViewText" Text="文件夹分组"
+                                                   VerticalAlignment="Center"/>
+                                        <Path x:Name="TaskViewIcon" Data="{StaticResource IconFolder}"
+                                              Stretch="Uniform" Width="13" Height="13" Margin="6,0,0,0"
+                                              VerticalAlignment="Center"
+                                              Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.6"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                              StrokeLineJoin="Round"/>
+                                    </StackPanel>
+                                </Button>
+                                <Button x:Name="TaskSortBtn" Click="OnToggleTaskSort"
+                                        Style="{StaticResource ToolButton}" Margin="0"
+                                        AutomationProperties.Name="任务排序">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock x:Name="TaskSortText" Text="新任务在后"
+                                                   VerticalAlignment="Center"/>
+                                        <Path x:Name="TaskSortIcon" Data="{StaticResource IconSortAsc}"
+                                              Stretch="Uniform" Width="13" Height="13" Margin="6,0,0,0"
+                                              VerticalAlignment="Center"
+                                              Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.6"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                              StrokeLineJoin="Round"/>
+                                    </StackPanel>
+                                </Button>
+                            </StackPanel>
+
+                            <!-- 批量删除选择模式的提示条（按 z 进入，默认隐藏、不占位）。
+                                 用户要求「按 z 进入删除选择模式，选好后按 Enter 确认」。 -->
+                            <Border x:Name="TaskSelectBar" Grid.Row="1" Grid.ColumnSpan="2"
+                                    Visibility="Collapsed" Margin="0,8,0,0" Padding="10,7" CornerRadius="8"
+                                    Background="{DynamicResource PrimaryLightBrush}"
+                                    BorderBrush="{DynamicResource PrimarySoftBrush}" BorderThickness="1"
+                                    HorizontalAlignment="Left">
                                 <StackPanel Orientation="Horizontal">
-                                    <TextBlock x:Name="TaskSortText" Text="新任务在后"
-                                               VerticalAlignment="Center"/>
-                                    <Path x:Name="TaskSortIcon" Data="{StaticResource IconSortAsc}"
-                                          Stretch="Uniform" Width="13" Height="13" Margin="6,0,0,0"
-                                          VerticalAlignment="Center"
-                                          Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.6"
+                                    <Path Data="{StaticResource IconWarning}" Stretch="Uniform" Width="13"
+                                          Height="13" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource PrimaryBrush}" StrokeThickness="1.8"
                                           StrokeStartLineCap="Round" StrokeEndLineCap="Round"
                                           StrokeLineJoin="Round"/>
+                                    <TextBlock Text="删除选择模式" Margin="8,0,0,0" FontWeight="SemiBold"
+                                               Foreground="{DynamicResource PrimaryBrush}" VerticalAlignment="Center"/>
+                                    <TextBlock Text="空白处拖拽框选 · 点击行选择 · 点文件夹行选中整组"
+                                               Margin="10,0,0,0" FontSize="11.5"
+                                               Foreground="{DynamicResource TextSecondaryBrush}"
+                                               VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="TaskSelectCountText" Text="已选 0 项"
+                                               Margin="14,0,0,0" FontSize="11.5" FontWeight="SemiBold"
+                                               Foreground="{DynamicResource PrimaryBrush}"
+                                               VerticalAlignment="Center"/>
+                                    <TextBlock Text="Enter 确认 · Esc 退出" Margin="12,0,0,0" FontSize="11"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"
+                                               VerticalAlignment="Center"/>
                                 </StackPanel>
-                            </Button>
+                            </Border>
                         </Grid>
 
                         <Grid Grid.Row="2">
@@ -961,9 +1006,52 @@
                             <ListBox x:Name="TaskList" SelectionMode="Extended"
                                      Style="{StaticResource PlainListBox}"
                                      ItemContainerStyle="{StaticResource TaskListItem}"
+                                     VirtualizingPanel.IsVirtualizingWhenGrouping="True"
+                                     SelectionChanged="OnTaskSelectionChanged"
                                      PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
+                                     PreviewMouseMove="OnTaskListMouseMove"
+                                     PreviewMouseLeftButtonUp="OnTaskListMouseUp"
                                      MouseRightButtonUp="OnTaskListRightClick"
                                      MouseDoubleClick="OnTaskListDoubleClick">
+                                <!-- 文件夹分组（方案 A）：分组头细、靠发丝线分隔。
+                                     GroupDescriptions 由代码按设置里的展示方式增减
+                                     （见 ApplyTaskGrouping）。这里只描述分组头长什么样。 -->
+                                <ListBox.GroupStyle>
+                                    <GroupStyle>
+                                        <GroupStyle.ContainerStyle>
+                                            <Style TargetType="{x:Type GroupItem}">
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="{x:Type GroupItem}">
+                                                            <Expander Style="{StaticResource TaskGroupExpander}"
+                                                                      IsExpanded="True">
+                                                                <Expander.Header>
+                                                                    <StackPanel Orientation="Horizontal">
+                                                                        <Path Data="{StaticResource IconFolder}"
+                                                                              Stretch="Uniform" Width="13" Height="13"
+                                                                              VerticalAlignment="Center"
+                                                                              Stroke="{DynamicResource TextTertiaryBrush}"
+                                                                              StrokeThickness="1.7"
+                                                                              StrokeStartLineCap="Round"
+                                                                              StrokeEndLineCap="Round"
+                                                                              StrokeLineJoin="Round"/>
+                                                                        <TextBlock Text="{Binding Name}"
+                                                                                   Margin="8,0,0,0" MaxWidth="560"
+                                                                                   Style="{StaticResource TaskGroupNameText}"/>
+                                                                        <TextBlock Style="{StaticResource TaskGroupCountText}"
+                                                                                   Text="{Binding ItemCount,
+                                                                                       StringFormat={}{0} 个文件}"/>
+                                                                    </StackPanel>
+                                                                </Expander.Header>
+                                                                <ItemsPresenter/>
+                                                            </Expander>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Style>
+                                        </GroupStyle.ContainerStyle>
+                                    </GroupStyle>
+                                </ListBox.GroupStyle>
                                 <ListBox.ContextMenu>
                                     <ContextMenu>
                                         <MenuItem Header="暂停" Click="OnTaskPause"/>
@@ -1040,6 +1128,7 @@
                                                      不是控制外部播放器（那做不到）。 -->
                                                 <Button Grid.Column="2" Click="OnTaskTogglePause"
                                                         Tag="{Binding}" Style="{StaticResource TaskPauseButton}"
+                                                        AutomationProperties.Name="暂停或继续"
                                                         Margin="6,0,0,0" VerticalAlignment="Center"/>
                                                 <!-- 「播放」= 交给系统默认程序打开（装了 VLC 就用 VLC）。
                                                      【2026-10-03】按用户要求：只有**能播**的时候才显示这个按钮
@@ -1073,9 +1162,39 @@
                                                     <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="Auto"/>
                                                 </Grid.ColumnDefinitions>
-                                                <ProgressBar Style="{StaticResource SlimProgressBar}"
-                                                             Value="{Binding Percent}"
-                                                             VerticalAlignment="Center"/>
+                                                <!-- 【2026-10-13】进度条按状态上色（与方案 A 一致）：
+                                                     下载中 = 主色靛蓝；完成 = 绿；暂停 = 橙；失败 = 红；
+                                                     已取消 = 中性灰。轨道统一改成凹槽色，避免整条都是蓝。 -->
+                                                <ProgressBar Value="{Binding Percent}"
+                                                             VerticalAlignment="Center">
+                                                    <ProgressBar.Style>
+                                                        <Style TargetType="ProgressBar"
+                                                               BasedOn="{StaticResource SlimProgressBar}">
+                                                            <Setter Property="Foreground"
+                                                                    Value="{DynamicResource PrimaryBrush}"/>
+                                                            <Setter Property="Background"
+                                                                    Value="{DynamicResource SurfaceSunkenBrush}"/>
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding State}" Value="Completed">
+                                                                    <Setter Property="Foreground"
+                                                                            Value="{DynamicResource SuccessBrush}"/>
+                                                                </DataTrigger>
+                                                                <DataTrigger Binding="{Binding State}" Value="Paused">
+                                                                    <Setter Property="Foreground"
+                                                                            Value="{DynamicResource WarningBrush}"/>
+                                                                </DataTrigger>
+                                                                <DataTrigger Binding="{Binding State}" Value="Failed">
+                                                                    <Setter Property="Foreground"
+                                                                            Value="{DynamicResource DangerBrush}"/>
+                                                                </DataTrigger>
+                                                                <DataTrigger Binding="{Binding State}" Value="Cancelled">
+                                                                    <Setter Property="Foreground"
+                                                                            Value="{DynamicResource BorderBrushStrong}"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </ProgressBar.Style>
+                                                </ProgressBar>
                                                 <TextBlock Grid.Column="1" Text="{Binding SpeedText}"
                                                            Margin="12,0,0,0" FontWeight="SemiBold"
                                                            VerticalAlignment="Center" MinWidth="72"
@@ -1087,6 +1206,7 @@
                                                 <TextBlock Grid.Column="3" Text="{Binding PercentText}"
                                                            Margin="12,0,0,0" VerticalAlignment="Center"
                                                            MinWidth="48" TextAlignment="Right"
+                                                           Foreground="{DynamicResource TextSecondaryBrush}"
                                                            Style="{StaticResource NumericText}"/>
                                             </Grid>
                                         </Grid>
@@ -1108,6 +1228,20 @@
                                            Margin="0,4,0,0" HorizontalAlignment="Center"
                                            Style="{StaticResource TertiaryText}" FontSize="11"/>
                             </StackPanel>
+
+                            <!-- 删除选择模式的视觉提示 + 框选矩形（2026-10-13）。
+                                 ⚠️ 两者都不吃鼠标事件：行/空白处的命中判定都在 TaskList 上做，
+                                    框选矩形只是"画"出来。 -->
+                            <Border x:Name="TaskSelectFrame" Visibility="Collapsed"
+                                    IsHitTestVisible="False" BorderThickness="1.5" CornerRadius="10"
+                                    BorderBrush="{DynamicResource PrimarySoftBrush}"/>
+                            <Canvas x:Name="TaskBandLayer" Visibility="Collapsed"
+                                    IsHitTestVisible="False" ClipToBounds="True">
+                                <Rectangle x:Name="TaskBandRect" Visibility="Collapsed"
+                                           Fill="{DynamicResource PrimaryLightBrush}"
+                                           Stroke="{DynamicResource PrimaryBrush}" StrokeThickness="1"
+                                           RadiusX="3" RadiusY="3"/>
+                            </Canvas>
                         </Grid>
 
                         <!-- 运行日志（从「下载」页迁来：日志讲的是任务跑得怎么样，放任务页更贴）
@@ -1518,6 +1652,8 @@
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
                                         </Grid.RowDefinitions>
 
                                         <!-- 1 / 2 / 3：三个数字键共用一行说明（分开写三行太占地方） -->
@@ -1592,10 +1728,27 @@
                                                    VerticalAlignment="Center"
                                                    Style="{StaticResource SecondaryText}"
                                                    Text="获取直链…"/>
+
+                                        <!-- 【2026-10-13】任务页批量删除：z 进模式 → 框选/点选 → Enter 确认 -->
+                                        <Border Grid.Row="8" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="z" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="8" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center" TextWrapping="Wrap"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="「任务」页进入 / 退出删除选择模式：空白处拖拽框选、点击行选择，点文件夹行 = 选中整组"/>
+
+                                        <Border Grid.Row="9" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="Enter" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="9" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center" TextWrapping="Wrap"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="删除选择模式下确认：弹出「仅删除记录」/「删除记录和本地文件」二选一（Esc 取消）"/>
                                     </Grid>
 
                                     <TextBlock Style="{StaticResource ProseText}" Margin="0,14,0,0"
-                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史在任何页面都可用；a / d / x / g 作用于文件列表，只在「下载」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件用 Shift+点击（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
+                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史在任何页面都可用；a / d / x / g 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件用 Shift+点击（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
                                 </StackPanel>
                             </Border>
                         </StackPanel>

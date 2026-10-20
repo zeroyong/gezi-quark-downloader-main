@@ -157,4 +157,10 @@
     <Geometry x:Key="IconSortDesc">M3,16 L7,20 L11,16 M7,20 V4 M11,4 H21 M11,9 H18 M11,14 H15</Geometry>
     <Geometry x:Key="IconSortAsc">M3,8 L7,4 L11,8 M7,4 V20 M11,20 H21 M11,15 H18 M11,10 H15</Geometry>
 
+    <!-- 分组头的展开 / 收起箭头（方案 A：默认向下 = 展开，收起时旋转 -90°） -->
+    <Geometry x:Key="IconChevronDown">M6,9 L12,15 L18,9</Geometry>
+
+    <!-- 「平铺」视图图标（三条横线） -->
+    <Geometry x:Key="IconList">M4,7 H20 M4,12 H20 M4,17 H20</Geometry>
+
 </ResourceDictionary>

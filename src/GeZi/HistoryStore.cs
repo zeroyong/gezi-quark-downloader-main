@@ -101,6 +101,11 @@ namespace GeZi
             [DataMember(Order = 2)] public List<PendingTask> Pending { get; set; }
             /// <summary>解析历史。⚠️ 老 state.json 里没有这个字段 → 反序列化为 null，Load 里补空表。</summary>
             [DataMember(Order = 3)] public List<ShareHistoryEntry> Shares { get; set; }
+            /// <summary>
+            /// 任务列表快照（2026-10-13 新增）：已完成 / 失败 / 取消 / 未完成的任务都记一份，
+            /// 重启后任务页能原样恢复（含进度）。老 state.json 里没有 → Load 补空表。
+            /// </summary>
+            [DataMember(Order = 4)] public List<TaskSnapshot> Tasks { get; set; }
         }
 
         private static string StatePath
@@ -134,6 +139,7 @@ namespace GeZi
                             if (s.Records == null) s.Records = new List<HistoryRecord>();
                             if (s.Pending == null) s.Pending = new List<PendingTask>();
                             if (s.Shares == null) s.Shares = new List<ShareHistoryEntry>();
+                            if (s.Tasks == null) s.Tasks = new List<TaskSnapshot>();
                             return s;
                         }
                     }
@@ -145,6 +151,7 @@ namespace GeZi
                 Records = new List<HistoryRecord>(),
                 Pending = new List<PendingTask>(),
                 Shares = new List<ShareHistoryEntry>(),
+                Tasks = new List<TaskSnapshot>(),
             };
         }
 
@@ -320,6 +327,94 @@ namespace GeZi
             var s = Load();
             s.Pending.Clear();
             Save(s);
+        }
+
+        // ---------------- 任务列表快照 ----------------
+
+        /// <summary>取上次退出时的任务列表（按时间正序存，调用方自己决定显示顺序）。</summary>
+        public static List<TaskSnapshot> GetTasks()
+        {
+            return Load().Tasks;
+        }
+
+        /// <summary>整体覆盖任务列表快照。由任务页在集合/状态变化时调用（代码里做了节流）。</summary>
+        public static void SetTasks(List<TaskSnapshot> tasks)
+        {
+            var s = Load();
+            s.Tasks = tasks ?? new List<TaskSnapshot>();
+            Save(s);
+        }
+    }
+
+    /// <summary>
+    /// 一条任务列表快照（2026-10-13 新增）。
+    ///
+    /// 【要解决的问题】原来任务页只活在内存里：重开程序，**已完成的任务**和
+    /// **正在下载的任务**都从列表里消失（前者只留在「下载历史」窗口，
+    /// 后者要等「未完成的任务」弹窗再点续传才会重新出现）。
+    /// 用户要求「应该保留记录和进度」→ 把每行的状态 / 已下字节也存下来，
+    /// 启动时原样铺回任务页。
+    ///
+    /// 【字段取舍】只是"恢复显示 + 支持续传"，所以存的是 DownloadJob 的关键上下文
+    /// （Dest / fid / token / 分享三件套 / 写入模式）与进度（Size / Done），
+    /// 不存调度器内部对象。
+    /// </summary>
+    [DataContract]
+    public class TaskSnapshot
+    {
+        [DataMember(Order = 1)] public string Name { get; set; }
+        [DataMember(Order = 2)] public string Dest { get; set; }
+        [DataMember(Order = 3)] public long Size { get; set; }
+        [DataMember(Order = 4)] public long Done { get; set; }
+        /// <summary>JobState 的名字（Completed / Failed / Canceled / Paused ...）。</summary>
+        [DataMember(Order = 5)] public string State { get; set; }
+        [DataMember(Order = 6)] public string Error { get; set; }
+        [DataMember(Order = 7)] public string Url { get; set; }
+
+        // ---- 续传 / 重取链所需（与 PendingTask 同口径）----
+        [DataMember(Order = 8)] public string Fid { get; set; }
+        [DataMember(Order = 9)] public string Token { get; set; }
+        [DataMember(Order = 10)] public bool FromShare { get; set; }
+        [DataMember(Order = 11)] public string PwdId { get; set; }
+        [DataMember(Order = 12)] public string Stoken { get; set; }
+        [DataMember(Order = 13)] public string Passcode { get; set; }
+        [DataMember(Order = 14)] public string RelDir { get; set; }
+        [DataMember(Order = 15)] public bool Segmented { get; set; }
+        /// <summary>记录时刻（仅用于排查 / 将来做"保留最近 N 天"）。</summary>
+        [DataMember(Order = 16)] public string Time { get; set; }
+
+        /// <summary>能不能"点一下就续传"——规则与 <see cref="PendingTask.CanResume"/> 一致。</summary>
+        public bool CanResume
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(Dest) || string.IsNullOrEmpty(Fid)) return false;
+                if (FromShare) return !string.IsNullOrEmpty(Token) && !string.IsNullOrEmpty(PwdId)
+                                  && !string.IsNullOrEmpty(Stoken);
+                return true;
+            }
+        }
+
+        /// <summary>转成续传流程认识的 <see cref="PendingTask"/>。</summary>
+        public PendingTask ToPending()
+        {
+            return new PendingTask
+            {
+                Name = Name,
+                Dest = Dest,
+                Url = Url,
+                Fid = Fid,
+                Token = Token,
+                FromShare = FromShare,
+                Size = Size,
+                StreamPlay = Segmented,
+                StreamPlayMode = Segmented,
+                Status = State,
+                PwdId = PwdId,
+                Stoken = Stoken,
+                Passcode = Passcode,
+                RelDir = RelDir,
+            };
         }
     }
 

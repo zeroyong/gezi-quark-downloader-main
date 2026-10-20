@@ -1715,4 +1715,94 @@
         <Setter Property="Margin" Value="0,0,0,10"/>
     </Style>
 
+    <!-- ============================================================
+         任务列表的「文件夹分组」头（方案 A / 2026-10-13）
+         ============================================================
+         一个目录 = 一个分组，分组头是**细长的一条**（36px）：箭头 + 文件夹图标 +
+         名称 + 数量，底下一条发丝线。观感刻意贴近原有任务行，不额外加卡片/大色块。
+
+         ⚠️ 不用 WPF 默认 Expander 模板 —— 它会画出 Windows 主题那个圆圈加三角，
+            在深色界面里非常突兀。这里整条都是可点的 ToggleButton（点哪儿都能收起）。
+         ⚠️ 箭头用 RenderTransform 旋转而不是换 Geometry：同一颗图标，动画/状态都更好对。
+         ⚠️ 头部的标题内容由 GroupStyle 的 GroupItem 模板塞进 Expander.Header，
+            这里只负责"箭头 + 头部内容 + 展开区"的排布。
+         ============================================================ -->
+    <Style x:Key="TaskGroupExpander" TargetType="Expander">
+        <Setter Property="IsExpanded" Value="True"/>
+        <Setter Property="Focusable" Value="False"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Expander">
+                    <StackPanel>
+                        <ToggleButton x:Name="HdrToggle" Focusable="False"
+                                      HorizontalContentAlignment="Stretch"
+                                      IsChecked="{Binding IsExpanded,
+                                          RelativeSource={RelativeSource TemplatedParent},
+                                          Mode=TwoWay}">
+                            <ToggleButton.Template>
+                                <ControlTemplate TargetType="ToggleButton">
+                                    <Border x:Name="Bd" Background="Transparent">
+                                        <ContentPresenter/>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter TargetName="Bd" Property="Background"
+                                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </ToggleButton.Template>
+                            <Grid Height="36" Background="Transparent">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Path x:Name="Chev" Grid.Column="0"
+                                      Data="{StaticResource IconChevronDown}"
+                                      Width="13" Height="13" Margin="4,0,8,0"
+                                      Stretch="Uniform" VerticalAlignment="Center"
+                                      Stroke="{DynamicResource TextTertiaryBrush}" StrokeThickness="2"
+                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                      StrokeLineJoin="Round"
+                                      RenderTransformOrigin="0.5,0.5"/>
+                                <ContentPresenter Grid.Column="1" Content="{TemplateBinding Header}"
+                                                  VerticalAlignment="Center"/>
+                            </Grid>
+                        </ToggleButton>
+                        <ContentPresenter x:Name="Body"/>
+                    </StackPanel>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsExpanded" Value="False">
+                            <Setter TargetName="Body" Property="Visibility" Value="Collapsed"/>
+                            <Setter TargetName="Chev" Property="RenderTransform">
+                                <Setter.Value>
+                                    <RotateTransform Angle="-90"/>
+                                </Setter.Value>
+                            </Setter>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 分组头里的「N 个文件」小标签 -->
+    <Style x:Key="TaskGroupCountText" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="11"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextTertiaryBrush}"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="Margin" Value="8,0,0,0"/>
+    </Style>
+
+    <!-- 分组头里的文件夹名 -->
+    <Style x:Key="TaskGroupNameText" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="12.5"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+    </Style>
+
 </ResourceDictionary>

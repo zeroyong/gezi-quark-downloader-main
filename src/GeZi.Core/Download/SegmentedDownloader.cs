@@ -2254,6 +2254,10 @@ namespace GeZi.Core.Download
                                 var partToken = pcts.Token;
                                 for (int attempt = 0; attempt <= MaxSegmentRetries; attempt++)
                                 {
+                                    // 暂停中不要发起新请求：恢复后直接从这一行继续往下走。
+                                    if (pause != null)
+                                        await pause.WaitIfPausedAsync(cancelToken).ConfigureAwait(false);
+
                                     if (attempt > 0)
                                     {
                                         double delayMs = 500.0 * Math.Pow(2.0, attempt - 1);
@@ -2305,10 +2309,23 @@ namespace GeZi.Core.Download
                                     };
 
                                     bool fatal = false;   // true 表示重试无意义（取消/服务器不支持 Range）
+
+                                    // 本次尝试专用的 I/O 令牌 = 片级取消 + 「暂停立刻掐断」。
+                                    // 只给 SendAsync / ReadAsync 用：写盘仍走 partToken，
+                                    // 避免暂停正好落在写盘中途时把数据写成半截。
+                                    CancellationTokenSource ioCts = null;
+                                    CancellationToken ioTok = partToken;
+                                    if (pause != null)
+                                    {
+                                        ioCts = CancellationTokenSource.CreateLinkedTokenSource(
+                                            partToken, pause.AbortToken);
+                                        ioTok = ioCts.Token;
+                                    }
+
                                     try
                                     {
                                         using (var req = BuildRequest(HttpMethod.Get, url, h))
-                                        using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, partToken).ConfigureAwait(false))
+                                        using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ioTok).ConfigureAwait(false))
                                         {
                                             int code = (int)resp.StatusCode;
                                             if (code == 200 && !(reqStart == 0 && part.E >= total - 1))
@@ -2375,7 +2392,7 @@ namespace GeZi.Core.Download
                                                             cancelToken.ThrowIfCancellationRequested();
                                                             if (pause != null)
                                                                 await pause.WaitIfPausedAsync(cancelToken).ConfigureAwait(false);
-                                            int n = await stream.ReadAsync(buf, 0, buf.Length, partToken).ConfigureAwait(false);
+                                            int n = await stream.ReadAsync(buf, 0, buf.Length, ioTok).ConfigureAwait(false);
                                             if (n <= 0)
                                                 break;
                                             await wfs.WriteAsync(buf, 0, n, partToken).ConfigureAwait(false);
@@ -2408,6 +2425,18 @@ namespace GeZi.Core.Download
                                             lastErr = null;
                                             break;   // 本分片完成
                                         }
+                                    }
+                                    // 【2026-10-13 新增】暂停掐断在途读 —— 必须排在"抢占"那个 catch 之前：
+                                    // 抢占用的是 partToken，这里只可能是 ioCts 里的「暂停令牌」触发的。
+                                    catch (OperationCanceledException)
+                                        when (pause != null && pause.IsPaused && !cancelToken.IsCancellationRequested)
+                                    {
+                                        // 不是错误、不算失败重试、不清进度：
+                                        // 置 -1 让下一次循环从 attempt=0 重新开始 —— 既不消耗重试预算，
+                                        // 也不会把之前累积的退避延迟（500ms × 2^n）带到恢复后的第一请求上。
+                                        lastErr = null;
+                                        attempt = -1;
+                                        continue;
                                     }
                                     // 【关键】先判抢占，再判真取消。
                                     // 抢占用的是 partToken（片级），全局 cancelToken 并未取消；
@@ -2444,6 +2473,13 @@ namespace GeZi.Core.Download
                                     catch (Exception ex)
                                     {
                                         lastErr = ex.GetType().Name + ": " + ex.Message;
+                                    }
+                                    finally
+                                    {
+                                        if (ioCts != null)
+                                        {
+                                            try { ioCts.Dispose(); } catch { }
+                                        }
                                     }
                                 }
 

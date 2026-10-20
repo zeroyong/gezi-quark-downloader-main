@@ -58,6 +58,9 @@ namespace GeZi
     {
         private readonly ObservableCollection<ShareFileItem> _files = new ObservableCollection<ShareFileItem>();
         private readonly ObservableCollection<TaskItem> _tasks = new ObservableCollection<TaskItem>();
+
+        /// <summary>任务列表的默认视图 —— 开关「文件夹分组」时直接改它的 GroupDescriptions。</summary>
+        private ListCollectionView _taskView;
         private readonly List<string> _pathList = new List<string>();
         private readonly Stack<string> _fidStack = new Stack<string>();
 
@@ -205,6 +208,8 @@ namespace GeZi
                        (f.Name ?? "").IndexOf(w, StringComparison.CurrentCultureIgnoreCase) >= 0;
             };
             TaskList.ItemsSource = _tasks;
+            // 拿默认视图的引用（与 ItemsSource 用的是同一个对象），供「文件夹分组」开关用。
+            _taskView = CollectionViewSource.GetDefaultView(_tasks) as ListCollectionView;
             ShareModeRadio.IsChecked = true;
 
             // 侧栏导航（ListBox）与内容区（TabControl）的初始对齐。
@@ -243,6 +248,8 @@ namespace GeZi
                 // 放在这里而不是各个删除点，是为了覆盖所有移除路径。
                 // SyncPending 内部有签名节流，集合频繁变化也不会反复写盘。
                 SyncPending();
+                // 任务列表快照（含已完成记录）：增删也要落盘
+                RequestSaveTaskList();
             };
             // 筛选视图变化也要刷新（筛选后可能一条都不剩）
             _filesView.CollectionChanged += (s, e) => UpdateEmptyStates();
@@ -255,6 +262,20 @@ namespace GeZi
                 (s, e) => FlushLogs(),
                 Dispatcher);
             _logFlushTimer.Start();
+
+            // 任务列表快照的节流写盘（2026-10-13）：进度每 500ms 报一次，不能跟着写盘。
+            // ⚠️ DispatcherTimer 的 4 参构造会**立刻启动**，这里创建后马上 Stop ——
+            //    只在真的有变化时由 RequestSaveTaskList 启动，避免空转。
+            _taskSaveTimer = new System.Windows.Threading.DispatcherTimer(
+                TimeSpan.FromSeconds(3),
+                System.Windows.Threading.DispatcherPriority.Background,
+                (s, e) =>
+                {
+                    _taskSaveTimer.Stop();
+                    SaveTaskListNow();
+                },
+                Dispatcher);
+            _taskSaveTimer.Stop();
 
             // ---- 保活：下载期间阻止系统空闲睡眠 ----
             //
@@ -299,6 +320,11 @@ namespace GeZi
             _capacityTimer.Start();
 
             _settings = SettingsStore.Load();
+
+            // 【2026-10-13】把上次的任务列表铺回来（含已完成记录与未完成的进度）。
+            // 必须在 LoadSettingsToUi 之前：恢复时要按「新任务在前/在后」重排。
+            // 出错绝不能拦住启动，所以内部全包了 try/catch。
+            RestoreTaskList();
 
             // 确定一个「真正可写」的下载目录：已保存的 → 真实下载目录 → 本地应用数据目录 → 程序目录
             string resolved = null;
@@ -345,18 +371,14 @@ namespace GeZi
                 }
                 catch { }
 
-                // 先启动分片清扫（后台线程），再弹续传询问 ——
+                // 先启动分片清扫（后台线程）。
                 // 清扫只回收"超过阈值没被碰过"的孤儿分片，不会动正在续传的，
                 // 但顺序上仍让清扫先跑，避免把刚被判定为待续的分片误伤（mtime 很新，实际不会）。
                 StartPartsSweep();
 
-                // 把续传询问推迟到 UI 完全渲染之后（Idle 优先级）再弹：
-                // 若直接在 Loaded 里 ShowDialog()，主窗还没画出来就先弹模态框，
-                // 用户会误以为"程序没打开"（尤其弹框被主窗或别的窗口挡住时）。
-                Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    try { ShowPendingOnStartup(); } catch { }
-                }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+                // 【2026-10-13 移除】原来这里会用 Idle 优先级弹「未完成的任务」询问框。
+                // 现在任务页本身就会把上次的任务（含未完成的进度）恢复成列表行，
+                // 点行上的 ▶ 即可续传 —— 再弹一个询问框只是在重复问同一件事。
 
                 // 窗口圆角（用户反馈「整个软件窗口四个角太尖了，微微加一些圆角」）。
                 // ⚠️ **必须放在 Loaded 里**：它要拿窗口句柄（HWND），
@@ -445,6 +467,9 @@ namespace GeZi
         {
             try { _logFlushTimer?.Stop(); } catch { }
             try { _sleepGuardTimer?.Stop(); } catch { }
+            // 关窗前把任务页的最终状态落盘（节流定时器可能还没到点）。
+            try { _taskSaveTimer?.Stop(); } catch { }
+            SaveTaskListNow();
             // 释放保活。其实进程退出时线程级状态会自动释放，这里显式写更清楚，
             // 也避免"关窗后进程还活着"的路径（如托盘常驻）把保活留着。
             try { SleepGuard.Release(); } catch { }
@@ -1597,8 +1622,8 @@ namespace GeZi
 
         /// <summary>
         /// 文件区工具栏上那个「解析历史」按钮（h 键之外看得见的入口）。
-        /// ⚠️ 别和任务页的「下载历史」（<c>HistoryBtn</c> / OnOpenHistory）搞混 ——
-        /// 那个是**本地下载记录**，这个是**解析过的分享**。
+        /// 记的是**解析过的分享**（pwd_id / 提取码），与任务页无关 ——
+        /// 任务页原来的「下载历史」按钮已经移除（任务列表本身就会跨重启保留）。
         /// </summary>
         private void OnShareHistoryButtonClick(object sender, RoutedEventArgs e)
         {
@@ -1706,6 +1731,31 @@ namespace GeZi
         {
             var mods = Keyboard.Modifiers;
             var item = FindListBoxItem(e.OriginalSource as DependencyObject);
+
+            // ⓪ 任务页的「删除选择模式」：点击语义整体换一套 ——
+            //    点行 = 切换该行、点分组头 = 整组切换、点空白 = 开始拖拽框选。
+            //    必须放在"item == null 直接 return"之前，否则空白的框选起点就被吞了。
+            if (_taskSelectMode && ReferenceEquals(sender, TaskList))
+            {
+                e.Handled = true;
+
+                var gi = FindAncestorGroupItem(e.OriginalSource as DependencyObject);
+                if (gi != null)
+                {
+                    ToggleTaskGroupSelection(gi);
+                    return;
+                }
+                if (item != null)
+                {
+                    item.IsSelected = !item.IsSelected;
+                    try { item.Focus(); } catch { }
+                    UpdateTaskSelectCount();
+                    return;
+                }
+                BeginTaskBandDrag(e);
+                return;
+            }
+
             if (item == null)
                 return;   // 点在空白处：交给默认处理（清空选择）
 
@@ -2591,7 +2641,32 @@ namespace GeZi
             if (e.Key == Key.H)
             {
                 e.Handled = true;
+                ExitTaskSelectMode();   // 面板是模态观感，别让底下的选择模式还挂着
                 ShowHistoryPanel();
+                return;
+            }
+
+            // ①.5 任务页的「删除选择模式」：z 进入 / Enter 确认 / Esc 退出。
+            //     用户要求「选好后 再按 Enter，弹出是仅删除记录还是一起删除本地文件」。
+            if (_taskSelectMode)
+            {
+                if (e.Key == Key.Z || e.Key == Key.Escape)
+                {
+                    e.Handled = true;
+                    ExitTaskSelectMode();
+                    return;
+                }
+                if (e.Key == Key.Enter)
+                {
+                    e.Handled = true;
+                    ConfirmTaskDeleteSelection();
+                    return;
+                }
+            }
+            if (e.Key == Key.Z && Tabs.SelectedIndex == 1)
+            {
+                e.Handled = true;
+                EnterTaskSelectMode();
                 return;
             }
 
@@ -3836,6 +3911,8 @@ namespace GeZi
 
             // ---- 未完成任务记录：仅在状态集合发生变化时同步（避免每帧进度都写盘）----
             SyncPending();
+            // ---- 任务列表快照：进度/状态变化也记下来（内部 3 秒节流）----
+            RequestSaveTaskList();
 
             // 合并按钮的文案/图标要跟着任务状态走（有在跑的 → 暂停全部；否则 → 恢复全部）
             UpdatePauseAllButton();
@@ -3843,6 +3920,137 @@ namespace GeZi
 
         /// <summary>上次写入 pending 时的状态签名，用于避免高频重复写盘。</summary>
         private string _pendingSig;
+
+        // ---- 任务列表快照（2026-10-13）：跨重启保留任务页的记录与进度 ----
+
+        /// <summary>节流写盘用：最多 3 秒落一次（进度每 500ms 就报一次，不能跟着写）。</summary>
+        private DispatcherTimer _taskSaveTimer;
+
+        /// <summary>最多保留多少条任务快照（防止一次几千文件的目录把 state 撑爆）。</summary>
+        private const int MaxTaskSnapshots = 1000;
+
+        /// <summary>请求把任务页写进 state（节流）。集合变化、状态/进度变化都走这里。</summary>
+        private void RequestSaveTaskList()
+        {
+            if (_taskSaveTimer == null) return;
+            if (!_taskSaveTimer.IsEnabled) _taskSaveTimer.Start();
+        }
+
+        /// <summary>立刻把任务页整表写进 state.json（OnClosed / 关键操作时用）。</summary>
+        private void SaveTaskListNow()
+        {
+            try
+            {
+                var list = new List<TaskSnapshot>();
+                // 按"加入次序"存（不是界面顺序）：恢复后由 ApplyTaskOrder 按用户偏好重排，
+                // 这样"新任务在前/在后"的设置在重启后依然成立。
+                foreach (var t in _tasks.OrderBy(x => x.Seq))
+                {
+                    var job = t.Job;
+                    var pi = job == null ? null : job.Pending;
+                    list.Add(new TaskSnapshot
+                    {
+                        Name = t.Name,
+                        Dest = job == null ? null : job.Dest,
+                        Size = t.Total,
+                        Done = t.Done,
+                        State = t.State.ToString(),
+                        Error = t.Error,
+                        Url = job == null ? null : job.Url,
+                        Fid = pi == null ? null : pi.Fid,
+                        Token = pi == null ? null : pi.Token,
+                        FromShare = pi != null && pi.FromShare,
+                        PwdId = pi == null ? null : pi.PwdId,
+                        Stoken = pi == null ? null : pi.Stoken,
+                        Passcode = pi == null ? null : pi.Passcode,
+                        RelDir = pi == null ? null : pi.RelDir,
+                        Segmented = job != null && job.WriteMode == WriteMode.SegmentedFiles,
+                        Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                    });
+                }
+                if (list.Count > MaxTaskSnapshots)
+                    list.RemoveRange(0, list.Count - MaxTaskSnapshots);
+                HistoryStore.SetTasks(list);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 启动时把上次的任务列表铺回任务页（含进度）。
+        ///
+        /// 未完成的一律先显示成「已暂停」并**标记为 Dormant**：它们没有挂到调度器上，
+        /// 点 ▶ 才走"重新取链 → 续传"（见 ResumeTask 的 Dormant 分支）。
+        /// </summary>
+        private void RestoreTaskList()
+        {
+            List<TaskSnapshot> saved;
+            try { saved = HistoryStore.GetTasks(); } catch { return; }
+            if (saved == null || saved.Count == 0) return;
+
+            int restored = 0, unfinished = 0;
+            foreach (var s in saved)
+            {
+                if (s == null || string.IsNullOrEmpty(s.Dest)) continue;
+                try
+                {
+                    var job = new DownloadJob
+                    {
+                        Name = s.Name,
+                        Url = s.Url,
+                        Dest = s.Dest,
+                        Threads = _settings.Threads,
+                        WriteMode = s.Segmented ? WriteMode.SegmentedFiles : WriteMode.SharedFile,
+                        PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
+                        ResumeCannotRefresh = s.FromShare,
+                        Pending = new PendingInfo
+                        {
+                            PwdId = s.PwdId, Stoken = s.Stoken, Passcode = s.Passcode,
+                            Fid = s.Fid, Token = s.Token, FromShare = s.FromShare,
+                            RelDir = s.RelDir ?? "", Dest = s.Dest, Size = s.Size,
+                        },
+                    };
+                    job.LinkRefresher = ct => RefreshLinkAsyncForPending(job, ct);
+
+                    var t = new TaskItem(job,
+                        string.IsNullOrEmpty(s.Name) ? Path.GetFileName(s.Dest) : s.Name)
+                    {
+                        Dormant = true,
+                    };
+                    t.Total = s.Size;
+                    t.Done = s.Done;
+                    t.Error = s.Error ?? "";
+
+                    JobState st;
+                    if (!Enum.TryParse(s.State, out st))
+                        st = JobState.Paused;
+
+                    if (st == JobState.Completed)
+                    {
+                        t.Percent = 100;
+                    }
+                    else if (st == JobState.Failed || st == JobState.Cancelled)
+                    {
+                        t.Percent = s.Size > 0 ? Math.Min(100.0, s.Done * 100.0 / s.Size) : 0;
+                    }
+                    else
+                    {
+                        // 上次是 排队/下载中/暂停/取消中 → 统一回到「已暂停」
+                        st = JobState.Paused;
+                        t.Percent = s.Size > 0 ? Math.Min(99.9, s.Done * 100.0 / s.Size) : 0;
+                        unfinished++;
+                    }
+                    t.State = st;
+                    _tasks.Add(t);
+                    restored++;
+                }
+                catch { }
+            }
+
+            if (restored == 0) return;
+            ApplyTaskOrder();   // 按「新任务在前 / 在后」的偏好重排
+            Log(string.Format("已恢复上次的任务记录: {0} 项{1}", restored,
+                unfinished > 0 ? "（其中 " + unfinished + " 个未完成，点 ▶ 可续传）" : ""));
+        }
 
         /// <summary>
         /// 把当前"未完成"的任务（排队/下载/暂停）写进持久化记录，
@@ -3859,6 +4067,11 @@ namespace GeZi
                 var list = new List<PendingTask>();
                 foreach (var t in _tasks)
                 {
+                    // 快照恢复出来的行（Dormant）**不再写回 Pending**：
+                    // 它们本来就直接来自 Pending/上次快照，写回去只会把"未完成任务"弹窗
+                    // 再撑一遍（用户会看到列表里已经有了、弹窗又问一次）。
+                    if (t.Dormant)
+                        continue;
                     if (t.State == JobState.Queued || t.State == JobState.Downloading
                         || t.State == JobState.Paused)
                     {
@@ -4038,15 +4251,22 @@ namespace GeZi
 
         private void OnClearDone(object sender, RoutedEventArgs e)
         {
-            for (int i = _tasks.Count - 1; i >= 0; i--)
+            var done = _tasks.Where(t => t.State == JobState.Completed || t.State == JobState.Failed
+                                      || t.State == JobState.Cancelled || t.State == JobState.Cancelling)
+                             .ToList();
+            if (done.Count == 0)
             {
-                var s = _tasks[i].State;
-                // 含 Cancelling：用户点了取消就说明不想要它了，
-                // 不该逼他等下载器慢慢退出之后才能清掉。
-                if (s == JobState.Completed || s == JobState.Failed
-                    || s == JobState.Cancelled || s == JobState.Cancelling)
-                    _tasks.RemoveAt(i);
+                Log("没有已完成的记录。");
+                return;
             }
+
+            // 【2026-10-13】用户要求「清空已完成也和 z 删除类似，需要选是仅删除记录还是包括文件」。
+            var choice = AskTaskDeleteChoice(done);
+            if (choice == TaskDeleteChoice.Cancel) return;
+
+            if (choice == TaskDeleteChoice.WithFiles) DeleteTaskLocals(done);
+            else RemoveTaskRecords(done, askRunning: false);
+
             SyncPending();
             UpdatePauseAllButton(force: true);
         }
@@ -4112,6 +4332,359 @@ namespace GeZi
             TaskSortBtn.ToolTip = first
                 ? "当前：新任务排在最前面（点击改为排在已有任务后面）"
                 : "当前：新任务排在已有任务后面（点击改为排在最前面）";
+        }
+
+        // ---------------- 任务列表：文件夹分组 / 平铺（2026-10-13 新增） ----------------
+        //
+        // 用户要求：「选择文件夹下载时，任务展示可以选择『用文件夹名称展示目录下的文件』
+        // 还是『展示一个个文件』，并且记忆选择；默认展开，可以点击收起」。
+        //
+        // 实现走 WPF 自带的 CollectionView 分组（GroupDescriptions）而不是自己拍平列表：
+        //   · TaskList.SelectedItems 里**仍然是 TaskItem**，右键菜单 / 暂停 / 删除等
+        //     全部现有逻辑一行都不用改；
+        //   · 分组头是独立的 GroupItem，天然不可被选中，不会污染多选；
+        //   · 收起/展开交给分组头里的 Expander，默认 IsExpanded=True。
+
+        /// <summary>按当前设置增删分组（Grouped = 按 <see cref="TaskItem.GroupName"/> 分组）。</summary>
+        private void ApplyTaskGrouping()
+        {
+            if (_taskView == null) return;
+            using (_taskView.DeferRefresh())
+            {
+                _taskView.GroupDescriptions.Clear();
+                if (_settings.TaskView == TaskViewMode.Grouped)
+                    _taskView.GroupDescriptions.Add(
+                        new PropertyGroupDescription(nameof(TaskItem.GroupName)));
+            }
+        }
+
+        /// <summary>同步「展示方式」按钮的文案 / 图标（图标在文字右边）。</summary>
+        private void UpdateTaskViewButton()
+        {
+            bool grouped = _settings.TaskView == TaskViewMode.Grouped;
+            TaskViewText.Text = grouped ? "文件夹分组" : "平铺";
+            var geo = TryFindResource(grouped ? "IconFolder" : "IconList") as Geometry;
+            if (geo != null) TaskViewIcon.Data = geo;
+            TaskViewBtn.ToolTip = grouped
+                ? "当前：按文件夹分组（点击改为平铺一个个文件）"
+                : "当前：平铺一个个文件（点击改为按文件夹分组）";
+        }
+
+        private void OnToggleTaskView(object sender, RoutedEventArgs e)
+        {
+            _settings.TaskView = _settings.TaskView == TaskViewMode.Grouped
+                ? TaskViewMode.Flat : TaskViewMode.Grouped;
+            SettingsStore.Save(_settings);
+            ApplyTaskGrouping();
+            UpdateTaskViewButton();
+            Log(_settings.TaskView == TaskViewMode.Grouped
+                ? "任务列表已切换：按文件夹分组（点分组头可收起）"
+                : "任务列表已切换：平铺显示一个个文件");
+        }
+
+        // ---------------- 任务列表：删除选择模式（z / Enter） ----------------
+        //
+        // 用户要求：「按 z 进入删除选择模式，可以框选也可以点选（选中文件夹就删整个文件夹）；
+        // 选好后按 Enter 确认，弹出『仅删除记录』还是『一起删除本地文件』」。
+        // 另：「清空已完成」也用同一套二选一。
+
+        private bool _taskSelectMode;
+        private Point _bandStart;
+        private bool _bandDragging;
+
+        /// <summary>删除方式（批量删除 / 清空已完成共用）。</summary>
+        private enum TaskDeleteChoice
+        {
+            Cancel,
+            RecordOnly,
+            WithFiles,
+        }
+
+        private void EnterTaskSelectMode()
+        {
+            if (_taskSelectMode) return;
+            _taskSelectMode = true;
+            TaskSelectBar.Visibility = Visibility.Visible;
+            TaskSelectFrame.Visibility = Visibility.Visible;
+            TaskBandLayer.Visibility = Visibility.Visible;
+            UpdateTaskSelectCount();
+            Log("已进入删除选择模式：拖拽框选或点击选择，选中文件夹行 = 整组；按 Enter 确认，Esc 退出。");
+        }
+
+        private void ExitTaskSelectMode(bool clearSelection = true)
+        {
+            if (!_taskSelectMode) return;
+            _taskSelectMode = false;
+            TaskSelectBar.Visibility = Visibility.Collapsed;
+            TaskSelectFrame.Visibility = Visibility.Collapsed;
+            TaskBandLayer.Visibility = Visibility.Collapsed;
+            TaskBandRect.Visibility = Visibility.Collapsed;
+            _bandDragging = false;
+            try { TaskList.ReleaseMouseCapture(); } catch { }
+            if (clearSelection) TaskList.SelectedItems.Clear();
+            UpdateTaskSelectCount();
+        }
+
+        private void UpdateTaskSelectCount()
+        {
+            if (TaskSelectCountText == null) return;
+            TaskSelectCountText.Text = "已选 " + TaskList.SelectedItems.Count + " 项";
+        }
+
+        private void OnTaskSelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_taskSelectMode) UpdateTaskSelectCount();
+        }
+
+        /// <summary>点分组头：整组选中 / 取消（只在删除选择模式下拦截，平时交给 Expander 收起）。</summary>
+        private void ToggleTaskGroupSelection(GroupItem gi)
+        {
+            var grp = gi == null ? null : gi.DataContext as CollectionViewGroup;
+            if (grp == null) return;
+            var items = grp.Items.OfType<TaskItem>().ToList();
+            bool all = items.All(t => TaskList.SelectedItems.Contains(t));
+            foreach (var t in items)
+            {
+                if (all) TaskList.SelectedItems.Remove(t);
+                else if (!TaskList.SelectedItems.Contains(t)) TaskList.SelectedItems.Add(t);
+            }
+            UpdateTaskSelectCount();
+        }
+
+        private static GroupItem FindAncestorGroupItem(DependencyObject d)
+        {
+            while (d != null)
+            {
+                if (d is GroupItem gi) return gi;
+                d = VisualTreeHelper.GetParent(d);
+            }
+            return null;
+        }
+
+        private void BeginTaskBandDrag(MouseButtonEventArgs e)
+        {
+            _bandDragging = true;
+            _bandStart = e.GetPosition(TaskBandLayer);
+            TaskBandRect.Visibility = Visibility.Visible;
+            Canvas.SetLeft(TaskBandRect, _bandStart.X);
+            Canvas.SetTop(TaskBandRect, _bandStart.Y);
+            TaskBandRect.Width = 0;
+            TaskBandRect.Height = 0;
+            try { TaskList.CaptureMouse(); } catch { }
+        }
+
+        private void OnTaskListMouseMove(object sender, MouseEventArgs e)
+        {
+            if (!_bandDragging) return;
+            var p = e.GetPosition(TaskBandLayer);
+            double x = Math.Min(p.X, _bandStart.X);
+            double y = Math.Min(p.Y, _bandStart.Y);
+            double w = Math.Abs(p.X - _bandStart.X);
+            double h = Math.Abs(p.Y - _bandStart.Y);
+            Canvas.SetLeft(TaskBandRect, x);
+            Canvas.SetTop(TaskBandRect, y);
+            TaskBandRect.Width = w;
+            TaskBandRect.Height = h;
+            SelectTasksInBand(new Rect(x, y, w, h));
+        }
+
+        private void OnTaskListMouseUp(object sender, MouseButtonEventArgs e)
+        {
+            if (!_bandDragging) return;
+            _bandDragging = false;
+            try { TaskList.ReleaseMouseCapture(); } catch { }
+            bool tiny = TaskBandRect.Width < 4 && TaskBandRect.Height < 4;
+            TaskBandRect.Visibility = Visibility.Collapsed;
+            // 点在空白处（没拖动）= 清空选择，和列表的常规手感一致
+            if (tiny) TaskList.SelectedItems.Clear();
+            UpdateTaskSelectCount();
+        }
+
+        /// <summary>把矩形碰到（且已生成容器）的任务行选中，其余取消。</summary>
+        private void SelectTasksInBand(Rect band)
+        {
+            for (int i = 0; i < _tasks.Count; i++)
+            {
+                var t = _tasks[i];
+                var lbi = TaskList.ItemContainerGenerator.ContainerFromItem(t) as ListBoxItem;
+                if (lbi == null) continue;   // 没生成的（滚出屏幕/被收起）不参与框选
+                Rect b;
+                try
+                {
+                    b = lbi.TransformToAncestor(TaskBandLayer)
+                            .TransformBounds(new Rect(lbi.RenderSize));
+                }
+                catch { continue; }
+
+                bool hit = b.IntersectsWith(band);
+                bool sel = TaskList.SelectedItems.Contains(t);
+                if (hit && !sel) TaskList.SelectedItems.Add(t);
+                else if (!hit && sel) TaskList.SelectedItems.Remove(t);
+            }
+        }
+
+        /// <summary>Enter：把当前选中项交给用户做「仅删除记录 / 连本地文件一起删」的选择。</summary>
+        private void ConfirmTaskDeleteSelection()
+        {
+            var sel = TaskList.SelectedItems.Cast<TaskItem>().ToList();
+            if (sel.Count == 0)
+            {
+                Log("没有选中任何任务，已退出删除选择模式。");
+                ExitTaskSelectMode(clearSelection: false);
+                return;
+            }
+
+            var choice = AskTaskDeleteChoice(sel);
+            if (choice == TaskDeleteChoice.Cancel) return;   // 留在选择模式里，方便继续调整
+
+            ExitTaskSelectMode();
+            if (choice == TaskDeleteChoice.WithFiles) DeleteTaskLocals(sel);
+            else RemoveTaskRecords(sel, askRunning: false);
+        }
+
+        /// <summary>
+        /// 删除方式的二选一对话框。
+        /// 不用 AppDialog（MessageBox 的按钮固定是"是/否"，没法写成两种删除方式）。
+        /// </summary>
+        private TaskDeleteChoice AskTaskDeleteChoice(IList<TaskItem> tasks)
+        {
+            int total = tasks.Count;
+            var groups = tasks.GroupBy(t => t.GroupName)
+                              .Where(g => g.Key != TaskItem.SingleFileGroupName)
+                              .ToList();
+            int inGroups = groups.Sum(g => g.Count());
+            int singles = total - inGroups;
+
+            string summary;
+            if (groups.Count > 0 && singles > 0)
+                summary = string.Format("共 {0} 个任务：{1} 个文件夹（{2} 个文件），另有 {3} 个单独的文件。",
+                    total, groups.Count, inGroups, singles);
+            else if (groups.Count > 0)
+                summary = string.Format("共 {0} 个文件，来自 {1} 个文件夹。", total, groups.Count);
+            else
+                summary = string.Format("共 {0} 个任务。", total);
+
+            if (groups.Count > 0)
+            {
+                var names = groups.Select(g => "· " + g.Key).Take(3).ToList();
+                if (groups.Count > 3) names.Add("…");
+                summary += "\n" + string.Join("\n", names);
+            }
+
+            var win = new Window { Title = "删除任务", Owner = this };
+            DialogChrome.StyleWindow(win, 480, 320);
+            win.SizeToContent = SizeToContent.Height;   // 内容多时往下长，不出现截断
+
+            var root = new System.Windows.Controls.Grid
+            {
+                Margin = new Thickness(20, 18, 20, 16),
+            };
+            for (int i = 0; i < 4; i++)
+                root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var title = DialogChrome.PageTitle("删除 " + total + " 项");
+            System.Windows.Controls.Grid.SetRow(title, 0);
+            root.Children.Add(title);
+
+            var msg = DialogChrome.Hint(summary, 2, 10);
+            System.Windows.Controls.Grid.SetRow(msg, 1);
+            root.Children.Add(msg);
+
+            var warn = DialogChrome.Hint(
+                "「仅删除记录」只移除列表条目，磁盘上的文件保留。\n" +
+                "「删除记录和本地文件」会先取消下载，再删除目标文件与分片缓存 —— 不可恢复。", 0, 14);
+            warn.SetResourceReference(TextBlock.ForegroundProperty, "DangerBrush");
+            System.Windows.Controls.Grid.SetRow(warn, 2);
+            root.Children.Add(warn);
+
+            var choice = TaskDeleteChoice.Cancel;
+            var cancel = DialogChrome.SecondaryButton("取消", (s, e) => win.Close());
+            // 直觉：Esc 就是取消（IsCancel 让 Esc 直接关窗）
+            cancel.IsCancel = true;
+            var record = DialogChrome.SecondaryButton("仅删除记录", (s, e) =>
+            {
+                choice = TaskDeleteChoice.RecordOnly;
+                win.Close();
+            });
+            var withFiles = DialogChrome.DangerButton("删除记录和本地文件", (s, e) =>
+            {
+                choice = TaskDeleteChoice.WithFiles;
+                win.Close();
+            });
+            var row = DialogChrome.ButtonRow(cancel, record, withFiles);
+            System.Windows.Controls.Grid.SetRow(row, 3);
+            root.Children.Add(row);
+
+            win.Loaded += (s, e) => { try { cancel.Focus(); } catch { } };
+            win.Content = root;
+            win.ShowDialog();
+            return choice;
+        }
+
+        /// <summary>批量「仅移除记录」（支持正在下载的任务：会先取消再移除）。</summary>
+        private void RemoveTaskRecords(IList<TaskItem> items, bool askRunning)
+        {
+            if (items == null || items.Count == 0) return;
+
+            if (askRunning)
+            {
+                var running = items.Where(x => x.State == JobState.Downloading
+                                            || x.State == JobState.Queued
+                                            || x.State == JobState.Paused
+                                            || x.State == JobState.Cancelling).ToList();
+                if (running.Count > 0)
+                {
+                    var ans = AppDialog.Show(this,
+                        (running.Count == 1
+                            ? "任务「" + running[0].Name + "」还在进行中。\n\n"
+                            : "选中的 " + running.Count + " 个任务还在进行中。\n\n")
+                        + "仅移除记录不会停止后台下载，文件仍会继续写入。\n"
+                        + "确定要先取消并移除记录吗？",
+                        "仅移除记录", MessageBoxButton.YesNo, MessageBoxImage.Question,
+                        MessageBoxResult.No);
+                    if (ans != MessageBoxResult.Yes)
+                        return;
+                }
+            }
+
+            foreach (var t in items) RemoveTaskRecord(t);
+            // 移除后立刻同步「未完成任务」记录 —— 否则它下次启动还会被当成可续传任务
+            SyncPending();
+            UpdatePauseAllButton(force: true);
+        }
+
+        /// <summary>批量「删除本地文件」：取消 + 移除记录 + 后台删文件（分片元数据一并清）。</summary>
+        private void DeleteTaskLocals(IList<TaskItem> items)
+        {
+            if (items == null) return;
+            var list = items.Where(x => x != null && x.Job != null
+                                     && !string.IsNullOrEmpty(x.Job.Dest)).ToList();
+            if (list.Count == 0)
+            {
+                Log("没有可删除的本地文件（任务没有记录目标路径）。");
+                return;
+            }
+
+            foreach (var t in list)
+            {
+                // 只要还在"活着"的状态就先取消（含暂停——见 RemoveTaskRecord 的注释）
+                if (t.State == JobState.Downloading || t.State == JobState.Queued
+                    || t.State == JobState.Paused || t.State == JobState.Cancelling)
+                {
+                    try { t.Job.CancelJob(); } catch { }
+                    t.State = JobState.Cancelling;
+                }
+
+                string dest = t.Job.Dest;
+                string name = t.Name;
+                _tasks.Remove(t);
+                // 后台删除：文件可能较大，且被占用时要等待句柄释放，不能卡 UI 线程。
+                _ = Task.Run(() => DeleteLocalFiles(dest, name));
+            }
+
+            SyncPending();
+            UpdatePauseAllButton(force: true);
+            Log("已删除 " + list.Count + " 项任务的本地文件。");
         }
 
         // ---------------- 任务列表右键菜单（单任务操作） ----------------
@@ -4220,6 +4793,50 @@ namespace GeZi
         private void ResumeTask(TaskItem t)
         {
             if (t == null) return;
+
+            // 【2026-10-13】上次运行恢复出来的行：没有挂在调度器上，点 ▶ = 重新取链续传。
+            if (t.Dormant)
+            {
+                if (t.State == JobState.Completed)
+                {
+                    Log("任务已完成。");
+                    return;
+                }
+                var p = t.Job == null ? null : t.Job.Pending;
+                bool canResume = p != null && !string.IsNullOrEmpty(t.Job.Dest)
+                    && !string.IsNullOrEmpty(p.Fid)
+                    && (!p.FromShare
+                        || (!string.IsNullOrEmpty(p.Token) && !string.IsNullOrEmpty(p.PwdId)
+                            && !string.IsNullOrEmpty(p.Stoken)));
+                if (!canResume)
+                {
+                    Log("这个任务缺少续传信息，无法继续；请重新解析分享后再下载（分片在，会自然续传）。");
+                    return;
+                }
+
+                Log("正在为「" + t.Name + "」重新取链……");
+                var pend = new PendingTask
+                {
+                    Name = t.Name,
+                    Dest = t.Job.Dest,
+                    Url = t.Job.Url,
+                    Fid = p.Fid,
+                    Token = p.Token,
+                    FromShare = p.FromShare,
+                    Size = t.Total,
+                    StreamPlay = t.Job.WriteMode == WriteMode.SegmentedFiles,
+                    StreamPlayMode = t.Job.WriteMode == WriteMode.SegmentedFiles,
+                    Status = t.StatusText,
+                    PwdId = p.PwdId,
+                    Stoken = p.Stoken,
+                    Passcode = p.Passcode,
+                    RelDir = p.RelDir,
+                };
+                // 续传流程会自己新建一行并替换掉这条占位（见 ResumePendingBatchAsync 里的去重）
+                _ = ResumePendingBatchAsync(new List<PendingTask> { pend });
+                return;
+            }
+
             if (t.State == JobState.Paused)
             {
                 t.PauseRequested = false;   // 先清标志，否则会继续忽略核心的 Downloading
@@ -4367,29 +4984,7 @@ namespace GeZi
             // 支持 Shift 离散多选：一次移除多条记录。
             var all = TasksFromMenu(sender);
             if (all.Count == 0) return;
-
-            var running = all.Where(x => x.State == JobState.Downloading
-                                      || x.State == JobState.Queued
-                                      || x.State == JobState.Paused
-                                      || x.State == JobState.Cancelling).ToList();
-            if (running.Count > 0)
-            {
-                var ans = AppDialog.Show(this,
-                    (running.Count == 1
-                        ? "任务「" + running[0].Name + "」还在进行中。\n\n"
-                        : "选中的 " + running.Count + " 个任务还在进行中。\n\n")
-                    + "仅移除记录不会停止后台下载，文件仍会继续写入。\n"
-                    + "确定要先取消并移除记录吗？",
-                    "仅移除记录", MessageBoxButton.YesNo, MessageBoxImage.Question,
-                    MessageBoxResult.No);
-                if (ans != MessageBoxResult.Yes)
-                    return;
-            }
-
-            foreach (var t in all) RemoveTaskRecord(t);
-            // 移除后立刻同步「未完成任务」记录 —— 否则它下次启动还会被当成可续传任务
-            SyncPending();
-            UpdatePauseAllButton(force: true);
+            RemoveTaskRecords(all, askRunning: true);
         }
 
         /// <summary>移除单条任务记录（不做确认，确认由调用方统一做一次）。</summary>
@@ -4461,22 +5056,7 @@ namespace GeZi
             if (ans != MessageBoxResult.Yes)
                 return;
 
-            foreach (var t in list)
-            {
-                // 只要还在"活着"的状态就先取消（含暂停——见上面的注释）
-                if (t.State == JobState.Downloading || t.State == JobState.Queued
-                    || t.State == JobState.Paused || t.State == JobState.Cancelling)
-                {
-                    try { t.Job.CancelJob(); } catch { }
-                    t.State = JobState.Cancelling;
-                }
-
-                string dest = t.Job.Dest;
-                string name = t.Name;
-                _tasks.Remove(t);
-                // 后台删除：文件可能较大，且被占用时要等待句柄释放，不能卡 UI 线程。
-                _ = Task.Run(() => DeleteLocalFiles(dest, name));
-            }
+            DeleteTaskLocals(list);
         }
 
         private void DeleteLocalFiles(string dest, string name)
@@ -4663,109 +5243,6 @@ namespace GeZi
             // 详见 ShellReveal 的注释。
             if (!ShellReveal.Reveal(dest))
                 Log("定位失败：找不到该文件或所在目录（" + dest + "）");
-        }
-
-        // ---------------- 下载历史 ----------------
-
-        /// <summary>
-        /// 「下载历史」：用最简单的窗口列出记录，支持打开/定位/清空。
-        /// 移植自 Python Flet 版 `_on_open_history`。
-        /// UI 刻意保持朴素（ListBox + 按钮），只求功能可用。
-        /// </summary>
-        private void OnOpenHistory(object sender, RoutedEventArgs e)
-        {
-            var win = new Window
-            {
-                Title = "下载历史",
-                Owner = this,
-            };
-            DialogChrome.StyleWindow(win, 760, 520);
-
-            var grid = new System.Windows.Controls.Grid { Margin = new Thickness(20, 18, 20, 18) };
-            grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = GridLength.Auto });
-            grid.RowDefinitions.Add(new System.Windows.Controls.RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-
-            var title = DialogChrome.PageTitle("下载历史");
-            System.Windows.Controls.Grid.SetRow(title, 0);
-            grid.Children.Add(title);
-
-            var bar = new System.Windows.Controls.StackPanel
-            {
-                Orientation = System.Windows.Controls.Orientation.Horizontal,
-                Margin = new Thickness(0, 8, 0, 12),
-            };
-            var openBtn = DialogChrome.SecondaryButton("打开");
-            var locateBtn = DialogChrome.SecondaryButton("定位");
-            var clearBtn = DialogChrome.DangerButton("清空记录");
-            bar.Children.Add(openBtn);
-            locateBtn.Margin = new Thickness(8, 0, 0, 0);
-            bar.Children.Add(locateBtn);
-            clearBtn.Margin = new Thickness(8, 0, 0, 0);
-            bar.Children.Add(clearBtn);
-            System.Windows.Controls.Grid.SetRow(bar, 1);
-            grid.Children.Add(bar);
-
-            var list = DialogChrome.StyledList();
-            list.FontSize = 12;
-            var listCard = DialogChrome.Card(list);
-            listCard.Padding = new Thickness(0);
-            System.Windows.Controls.Grid.SetRow(listCard, 2);
-            grid.Children.Add(listCard);
-
-            // 每行：时间  状态  大小  名称（"名称"是主键，路径另存）
-            var records = new List<HistoryRecord>();
-            var display = new System.Collections.ObjectModel.ObservableCollection<string>();
-            list.ItemsSource = display;
-
-            Action reload = () =>
-            {
-                records = HistoryStore.GetHistory();
-                display.Clear();
-                foreach (var r in records)
-                {
-                    display.Add(string.Format("{0}   [{1}]   {2}   {3}",
-                        r.Time ?? "", r.Status ?? "", r.Size ?? "", r.Name ?? ""));
-                }
-                if (display.Count == 0)
-                    display.Add("（暂无历史记录）");
-            };
-            reload();
-
-            HistoryRecord Sel()
-            {
-                int i = list.SelectedIndex;
-                return (i >= 0 && i < records.Count) ? records[i] : null;
-            }
-
-            openBtn.Click += (s2, e2) =>
-            {
-                var r = Sel();
-                if (r == null || string.IsNullOrEmpty(r.Path)) { Log("请先选中一条记录"); return; }
-                if (!File.Exists(r.Path)) { Log("文件已不存在：" + r.Path); return; }
-                OpenTaskFileByPath(r.Path);
-            };
-            locateBtn.Click += (s2, e2) =>
-            {
-                var r = Sel();
-                if (r == null || string.IsNullOrEmpty(r.Path)) { Log("请先选中一条记录"); return; }
-                if (!ShellReveal.Reveal(r.Path))
-                    Log("定位失败：" + r.Path);
-            };
-            clearBtn.Click += (s2, e2) =>
-            {
-                var ans = AppDialog.Show(win,
-                    "确定清空全部下载记录吗？（不会删除磁盘上的文件）",
-                    "清空记录", MessageBoxButton.YesNo, MessageBoxImage.Question,
-                    MessageBoxResult.No);
-                if (ans != MessageBoxResult.Yes) return;
-                HistoryStore.ClearHistory();
-                reload();
-                Log("已清空下载历史");
-            };
-
-            win.Content = grid;
-            win.ShowDialog();
         }
 
         /// <summary>按路径打开文件（供历史窗口复用「打开」逻辑）。</summary>
@@ -5052,298 +5529,6 @@ namespace GeZi
             Log("已启动分片自动清扫（阈值 " + PartsSweeper.DefaultMaxAgeDays + " 天）。扫描范围: " + rootSnapshot);
         }
 
-        /// <summary>
-        /// 启动时读取未完成任务记录，让用户决定**逐条/批量续传**，而不是只提示一句。
-        ///
-        /// <para>【为什么改了原来的做法】</para>
-        /// <para>
-        /// 原实现只弹「有 N 个未完成任务，是否打开下载目录？」—— 用户点「是」也只是
-        /// 打开文件夹，要真正继续还得自己重新走一遍解析/选文件的流程，很别扭。
-        /// Python Flet 版在这里是**逐条询问 + 支持一键全部继续**，体验明显更好。
-        /// </para>
-        ///
-        /// <para>【续传怎么做到的】</para>
-        /// <para>
-        /// 直链带时效签名，重启后必然失效，所以必须**重新取链**。为此
-        /// <see cref="PendingTask"/> 补齐了 fid / token / 分享上下文（见其注释），
-        /// 使这里可以脱离界面上下文重走「取链 → 入队」。分片与 .qmeta 都在原地，
-        /// 下载器会自动接着下，不会重下已完成的部分。
-        /// </para>
-        ///
-        /// <para>【安全阀】</para>
-        /// <para>
-        /// 批量续传会一次性打出若干取链请求 —— 与"一次误选几万个文件"是同类风险。
-        /// 因此数量超过 <see cref="ConfirmThreshold"/> 时先让用户确认；
-        /// 无法续传的（免转存/信息不全）单独列出并说明，不会静默丢弃。
-        /// </para>
-        /// </summary>
-        private void ShowPendingOnStartup()
-        {
-            List<PendingTask> all;
-            try { all = HistoryStore.GetPending(); }
-            catch { return; }
-            if (all == null || all.Count == 0)
-                return;
-
-            foreach (var p in all)
-                Log("  - " + p.Name + "  [" + (p.Status ?? "") + "]");
-
-            var resumable = all.Where(p => p != null && p.CanResume).ToList();
-            var notResumable = all.Where(p => p == null || !p.CanResume).ToList();
-
-            var dlg = new Window
-            {
-                Owner = this,
-                Title = "未完成的任务",
-                ResizeMode = ResizeMode.CanResize,
-            };
-            DialogChrome.StyleWindow(dlg, 600, 480);
-
-            var root = new Grid { Margin = new Thickness(20, 18, 20, 18) };
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-
-            var title = DialogChrome.PageTitle("未完成的任务");
-            Grid.SetRow(title, 0);
-            root.Children.Add(title);
-
-            var head = DialogChrome.Hint(string.Format(
-                "上次有 {0} 个任务未完成，其中 {1} 个可以继续下载。\n"
-                + "勾选后点「继续下载」会重新获取直链并接着已下载的部分继续（不会重下）。",
-                all.Count, resumable.Count), 0, 12);
-            Grid.SetRow(head, 1);
-            root.Children.Add(head);
-
-            // 【2026-10-03 用户反馈】「续传界面的文件前面有个对勾太误导人了，
-            //  让人以为已经自动勾选了」。
-            //  原来是在 Display 字符串前面拼了一个 "✓"（表示"可续传"），可它长得
-            //  就像"已勾选"；再加上 ListBox 的选中蓝底，整行看起来就是"已经选好了"，
-            //  于是用户以为可以直接点「继续下载」，结果按钮是灰的（一个都没真勾上）。
-            //  → 换成**真正的复选框**：默认全部不勾，勾选态与按钮可用性直接联动。
-            var wrappers = new List<PendingRow>();
-            foreach (var p in all) wrappers.Add(new PendingRow(p));
-
-            var selAll = DialogChrome.SecondaryButton("全选可续传");
-            var resumeBtn = DialogChrome.PrimaryButton("继续下载");
-            var discardBtn = DialogChrome.DangerButton("丢弃这些任务");
-            var closeBtn = DialogChrome.SecondaryButton("稍后再说");
-
-            // 用 ListBox + 复选（ItemsSource 为包装对象，便于双向绑定 IsChecked）
-            var box = new ListBox
-            {
-                SelectionMode = SelectionMode.Single,
-                BorderThickness = new Thickness(0),
-                Padding = new Thickness(4),
-            };
-            var plainStyle = TryFindResource("PlainListBox") as Style;
-            if (plainStyle != null) box.Style = plainStyle;
-            // ⚠️ **必须**给 ItemTemplate：ListBox 的项没有模板时会调 ToString()，
-            //    而 PendingRow 没重写它 → 用户看到一列
-            //    「GeZi.MainWindow+PendingRow」（用户反馈：「续传的时候为什么都
-            //    显示同样的东西，不应该显示需要续传的文件名吗」）。
-            box.ItemTemplate = BuildPendingRowTemplate();
-            foreach (var w in wrappers) box.Items.Add(w);
-
-            var boxCard = DialogChrome.Card(box);
-            boxCard.Padding = new Thickness(0);
-            Grid.SetRow(boxCard, 2);
-            root.Children.Add(boxCard);
-
-            var btns = DialogChrome.ButtonRow(selAll, resumeBtn, discardBtn, closeBtn);
-            btns.Margin = new Thickness(0, 14, 0, 0);
-            Grid.SetRow(btns, 3);
-            root.Children.Add(btns);
-
-            dlg.Content = root;
-
-            // 【用户反馈】「没勾任何文件时『继续下载』是灰的，用不了」。
-            // 这个禁用态本身是对的（一个都没勾时点它没有任何意义），
-            // 真正的问题是上面那个假对勾让人以为已经勾好了 —— 现在换成真复选框，
-            // 并让按钮状态**实时跟着勾选走**：勾一个立刻变亮，全取消立刻变灰。
-            Action syncResumeBtn = () =>
-            {
-                resumeBtn.IsEnabled = wrappers.Any(w => w.IsChecked && w.CanResume);
-            };
-            foreach (var w in wrappers)
-            {
-                w.PropertyChanged += (s, e) =>
-                {
-                    if (e.PropertyName == nameof(PendingRow.IsChecked)) syncResumeBtn();
-                };
-            }
-            syncResumeBtn();
-
-            bool doResume = false;
-            bool doDiscard = false;
-
-            selAll.Click += (s, e) =>
-            {
-                foreach (var w in wrappers)
-                    if (w.CanResume) w.IsChecked = true;
-            };
-            resumeBtn.Click += (s, e) => { doResume = true; dlg.DialogResult = true; };
-            discardBtn.Click += (s, e) => { doDiscard = true; dlg.DialogResult = true; };
-            closeBtn.Click += (s, e) => { dlg.DialogResult = false; };
-
-            // 默认**一个都不勾**（原来是"全部设 false"，效果一样，但写在这里容易被
-            // 误读成"有默认勾选"）。勾选完全交给用户，按钮状态跟着走。
-            syncResumeBtn();
-
-            dlg.ShowDialog();
-
-            if (doDiscard)
-            {
-                // 丢弃 = 清 pending + 清该任务的全部本地残留
-                //（分片目录 / 续传元数据 / **未下完的目标文件**；网盘上的文件保留）。
-                //
-                // 【2026-10-03 用户反馈】「丢弃这些任务的时候不会删除分片和对应的其他文件」。
-                //  这里补两处：
-                //   ① 原来只删分片目录与 .qmeta，**没删目标文件** —— 而共写模式的目标文件
-                //      是预分配的满尺寸文件（可能是几百 MB 的空洞文件），留着最占地方；
-                //   ② 原来 `TryDeletePath` 静默吞异常、`n++` 无条件自增，
-                //      于是"删失败"和"删成功"在日志里长得一模一样 —— 用户报的正是
-                //      "删没删不知道"。现在分开统计成功/失败，并把失败情况写进日志。
-                int n = 0, failed = 0;
-                long freed = 0;
-                var roots = AllPartsRoots();
-                foreach (var p in all)
-                {
-                    if (p == null) continue;
-                    bool anyFail = false;
-                    try
-                    {
-                        foreach (string path in SegmentedDownloader.EnumeratePartialPaths(p.Dest, roots))
-                        {
-                            if (!Directory.Exists(path) && !File.Exists(path)) continue;
-                            freed += PathSizeSafe(path);
-                            TryDeletePath(path);
-                            if (Directory.Exists(path) || File.Exists(path)) anyFail = true;
-                        }
-                        // 目标文件本身（未下完的残件）
-                        if (!string.IsNullOrEmpty(p.Dest) && File.Exists(p.Dest))
-                        {
-                            freed += PathSizeSafe(p.Dest);
-                            try { File.Delete(p.Dest); } catch { }
-                            if (File.Exists(p.Dest)) anyFail = true;
-                        }
-                    }
-                    catch { anyFail = true; }
-
-                    if (anyFail) failed++;
-                    else n++;
-                }
-                HistoryStore.ClearPending();
-                _pendingSig = null;
-                Log(failed == 0
-                    ? string.Format("已丢弃 {0} 个未完成任务，本地残留已清理（释放 {1}），网盘文件保留。",
-                        n, Util.FormatSize(freed))
-                    : string.Format("已丢弃 {0} 个未完成任务（释放 {1}）；其中 {2} 个有文件正被占用未能删除，"
-                        + "下次启动的自动清扫会兜底回收。网盘文件保留。",
-                        n + failed, Util.FormatSize(freed), failed));
-                return;
-            }
-
-            if (!doResume)
-            {
-                Log("未完成的任务已保留记录，稍后可从下载页重新下载（分片在，会自然续传）。");
-                return;
-            }
-
-            var chosen = wrappers.Where(w => w.IsChecked && w.CanResume)
-                                 .Select(w => w.Task).ToList();
-            if (chosen.Count == 0)
-            {
-                Log("没有勾选任何可续传的任务。");
-                return;
-            }
-
-            if (chosen.Count > ConfirmThreshold)
-            {
-                var ans = AppDialog.Show(this,
-                    string.Format("将续传 {0} 个任务，会一次性发出相应数量的取链请求。\n\n确认继续吗？",
-                        chosen.Count),
-                    "确认续传", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No);
-                if (ans != MessageBoxResult.Yes)
-                {
-                    Log("已取消批量续传。");
-                    return;
-                }
-            }
-
-            Log(string.Format("开始续传 {0} 个任务…", chosen.Count));
-            Tabs.SelectedIndex = 1;
-            _ = ResumePendingBatchAsync(chosen);
-        }
-
-        /// <summary>
-        /// 续传列表的行模板：**真正的复选框** + 文件名（+ 大小 / 不可续传的说明）。
-        ///
-        /// <para>【为什么不用 DisplayMemberPath】</para>
-        /// <para>
-        /// 原来用 <c>DisplayMemberPath = "Display"</c>，只能在文字里拼一个 "✓" 冒充勾选态，
-        /// 用户明确反馈「文件前面有个对勾太误导人了，让人以为已经自动勾选了」。
-        /// 换成 ItemTemplate 才能放真的 CheckBox，并把勾选态双向绑回 PendingRow.IsChecked
-        /// （「继续下载」按钮的可用性就是靠它驱动的）。
-        /// </para>
-        /// </summary>
-        private DataTemplate BuildPendingRowTemplate()
-        {
-            var cb = new FrameworkElementFactory(typeof(CheckBox));
-            var st = TryFindResource("AppCheckBox") as Style;
-            if (st != null) cb.SetValue(FrameworkElement.StyleProperty, st);
-            cb.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-            cb.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Left);
-            // 不可续传的行：复选框置灰（文案里已说明原因）
-            cb.SetBinding(UIElement.IsEnabledProperty,
-                new Binding("CanResume") { Mode = BindingMode.OneWay });
-            cb.SetBinding(ToggleButton.IsCheckedProperty,
-                new Binding("IsChecked")
-                {
-                    Mode = BindingMode.TwoWay,
-                    UpdateSourceTrigger = UpdateSourceTrigger.PropertyChanged,
-                });
-            cb.SetBinding(ContentControl.ContentProperty, new Binding("Display"));
-
-            return new DataTemplate { VisualTree = cb };
-        }
-
-        /// <summary>续传对话框里的一行（带勾选）。</summary>
-        private sealed class PendingRow : INotifyPropertyChanged
-        {
-            public PendingTask Task { get; }
-            private bool _checked;
-            public bool IsChecked
-            {
-                get => _checked;
-                set { _checked = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsChecked))); }
-            }
-            public string Display { get; }
-            public bool CanResume => Task != null && Task.CanResume;
-
-            public PendingRow(PendingTask t)
-            {
-                Task = t;
-                // 一行要能一眼看出"这是哪个文件、多大、能不能接着下"。
-                // 【用户反馈 2026-10-03】原来这里在文件名前面拼了一个 "✓"/"✕"，
-                // 那是"能不能续传"的标记，却长得就像"已经勾选" —— 用户以为文件被
-                // 自动勾上了，于是点了「继续下载」却发现按钮是灰的。
-                // 现在前缀去掉：能不能续传看**复选框是否可用**（不可续传的复选框置灰），
-                // 以及后面那句说明；勾选与否完全由用户点复选框决定。
-                string size = (t != null && t.Size > 0) ? "   " + Util.FormatSize(t.Size) : "";
-                string why = CanResume ? "" : "   （信息不全，需重新下载）";
-                Display = (t?.Name ?? "(未知)") + size + why;
-            }
-
-            public event PropertyChangedEventHandler PropertyChanged;
-
-            // ListBoxItem 的**无障碍名**取的是数据项的 ToString()（即使设了
-            // DisplayMemberPath，容器元素的名字仍走这条），不重写的话屏幕阅读器/
-            // UIA 读到的还是「GeZi.MainWindow+PendingRow」。
-            public override string ToString() { return Display; }
-        }
-
         /// <summary>删除文件或目录，失败静默（供丢弃续传用）。</summary>
         private static void TryDeletePath(string path)
         {
@@ -5503,7 +5688,15 @@ namespace GeZi
                 }
 
                 foreach (var job in jobs)
+                {
+                    // 去重：任务页里可能已经有一条"上次恢复出来的占位行"（Dormant），
+                    // 续传成功后要把它换掉，不能并存两行。
+                    var stale = _tasks.FirstOrDefault(x => x.Dormant && x.Job != null
+                        && string.Equals(x.Job.Dest, job.Dest, StringComparison.OrdinalIgnoreCase));
+                    if (stale != null)
+                        _tasks.Remove(stale);
                     AddTaskItem(new TaskItem(job, job.Name));
+                }
                 Log("已续传 " + jobs.Count + " 个任务。");
                 RunJobs(jobs);
             }
@@ -5697,6 +5890,9 @@ namespace GeZi
                 SyncThemeRadios();
                 // 任务列表排序偏好 → 同步工具栏那颗切换按钮的文案与图标
                 UpdateTaskSortButton();
+                // 任务列表展示方式（文件夹分组 / 平铺）→ 应用分组 + 同步按钮
+                ApplyTaskGrouping();
+                UpdateTaskViewButton();
             }
             finally
             {
@@ -7234,6 +7430,11 @@ namespace GeZi
 
         private void OnTabsSelectionChanged(object sender, SelectionChangedEventArgs e)
         {
+            // 切走「任务」页时顺手退出删除选择模式：否则回来会看到一个还亮着的提示条，
+            // 而用户此时并没有在选东西。
+            if (_taskSelectMode && Tabs.SelectedIndex != 1)
+                ExitTaskSelectMode();
+
             if (_syncingNav)
                 return;
             try

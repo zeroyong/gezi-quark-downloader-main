@@ -157,6 +157,25 @@ namespace GeZi
         ///    额外记一个"写过没有"的标记。
         /// </summary>
         public bool TaskNewestFirst { get; set; }
+
+        /// <summary>
+        /// 任务列表的展示方式（2026-10-13 新增）：文件夹分组 / 平铺（一个个文件）。
+        /// 用户要求「选择要记忆」，所以落盘。
+        ///
+        /// ⚠️ 枚举的 0 值刻意是 <see cref="TaskViewMode.Grouped"/>：XmlSerializer
+        ///    反序列化**不执行字段初始化器**，老配置里没有这个节点时就是 default = 0，
+        ///    正好等于"默认按文件夹分组、展开"。
+        /// </summary>
+        public TaskViewMode TaskView { get; set; } = TaskViewMode.Grouped;
+    }
+
+    /// <summary>任务列表展示方式。</summary>
+    public enum TaskViewMode
+    {
+        /// <summary>一个下载文件夹 = 一个可展开/收起的分组（默认）。</summary>
+        Grouped = 0,
+        /// <summary>全部任务平铺，一个文件一行。</summary>
+        Flat = 1,
     }
 
     /// <summary>主窗口「关闭」按钮的行为。</summary>

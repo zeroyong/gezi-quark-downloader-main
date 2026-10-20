@@ -29,6 +29,15 @@ namespace GeZi
         /// <summary>是否已写入下载历史。终态只记一次，防止重复上报把历史刷屏。</summary>
         public bool HistoryRecorded { get; set; }
 
+        /// <summary>
+        /// 这一行是**从上次运行的任务快照恢复**出来的、没有挂到调度器上（2026-10-13 新增）。
+        ///
+        /// 已完成的任务：只作为记录/播放/定位/删除的入口。
+        /// 未完成的任务：显示为「已暂停」并保留上次进度，点 ▶ 才走"重新取链 → 续传"，
+        /// 见 <c>MainWindow.ResumeTask</c> 里的 Dormant 分支。
+        /// </summary>
+        public bool Dormant { get; set; }
+
         private static long _nextSeq;
 
         /// <summary>
@@ -40,6 +49,34 @@ namespace GeZi
         /// 越新加入的任务 Seq 越大 ⇒ 倒序排列即"新任务在前"。
         /// </summary>
         public long Seq { get; }
+
+        /// <summary>
+        /// 「单独选择的文件」这一组的名字。
+        /// 没经过文件夹的任务（直接勾选文件下载）归到这一组，避免它们被硬塞进
+        /// 某个真实文件夹名下。
+        /// </summary>
+        public const string SingleFileGroupName = "单独选择的文件";
+
+        /// <summary>
+        /// 任务所属的**顶层文件夹名**（任务页「文件夹分组」用，2026-10-13 新增）。
+        ///
+        /// 来源是 <see cref="GeZi.Core.Download.PendingInfo.RelDir"/>：下载文件夹时
+        /// CollectFilesAsync 会把"所选文件夹名"作为最外层前缀写进每个文件的 RelDir，
+        /// 所以取第一段就是用户选中的那个文件夹。多级子目录（A\B）也只取顶层 A ——
+        /// 按子目录再分一层会让分组爆炸，而且用户要的是"这个文件夹下载了多少"。
+        ///
+        /// 空 RelDir（单独勾选的文件）→ <see cref="SingleFileGroupName"/>。
+        /// </summary>
+        public string GroupName
+        {
+            get
+            {
+                string rel = (Job != null && Job.Pending != null) ? (Job.Pending.RelDir ?? "") : "";
+                if (rel.Length == 0) return SingleFileGroupName;
+                int i = rel.IndexOfAny(new[] { '\\', '/' });
+                return i <= 0 ? rel : rel.Substring(0, i);
+            }
+        }
 
         public TaskItem(DownloadJob job, string name)
         {
