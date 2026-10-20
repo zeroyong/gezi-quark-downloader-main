@@ -1022,6 +1022,10 @@ namespace GeZi.Core.Download
                         int n = await stream.ReadAsync(buf, 0, buf.Length, cancel).ConfigureAwait(false);
                         if (n <= 0)
                             break;
+                        // 【2026-10-20 移植】写盘前再查一次暂停：net48 内容流读取不响应取消令牌，
+                        // 暂停那刻在途的读会带数据正常返回；不拦就会继续写盘、进度继续涨。
+                        if (pause != null)
+                            await pause.WaitIfPausedAsync(cancel).ConfigureAwait(false);
                         await fs.WriteAsync(buf, 0, n, cancel).ConfigureAwait(false);
                         done += n;
                         // 节流：单线程路径按 200ms 报一次进度，避免高速下载时 UI 被刷爆
@@ -2684,6 +2688,13 @@ namespace GeZi.Core.Download
                                             int n = await stream.ReadAsync(buf, 0, buf.Length, ioTok).ConfigureAwait(false);
                                             if (n <= 0)
                                                 break;
+                                            // 【2026-10-20 移植】暂停必须在**写盘前**再查一次：
+                                            // net48 下内容流读取**不响应取消令牌**（实测确认，见原仓库同处注释），
+                                            // 暂停那一刻在途的读会带着数据正常返回 —— 若这里不拦，就照样写盘、
+                                            // done 照样涨，用户看到的就是「点了暂停、进度条还在涨、慢慢才停」。
+                                            // 已读到的数据留在 buf 里，恢复后原样写入：不丢、不重复。
+                                            if (pause != null)
+                                                await pause.WaitIfPausedAsync(cancelToken).ConfigureAwait(false);
                                             await wfs.WriteAsync(buf, 0, n, partToken).ConfigureAwait(false);
                                                             written += n;
                                                             part.W = written;
