@@ -21,6 +21,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using GeZi.Core.Update;
 
 namespace GeZi
 {
@@ -78,7 +79,115 @@ namespace GeZi
 
             BuildFeatureList();
 
-            Loaded += (s, e) => DialogChrome.ApplyRoundedCorners(this);
+            Loaded += (s, e) =>
+            {
+                DialogChrome.ApplyRoundedCorners(this);
+                // 启动检查是异步的，可能刚好在构造之后才完成；打开时再刷一次红点
+                RefreshUpdateDot();
+            };
+        }
+
+        // ---------------- 检查更新（GitHub Releases） ----------------
+
+        private bool _checkingUpdate;
+
+        /// <summary>按 UpdateService.HasUpdate 决定「检查更新」旁边的红点。</summary>
+        private void RefreshUpdateDot()
+        {
+            try
+            {
+                UpdateDot.Visibility = UpdateService.HasUpdate
+                    ? Visibility.Visible : Visibility.Collapsed;
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 用户主动点「检查更新」：不节流，结果明确告诉用户（失败也给原因和手动地址）。
+        /// 与启动时的静默检查是两回事。
+        /// </summary>
+        private async void OnCheckUpdateClick(object sender, RoutedEventArgs e)
+        {
+            if (_checkingUpdate) return;
+            _checkingUpdate = true;
+            CheckUpdateBtn.IsEnabled = false;
+            try
+            {
+                var m = await UpdateService.CheckNowAsync();
+
+                if (UpdateService.Settings != null)
+                    UpdateService.Apply(UpdateService.Settings, m, null);
+                RefreshUpdateDot();
+
+                // 有新版本、但之前被忽略过 → 先问要不要恢复提醒
+                if (m != null && UpdateService.CurrentVersion != null
+                    && m.Version.CompareTo(UpdateService.CurrentVersion) > 0
+                    && UpdateService.IsIgnored(m.Version))
+                {
+                    var resume = AppDialog.Show(this,
+                        "你之前忽略了 v" + m.Version + " 的更新提醒。\n\n是否恢复提醒并查看更新？",
+                        "检查更新", MessageBoxButton.YesNo, MessageBoxImage.Information);
+                    if (resume != MessageBoxResult.Yes) return;
+
+                    if (UpdateService.Settings != null)
+                    {
+                        UpdateService.ClearIgnore(UpdateService.Settings);
+                        SettingsStore.Save(UpdateService.Settings);
+                    }
+                    RefreshUpdateDot();
+                }
+
+                if (UpdateService.HasUpdate && m != null)
+                {
+                    OpenUpdatePrompt(m);
+                    RefreshUpdateDot();
+                }
+                else if (UpdateService.Latest != null
+                         && UpdateService.CurrentVersion != null
+                         && UpdateService.Latest.Version.CompareTo(UpdateService.CurrentVersion) > 0)
+                {
+                    AppDialog.Show(this,
+                        "你已忽略 v" + UpdateService.Latest.Version + " 的更新提醒。\n"
+                        + "当前版本仍是 v" + UpdateService.CurrentVersion + "。\n\n"
+                        + "想恢复提醒：再点一次「检查更新」即可。",
+                        "检查更新");
+                }
+                else
+                {
+                    AppDialog.Show(this,
+                        "当前已是最新版本（v"
+                        + (UpdateService.CurrentVersion != null ? UpdateService.CurrentVersion.ToString() : "?")
+                        + "）。",
+                        "检查更新");
+                }
+            }
+            catch (Exception ex)
+            {
+                AppDialog.Show(this,
+                    "检查更新失败：" + ex.Message
+                    + "\n\n你也可以手动打开 Releases 页查看：\n" + UpdateService.ReleasesPageUrl,
+                    "检查更新", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            finally
+            {
+                _checkingUpdate = false;
+                CheckUpdateBtn.IsEnabled = true;
+            }
+        }
+
+        /// <summary>打开「更新详情」窗；用户在窗内明确点「忽略此版本」才落盘。</summary>
+        private void OpenUpdatePrompt(GitHubRelease m)
+        {
+            if (m == null) return;
+
+            var prompt = new UpdatePromptWindow(m) { Owner = this };
+            prompt.ShowDialog();
+
+            if (prompt.IgnoredByUser && UpdateService.Settings != null)
+            {
+                UpdateService.IgnoreCurrent(UpdateService.Settings);
+                SettingsStore.Save(UpdateService.Settings);
+            }
         }
 
         private void BuildFeatureList()

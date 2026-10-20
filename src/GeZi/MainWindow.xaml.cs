@@ -36,6 +36,7 @@ using GeZi.Core.Api;
 using GeZi.Core.Download;
 using GeZi.Core.Models;
 using GeZi.Core.Support;
+using GeZi.Core.Update;
 using System.Text.RegularExpressions;
 
 // 说明：MainWindow 里既有 XAML 生成的字段，也有代码动态构建的窗口（如续传询问、
@@ -327,6 +328,9 @@ namespace GeZi
             _capacityTimer.Start();
 
             _settings = SettingsStore.Load();
+            // 代理策略必须在创建 QuarkClient / 下载器之前写入核心层，
+            // 否则启动时第一次登录仍会按旧值直连。
+            NetworkOptions.UseSystemProxy = _settings.UseSystemProxy;
 
             // 【2026-10-13】把上次的任务列表铺回来（含已完成记录与未完成的进度）。
             // 必须在 LoadSettingsToUi 之前：恢复时要按「新任务在前/在后」重排。
@@ -363,6 +367,8 @@ namespace GeZi
             _scheduler.Log = LogFromWorker;
             _scheduler.Diagnostics = OnDiagnostics;
             LoadSettingsToUi();
+            // 检查更新：注入配置，恢复上次的红点状态（不在这里发网络请求）
+            UpdateService.Attach(_settings);
 
             // 加载完成后再提示未完成任务（此时窗口已就绪，弹窗才有 Owner）
             Loaded += (s, e) =>
@@ -398,6 +404,10 @@ namespace GeZi
                 // ⚠️ 也必须在 Loaded 里：NotifyIcon 需要一个窗口句柄来收任务栏消息，
                 //    而 WPF 窗口句柄到 Loaded 才存在。
                 InitTray();
+
+                // 启动检查更新：静默执行，有新版本只点亮关于页红点 + 弹一次气泡，
+                // 不打断用户；失败（断网/接口不通）什么也不做。
+                _ = UpdateService.RunStartupCheckAsync(_settings, OnUpdateFound);
 
                 // 【2026-10-08】「再点一次 exe 把窗口拉起来」的消息钩子、以及
                 // 「剪贴板自动解析」的监听，都不在这里挂了 —— 它俩都绑在窗口句柄上，
@@ -6008,6 +6018,28 @@ namespace GeZi
         }
 
 
+        // ---------------- 检查更新（GitHub Releases） ----------------
+
+        /// <summary>
+        /// 启动检查确认有新版本后的回调（UI 线程）。
+        /// 只做两件"不抢焦点"的事：应用内气泡 + 日志行；
+        /// 真正的更新详情窗等用户去「关于 → 检查更新」才出现。
+        /// </summary>
+        private void OnUpdateFound(GitHubRelease m)
+        {
+            try
+            {
+                if (m == null) return;
+                string size = m.AssetSize > 0
+                    ? "，" + (m.AssetSize / 1048576.0).ToString("0.0") + " MB"
+                    : "";
+                NotifyToast.Show("发现新版本 v" + m.Version,
+                    "打开「关于」点「检查更新」查看更新说明并下载" + size, null);
+                Log("发现新版本 v" + m.Version + "（" + m.TagName + "）— 可在「关于」页点击「检查更新」。");
+            }
+            catch { }
+        }
+
         // ---------------- 播放器探测（边下边播用） ----------------
 
         /// <summary>刷新设置页的播放器状态文案（同步版，供启动阶段调用）。</summary>
@@ -6184,6 +6216,7 @@ namespace GeZi
                 ConcurrentBox.Text = _settings.ConcurrentTasks.ToString();
                 OutDirBox.Text = _settings.OutDir;
                 AutoCleanCheck.IsChecked = _settings.AutoClean;
+                SystemProxyCheck.IsChecked = _settings.UseSystemProxy;
                 // 写入方式改成两张可点击的卡片（下拉框已删）
                 WriteModeSegmentedRadio.IsChecked = _settings.WriteMode == WriteMode.SegmentedFiles;
                 WriteModeSharedRadio.IsChecked = _settings.WriteMode != WriteMode.SegmentedFiles;
@@ -6353,6 +6386,8 @@ namespace GeZi
                 // 外部播放器（VLC）会把它当 URL 协议头而打不开（2026-10-04 实测）。
                 _settings.OutDir = NormalizeDir(OutDirBox.Text);
                 _settings.AutoClean = AutoCleanCheck.IsChecked == true;
+                _settings.UseSystemProxy = SystemProxyCheck.IsChecked == true;
+                NetworkOptions.UseSystemProxy = _settings.UseSystemProxy;
                 _settings.WriteMode = WriteModeSegmentedRadio.IsChecked == true
                     ? WriteMode.SegmentedFiles : WriteMode.SharedFile;
                 // 分片根目录变了 → 把**旧值**记入历史清单，否则旧目录里的残留分片

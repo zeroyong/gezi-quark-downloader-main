@@ -1674,6 +1674,14 @@
                                               Content="下载完成后自动清理云盘转存文件"
                                               Style="{StaticResource AppCheckBox}"
                                               Click="OnSettingChanged"/>
+
+                                    <!-- 跟随系统代理：默认关闭（直连），公司网络/只能经代理出口时才开 -->
+                                    <CheckBox x:Name="SystemProxyCheck"
+                                              Content="跟随系统代理"
+                                              Style="{StaticResource AppCheckBox}"
+                                              Margin="0,8,0,0"
+                                              Click="OnSettingChanged"
+                                              ToolTip="默认直连。只有公司网络或必须经代理上网时才需要开启；只影响此后新建的连接（重新登录 / 新建任务后生效）。"/>
                                 </StackPanel>
                             </Border>
 

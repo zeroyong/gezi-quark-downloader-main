@@ -67,15 +67,11 @@ namespace GeZi.Core.Support
                 AutomaticDecompression = decompression,
                 // 复用连接：保持 TCP/TLS 会话，减少重复握手
                 MaxConnectionsPerServer = 128,
-                // 默认不读 Windows 系统代理(WinINET)。原因：
-                //   1) 与 Python Flet 版行为一致（urllib 不读系统代理）；
-                //   2) 本机代理软件常把请求劫持到 127.0.0.1，导致夸克接口失败；
-                //   3) 代理会改变 TLS ClientHello，而 pan.quark.cn 的 WAF
-                //      对指纹敏感，走代理可能直接被拒。
-                // 需要走代理的用户可设 UseSystemProxy = true（在构造后、首次请求前）。
-                Proxy = null,
-                UseProxy = false,
             };
+            // 代理策略统一交给 NetworkOptions：默认**直连**（理由见 NetworkOptions 注释），
+            // 只有用户在设置里显式打开「跟随系统代理」才读 WinINET 设置。
+            // ⚠️ 必须在首次请求之前调用（构造 handler 后立即执行即可）。
+            NetworkOptions.ApplyTo(_handler);
             _http = new HttpClient(_handler) { Timeout = Timeout.InfiniteTimeSpan };
             _gate = new SemaphoreSlim(1, 1);
         }

@@ -527,17 +527,12 @@ namespace GeZi.Core.Download
                 CookieContainer = _jar,
                 AllowAutoRedirect = true,
                 AutomaticDecompression = DecompressionMethods.None,
-                // 关键：.NET Framework 下这里不显式设置，会退回 ServicePoint 的
-                // DefaultConnectionLimit（受"全局连接预算"约束）。线程数调高后
-                // 连接池必须同步放开，否则线程再高也只能干等空位。
+                // 连接池必须随线程数放开，否则线程再高也只能干等空位
                 MaxConnectionsPerServer = Math.Max(1024, _threads * 2),
-                // 显式关闭代理。默认 HttpClientHandler 会读取 Windows 系统代理(WinINET)，
-                // 而直链下载是到夸克 CDN 的大流量长连接：一旦被本机代理(如某些
-                // VPN/抓包/加速器)接管，轻则限速重则连接被劫持到 127.0.0.1 失败。
-                // Python Flet 版用 urllib 不读系统代理，这里保持一致行为。
-                Proxy = null,
-                UseProxy = false,
             };
+            // 代理策略统一交给 NetworkOptions：默认直连（避免本机代理/抓包工具
+            // 接管 CDN 长连接），设置页显式开启「跟随系统代理」时才读 WinINET。
+            NetworkOptions.ApplyTo(handler);
             _http = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
         }
 

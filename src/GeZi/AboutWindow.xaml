@@ -59,9 +59,24 @@
                         <StackPanel Margin="14,0,0,0" VerticalAlignment="Center">
                             <TextBlock Text="鸽子下载" FontSize="19" FontWeight="SemiBold"
                                        Foreground="{DynamicResource TextPrimaryBrush}"/>
-                            <TextBlock x:Name="VersionText" Text="夸克网盘 · 直链助手"
-                                       FontSize="11" Margin="0,3,0,0"
-                                       Foreground="{DynamicResource TextTertiaryBrush}"/>
+                            <StackPanel Orientation="Horizontal" Margin="0,3,0,0">
+                                <TextBlock x:Name="VersionText" Text="夸克网盘 · 直链助手"
+                                           FontSize="11"
+                                           VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                <Button x:Name="CheckUpdateBtn" Content="检查更新"
+                                        Click="OnCheckUpdateClick"
+                                        AutomationProperties.Name="检查更新"
+                                        Style="{StaticResource GhostButton}"
+                                        FontSize="10.5" Height="21" Padding="7,0"
+                                        Margin="10,0,0,0"
+                                        ToolTip="从 GitHub Releases 检查新版本"/>
+                                <Ellipse x:Name="UpdateDot" Width="6" Height="6"
+                                         Margin="6,0,0,0" VerticalAlignment="Center"
+                                         Fill="{DynamicResource DangerBrush}"
+                                         Visibility="Collapsed"
+                                         ToolTip="有新版本"/>
+                            </StackPanel>
                             <TextBlock Text="分享转存 · 直链解析 · 高速下载"
                                        FontSize="11" Margin="0,1,0,0"
                                        Foreground="{DynamicResource TextTertiaryBrush}"/>

@@ -113,6 +113,26 @@ namespace GeZi
         public CloseAction OnCloseButton { get; set; } = CloseAction.Ask;
 
         /// <summary>
+        /// 是否跟随 Windows 系统代理（WinINET 设置，含 PAC）。
+        /// 默认 false = 直连，与旧版本行为完全一致：本机代理软件常把夸克接口劫持到
+        /// 127.0.0.1，且代理会改变 TLS 指纹，可能直接触发 WAF。
+        /// 只有公司网络/只能经代理出口的环境才需要打开。
+        /// ⚠️ 只影响**此后新建**的连接：改完要重新登录/新建任务才生效。
+        /// </summary>
+        public bool UseSystemProxy { get; set; }
+
+        // ---------------- 检查更新（GitHub Releases） ----------------
+
+        /// <summary>上次检查更新的时刻（DateTime.Ticks，本地时间）。0 = 从没查过。</summary>
+        public long UpdateLastCheckTicks { get; set; }
+
+        /// <summary>上次查到的最新版本号（"2.7.3"）；空 = 没有待提示的更新。</summary>
+        public string UpdateLatestVersion { get; set; }
+
+        /// <summary>用户点过「忽略此版本」的版本号。</summary>
+        public string UpdateIgnoredVersion { get; set; }
+
+        /// <summary>
         /// 小窗左上角坐标。⚠️ 必须配 <see cref="MiniPosSet"/> 用：
         /// XmlSerializer 反序列化不跑字段初始化器，老配置里缺这个节点时值是 0
         /// （而不是 NaN），光看 0 分不清"没摆过"还是"就摆在 (0,0)"。
