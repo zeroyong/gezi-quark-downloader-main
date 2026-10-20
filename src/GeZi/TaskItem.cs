@@ -401,10 +401,9 @@ namespace GeZi
         {
             get
             {
-                // 完成态由 XAML 的 DataTrigger 单独显示「已完成」，这里不再重复
-                if (State == JobState.Completed) return "";
-
-                // 只在"真正在下载"时估算：暂停/失败/取消时速度是 0 或无意义
+                // 【2026-10-20 用户反馈】只在**下载中**才显示剩余时间。
+                // 已完成/暂停/排队时整列在 XAML 里 Collapsed —— 否则会白占宽度，
+                // 把进度条越挤越短（用户实测：「进度条越来越短」）。
                 if (State != JobState.Downloading) return "";
 
                 if (_total <= 0 || _done >= _total) return "";

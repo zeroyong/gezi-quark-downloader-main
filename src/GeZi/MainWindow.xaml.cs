@@ -669,6 +669,10 @@ namespace GeZi
         {
             try
             {
+                // 【2026-10-20】顺手刷新关机提示条里的「预计 X 后」——
+                // 它随总速度变化，跟进度日志同一个节拍（每 10 秒）正好。
+                if (_shutdownAfterAll) RefreshShutdownPill();
+
                 var active = _tasks.Where(t => t.State == JobState.Downloading
                                             || t.State == JobState.Queued
                                             || t.State == JobState.Paused
@@ -4331,26 +4335,111 @@ namespace GeZi
             }
         }
 
-        /// <summary>按当前状态刷新关机胶囊的外观（底与边框、文字颜色）。</summary>
+        /// <summary>
+        /// 按当前状态刷新关机胶囊与提示条（对齐方案 A 的视觉）。
+        ///
+        /// <para>开启时三处联动：
+        /// ① 胶囊整块变警告色底、文字转警告色、迷你开关滑到右侧并变警告色；
+        /// ② 工具栏下方出现黄色提示条「已开启：全部任务完成后将自动关机（预计 X 后）」；
+        /// ③ 提示条右侧「取消」可一键关掉。</para>
+        /// </summary>
         private void RefreshShutdownPill()
         {
             try
             {
                 if (ShutdownPill == null) return;
+
                 // 用 Tag 驱动 Styles.xaml 里的 DataTrigger（"on" = 开启态）
                 ShutdownPill.Tag = _shutdownAfterAll ? "on" : null;
+
+                var warning = (System.Windows.Media.Brush)FindResource("WarningBrush");
+                var secondary = (System.Windows.Media.Brush)FindResource("TextSecondaryBrush");
+                var tertiary = (System.Windows.Media.Brush)FindResource("TextTertiaryBrush");
+
                 if (ShutdownLabel != null)
                 {
+                    // 文案与方案 A 一致：关闭「完成后关机」/ 开启「已开启关机」
                     ShutdownLabel.Text = _shutdownAfterAll ? "已开启关机" : "完成后关机";
-                    ShutdownLabel.Foreground = _shutdownAfterAll
-                        ? (System.Windows.Media.Brush)FindResource("WarningBrush")
-                        : (System.Windows.Media.Brush)FindResource("TextSecondaryBrush");
+                    ShutdownLabel.Foreground = _shutdownAfterAll ? warning : secondary;
                 }
+
+                // 迷你开关本体：开启 → 警告色底 + 白点靠右；关闭 → 凹槽底 + 灰点靠左
+                if (ShutdownSw != null)
+                {
+                    ShutdownSw.Background = _shutdownAfterAll
+                        ? warning
+                        : (System.Windows.Media.Brush)FindResource("SurfaceSunkenBrush");
+                    ShutdownSw.BorderBrush = _shutdownAfterAll
+                        ? warning
+                        : (System.Windows.Media.Brush)FindResource("BorderBrush");
+                }
+                if (ShutdownSwKnob != null)
+                {
+                    ShutdownSwKnob.HorizontalAlignment = _shutdownAfterAll
+                        ? System.Windows.HorizontalAlignment.Right
+                        : System.Windows.HorizontalAlignment.Left;
+                    ShutdownSwKnob.Margin = _shutdownAfterAll
+                        ? new Thickness(0, 0, 2, 0)
+                        : new Thickness(2, 0, 0, 0);
+                    ShutdownSwKnob.Background = _shutdownAfterAll
+                        ? System.Windows.Media.Brushes.White
+                        : tertiary;
+                }
+
                 ShutdownPill.ToolTip = _shutdownAfterAll
                     ? "已开启：全部任务下载完成后自动关机。再点一次取消。"
                     : "全部任务下载完成后自动关机";
+
+                // ---- 提示条 ----
+                if (ShutdownNote != null)
+                {
+                    ShutdownNote.Visibility = _shutdownAfterAll
+                        ? System.Windows.Visibility.Visible
+                        : System.Windows.Visibility.Collapsed;
+                }
+                if (_shutdownAfterAll && ShutdownNoteText != null)
+                {
+                    string eta = FormatRemainingTotalEta();
+                    ShutdownNoteText.Text = string.IsNullOrEmpty(eta)
+                        ? "已开启：全部任务完成后将自动关机。"
+                        : "已开启：全部任务完成后将自动关机（预计 " + eta + " 后）。";
+                }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 汇总当前所有"下载中"任务的合计剩余时间（用于关机提示条的「预计 X 后」）。
+        ///
+        /// <para>【为什么是"最大剩余"而不是"求和"】多个任务并发下载时它们同时结束，
+        /// 总耗时取决于**最慢的那个**，不是各自相加。求和会给出一个虚高的数字。</para>
+        /// <para>没有在跑的任务时返回空串（调用方会退化成不带预计时间的文案）。</para>
+        /// </summary>
+        private string FormatRemainingTotalEta()
+        {
+            try
+            {
+                double maxSeconds = 0;
+                bool any = false;
+                foreach (var t in _tasks)
+                {
+                    if (t.State != JobState.Downloading) continue;
+                    if (t.Total <= 0 || t.Done >= t.Total) continue;
+                    if (t.Speed <= 1024) continue;
+                    double s = (t.Total - t.Done) / t.Speed;
+                    if (s <= 0) continue;
+                    if (s > maxSeconds) maxSeconds = s;
+                    any = true;
+                }
+                return any ? TaskItem.FormatEta(maxSeconds) : "";
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>提示条上的「取消」：关掉完成后关机。</summary>
+        private void OnCancelShutdownAfterAll(object sender, RoutedEventArgs e)
+        {
+            SetShutdownAfterAll(false, announce: true);
         }
 
         /// <summary>
