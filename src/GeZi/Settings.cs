@@ -228,6 +228,86 @@ namespace GeZi
         /// 这样既兼容老配置，也不用在这里写死一个会随界面设计变动而失效的数字。</para>
         /// </summary>
         public double LogPanelHeight { get; set; }
+
+        /// <summary>
+        /// 任务页：同一文件夹分组内，是否把**未完成的文件排在前面**（2026-10-21 新增）。
+        ///
+        /// <para>【为什么需要】用户反馈「假如有多个文件在文件夹下，应该优先展示未完成的文件，
+        /// 因为有时候需要滚动到底部才发现」—— 一个文件夹下几十个文件时，
+        /// 已完成的和正在下的混在一起，想找"还在下的那几个"得往下翻。</para>
+        ///
+        /// <para>【排序规则】未完成（下载中 / 排队 / 暂停 / 取消中）在前，
+        /// 已完成 / 失败 / 已取消在后；两组内部再按原有的"新任务在前 / 在后"偏好排。
+        /// 这样既满足"未完成的优先看到"，又不破坏用户已经习惯的时间序。</para>
+        ///
+        /// <para>⚠️ 默认 false：XmlSerializer 不执行字段初始化器，老配置里没这个节点
+        /// 就是 false = 保持原有排序行为，不会让老用户觉得列表突然乱序。</para>
+        /// </summary>
+        public bool TaskUnfinishedFirst { get; set; }
+
+        // ---------------- 下载页「上次浏览位置」（2026-10-21 新增） ----------------
+        //
+        // 【需求】用户反馈「每次重启启动应用，下载页都会重置，能否保留上次的浏览文件位置，
+        //        方便继续浏览（包括打开文件的层级）」。选型为方案 A：
+        //        只记住"目录层级"（模式 + 分享标识 + 路径链 + fid 链），
+        //        重启后自动重新加载该层，**不缓存文件列表本体**。
+        //
+        // 【为什么只存层级、不存列表】
+        //   · 列表可能几千项，序列化进 config.xml 会让设置文件膨胀到几 MB，读写都变慢；
+        //   · 存下来的列表一定是"旧"的，用户看到过期内容反而困惑；
+        //   · 重新请求一次就能拿到最新数据，代价只是一次网络往返（本来启动也要拉目录）。
+        //
+        // 【失效处理】分享过期 / 网盘里被删 / 未登录 → 静默回退到根目录，只在日志里记一行。
+
+        /// <summary>
+        /// 上次是否在「分享链接」模式（false = 「我的网盘」）。
+        /// <para>启动时据此决定要不要恢复分享面板与 ParseBtn 的默认模式。</para>
+        /// </summary>
+        public bool LastBrowseWasShare { get; set; }
+
+        /// <summary>上次浏览的分享 ID（仅分享模式有意义，对应 URL 里的 /s/&lt;pwd_id&gt;）。</summary>
+        public string LastSharePwdId { get; set; }
+
+        /// <summary>上次浏览的分享提取码（可能为空）。</summary>
+        public string LastSharePasscode { get; set; }
+
+        /// <summary>上次浏览的分享起点 fid（分享链接自带的子目录入口，通常是 "0"）。</summary>
+        public string LastShareStartFid { get; set; }
+
+        /// <summary>
+        /// 上次浏览的目录 fid（当前层）。
+        /// <para>网盘模式下这是 DriveFid；分享模式下这是分享内的 fid。</para>
+        /// </summary>
+        public string LastBrowseFid { get; set; }
+
+        /// <summary>
+        /// 从根到当前层的**祖先 fid 链**，顺序为 [根, …, 上一层]（不含当前层）。
+        /// <para>用它可以在恢复时重建 <c>_fidStack</c> 与面包屑；
+        /// 只存当前 fid 是不够的 —— "上一级"和面包屑都要靠这条链。</para>
+        /// </summary>
+        public List<string> LastBrowseFidChain { get; set; } = new List<string>();
+
+        /// <summary>
+        /// 从根到当前层的**目录名链**，顺序为 [第一层, …, 当前层]（不含根），
+        /// 与 <see cref="LastBrowseFidChain"/> 逐项对齐（链长关系见代码注释）。
+        /// </summary>
+        public List<string> LastBrowseNameChain { get; set; } = new List<string>();
+
+        /// <summary>
+        /// 启动时是否自动恢复上次的浏览位置（2026-10-21 新增，默认开启）。
+        ///
+        /// <para>⚠️ 默认 true 需要特殊处理：XmlSerializer 反序列化**不执行字段初始化器**，
+        /// 老配置里没有这个节点时是 default(bool) = false，会把功能误关掉。
+        /// 所以照抄 <see cref="ClipboardAutoParse"/> 的做法 —— 配一个
+        /// <see cref="RestoreBrowseSet"/> 标记，在 Load 阶段判定"从没设过 → 按默认开"。</para>
+        /// </summary>
+        public bool RestoreBrowseOnStartup { get; set; } = true;
+
+        /// <summary>
+        /// <see cref="RestoreBrowseOnStartup"/> 是否已经落过盘。
+        /// <para>用于区分"用户主动关掉了"与"老配置里没这个节点"——两者反序列化后都是 false。</para>
+        /// </summary>
+        public bool RestoreBrowseSet { get; set; }
     }
 
     /// <summary>任务列表展示方式。</summary>
@@ -350,6 +430,8 @@ namespace GeZi
             // 老配置（没有 ClipboardAutoParseSet 节点）→ 按默认值「开」，
             // 而不是让 default(bool) 的 false 把功能悄悄关掉。见该属性的注释。
             if (!s.ClipboardAutoParseSet) s.ClipboardAutoParse = true;
+            // 同理：「启动时恢复上次浏览位置」默认也是开
+            if (!s.RestoreBrowseSet) s.RestoreBrowseOnStartup = true;
             return s;
         }
 
@@ -368,6 +450,10 @@ namespace GeZi
                 // （见 ClipboardAutoParseSet 的注释）。放在这里而不是各个调用点，
                 // 是为了覆盖所有写盘路径，避免漏一处就退回"默认关"。
                 s.ClipboardAutoParseSet = true;
+
+                // 同理：「启动时恢复上次浏览位置」也在这里置位，
+                // 覆盖所有写盘路径（见 RestoreBrowseSet 的注释）。
+                s.RestoreBrowseSet = true;
 
                 // 先写临时文件再原子替换：避免写一半断电/异常留下半截 XML，
                 // 下次启动 Load 直接抛异常、用户设置全丢。

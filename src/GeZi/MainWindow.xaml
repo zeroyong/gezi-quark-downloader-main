@@ -1870,6 +1870,46 @@
                                                  KeyDown="OnSettingKeyDown"/>
                                     </Grid>
 
+                                    <!-- 【2026-10-21】任务列表排序（用户要求）：
+                                         「假如有多个文件在文件夹下，应该优先展示未完成的文件，
+                                         因为有时候需要滚动到底部才发现」。
+                                         放这里而不是新开一张卡：它和"同时下载任务数"一样，
+                                         影响的是任务页怎么呈现，语义相邻。 -->
+                                    <TextBlock Text="任务列表" Style="{StaticResource SectionLabel}"/>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="排序" Style="{StaticResource FieldLabel}"/>
+                                        <CheckBox x:Name="TaskUnfinishedFirstCheck" Grid.Column="1"
+                                                  Content="优先展示未完成的文件"
+                                                  Style="{StaticResource AppCheckBox}"
+                                                  Click="OnTaskUnfinishedFirstChanged"
+                                                  ToolTip="开启后：同一个文件夹分组内，正在下载 / 排队 / 已暂停的文件排在前面，已完成 / 失败 / 取消的排在后面。&#10;组内仍按工具栏的「新任务在前 / 在后」排序。默认关闭。"/>
+                                    </Grid>
+                                    <TextBlock Style="{StaticResource TertiaryText}" FontSize="11"
+                                               Margin="150,0,0,18" TextWrapping="Wrap"
+                                               Text="文件夹里文件多时，未完成的会排到前面，不用滚到底部去找。"/>
+
+                                    <!-- 【2026-10-21】下载页「上次浏览位置」恢复（默认开）。 -->
+                                    <TextBlock Text="下载页" Style="{StaticResource SectionLabel}"/>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="浏览位置" Style="{StaticResource FieldLabel}"/>
+                                        <CheckBox x:Name="RestoreBrowseCheck" Grid.Column="1"
+                                                  Content="启动时恢复上次浏览的目录"
+                                                  Style="{StaticResource AppCheckBox}"
+                                                  Click="OnRestoreBrowseChanged"
+                                                  ToolTip="开启后：重新打开程序会自动回到上次看的目录（分享链接模式还会记住是哪条分享）。&#10;目录已失效时会静默回到根目录。默认开启。"/>
+                                    </Grid>
+                                    <TextBlock Style="{StaticResource TertiaryText}" FontSize="11"
+                                               Margin="150,0,0,18" TextWrapping="Wrap"
+                                               Text="只记目录位置，不缓存文件列表 —— 每次都会重新加载，保证看到的是最新内容。"/>
+
                                     <TextBlock Text="窗口与后台" Style="{StaticResource SectionLabel}"/>
                                     <!-- 【2026-10-03 新增】关闭按钮行为 + 悬浮小窗入口。
                                          用户要求：第一次点 × 时询问「最小化到托盘 / 直接退出」，

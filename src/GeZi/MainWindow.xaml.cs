@@ -420,6 +420,11 @@ namespace GeZi
                 // 会被这个估值错误地夹小。到 Loaded 时窗口尺寸已经确定，这里重算一次。
                 ApplyLogPanelHeight();
 
+                // 【2026-10-21】恢复下载页上次的浏览位置（模式 + 目录层级）。
+                // 放在 Loaded 里而不是构造函数：需要窗口已就绪（会有日志与 UI 反馈），
+                // 而且要在自动登录**之后**才有 _client —— 恢复流程内部会等登录任务。
+                _ = RestoreBrowsePositionOnStartupAsync();
+
                 // 托盘图标（用户要求加后台功能）。
                 // ⚠️ 也必须在 Loaded 里：NotifyIcon 需要一个窗口句柄来收任务栏消息，
                 //    而 WPF 窗口句柄到 Loaded 才存在。
@@ -959,11 +964,21 @@ namespace GeZi
 
         // ---------------- 模式切换 ----------------
 
+        /// <summary>
+        /// 正在执行"恢复上次浏览位置"（2026-10-21）。
+        /// <para>恢复流程要用代码改 ShareModeRadio/DriveModeRadio 的选中态，
+        /// 而那会触发 <see cref="OnModeChanged"/> —— 它会 ResetNav 并重新加载，
+        /// 把恢复要铺的状态冲掉。这个标记让 OnModeChanged 在恢复期间直接返回。</para>
+        /// </summary>
+        private bool _restoringBrowse;
+
         private async void OnModeChanged(object sender, RoutedEventArgs e)
         {
             if (SharePanel == null)
                 return;
 
+            // 恢复浏览位置期间不要响应：恢复流程自己会负责加载正确的目录
+            if (_restoringBrowse) return;
             bool nowShare = ShareMode;
             SharePanel.Visibility = nowShare ? Visibility.Visible : Visibility.Collapsed;
 
@@ -1040,6 +1055,351 @@ namespace GeZi
             _shareRootName = "";
             _curFid = "0";
             UpdatePathText();
+        }
+
+        // ---------------- 下载页「上次浏览位置」持久化（2026-10-21） ----------------
+        //
+        // 【需求】用户反馈「每次重启启动应用，下载页都会重置，能否保留上次的浏览文件位置，
+        //        方便继续浏览（包括打开文件的层级）」。选型方案 A：只记目录层级，重启后重新加载。
+        //
+        // 【为什么不复用现有的 NavSnapshot】那个是**内存里**的（切模式时用），
+        //   字段是完整的 ShareFileItem 列表，需要 XmlSerializer 能序列化 ShareFileItem；
+        //   而我们明确不想把列表落盘（几千项、且必然是旧的）。
+        //   所以这里单独存"层级骨架"：模式 + 分享标识 + 当前 fid + 两条链。
+
+        /// <summary>
+        /// 把当前浏览位置写进设置（由 <see cref="SaveBrowsePosition"/> 调用，节流后落盘）。
+        /// <para>导航变化时立刻调，但真正写盘由 SettingsStore.Save 自己合并 ——
+        /// 用户点几下上级目录不该产生几次磁盘写。</para>
+        /// </summary>
+        private void CaptureBrowsePosition()
+        {
+            try
+            {
+                if (_settings == null) return;
+
+                _settings.LastBrowseWasShare = ShareMode;
+                _settings.LastBrowseFid = _curFid ?? "0";
+
+                if (ShareMode)
+                {
+                    _settings.LastSharePwdId = _pwdId ?? "";
+                    _settings.LastSharePasscode = _sharePasscode ?? "";
+                    _settings.LastShareStartFid = string.IsNullOrEmpty(_shareStartFid) ? "0" : _shareStartFid;
+                }
+                else
+                {
+                    // 网盘模式与分享无关，清掉分享标识，避免下次启动误以为要恢复分享
+                    _settings.LastSharePwdId = "";
+                    _settings.LastSharePasscode = "";
+                    _settings.LastShareStartFid = "0";
+                }
+
+                // 祖先链：_fidStack.ToList() 是"栈顶在前" = [上一层, …, 根]，反转成 [根, …, 上一层]
+                var chain = new List<string>(_fidStack);
+                chain.Reverse();
+                _settings.LastBrowseFidChain = chain;
+
+                // 名字链：_pathList 就是 [第一层, …, 当前层]
+                _settings.LastBrowseNameChain = new List<string>(_pathList);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 记录浏览位置并落盘。
+        /// <para>⚠️ SettingsStore.Save 是**同步全量序列化 + 原子替换**（见它的实现），
+        /// 没有合并/去抖。而 LoadDirAsync 每次导航都会调到这里，
+        /// 逐个目录点「上级」就变成一次一次写盘 —— 所以这里自己做一个 1.5 秒的去抖：
+        /// 只记住"待写"，等用户停下来再真正落盘。窗口关闭时由 FlushBrowsePosition 强制补写。</para>
+        /// </summary>
+        private void SaveBrowsePosition()
+        {
+            try
+            {
+                CaptureBrowsePosition();   // 先把意图记到 _settings 上（纯内存，便宜）
+
+                if (_browseSaveTimer == null)
+                {
+                    _browseSaveTimer = new DispatcherTimer
+                    {
+                        Interval = TimeSpan.FromSeconds(1.5),
+                    };
+                    _browseSaveTimer.Tick += (s, e) =>
+                    {
+                        try
+                        {
+                            _browseSaveTimer.Stop();
+                            if (_settings != null) SettingsStore.Save(_settings);
+                        }
+                        catch { }
+                    };
+                }
+                _browseSaveTimer.Stop();
+                _browseSaveTimer.Start();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 立刻把浏览位置写盘（窗口关闭时调用）——
+        /// 否则用户在去抖窗口内关掉程序，最后一次导航就丢了。
+        /// </summary>
+        private void FlushBrowsePosition()
+        {
+            try
+            {
+                _browseSaveTimer?.Stop();
+                CaptureBrowsePosition();
+                if (_settings != null) SettingsStore.Save(_settings);
+            }
+            catch { }
+        }
+
+        /// <summary>浏览位置落盘的去抖定时器（见 <see cref="SaveBrowsePosition"/>）。</summary>
+        private DispatcherTimer _browseSaveTimer;
+
+        /// <summary>
+        /// 启动时恢复浏览位置的**包装**：先等自动登录有结果，再决定能不能恢复。
+        ///
+        /// <para>为什么一定要等登录：网盘模式没有 Cookie 就拿不到目录；
+        /// 分享模式虽然游客也能看，但先等登录结束能让两条路径的行为一致
+        /// （否则可能出现"这次能恢复、下次不能"的随机感）。</para>
+        ///
+        /// <para>登录失败也不算错 —— 分享模式照样可用，所以这里吞掉异常往下走。</para>
+        /// </summary>
+        private async Task RestoreBrowsePositionOnStartupAsync()
+        {
+            try
+            {
+                if (_startupLoginTask != null)
+                {
+                    try { await _startupLoginTask; } catch { }
+                }
+                await RestoreBrowsePositionAsync();
+            }
+            catch (Exception ex)
+            {
+                Log("恢复浏览位置时出错：" + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 启动时恢复上次浏览位置（方案 A：重新请求，不缓存列表）。
+        ///
+        /// <para>【调用时机】必须在"登录就绪"之后：网盘模式要 Cookie、分享模式虽然
+        /// 游客也能看但拿 stoken 更稳。见构造函数里 <c>_startupLoginTask</c> 的用法。</para>
+        ///
+        /// <para>【失败策略】静默回退到根目录，日志记一行（用户选的方案）。
+        /// 任何一步失败都不弹窗 —— 启动流程被一个"上次的目录打不开"的对话框打断很难受。</para>
+        /// </summary>
+        private async Task RestoreBrowsePositionAsync()
+        {
+            try
+            {
+                if (_settings == null) return;
+
+                // 用户在设置里关掉了 → 直接不恢复（保持原有的"从根目录开始"行为）
+                if (!_settings.RestoreBrowseOnStartup) return;
+
+                bool wantShare = _settings.LastBrowseWasShare;
+                string fid = _settings.LastBrowseFid;
+
+                // ① 没有任何记录（首次启动 / 老配置）→ 什么都不做，保持原有首屏
+                if (!wantShare && string.IsNullOrEmpty(fid))
+                {
+                    return;
+                }
+                // 网盘模式停在根目录、且没有分享记录 → 等价于"没浏览过"，不用恢复
+                if (!wantShare && (fid == "0" || string.IsNullOrEmpty(fid))
+                    && (_settings.LastBrowseFidChain == null || _settings.LastBrowseFidChain.Count == 0))
+                {
+                    return;
+                }
+
+                if (wantShare)
+                {
+                    string pwdId = _settings.LastSharePwdId;
+                    if (string.IsNullOrEmpty(pwdId))
+                    {
+                        Log("上次没有可恢复的分享浏览位置。");
+                        return;
+                    }
+                    await RestoreSharePositionAsync(pwdId, fid);
+                }
+                else
+                {
+                    await RestoreDrivePositionAsync(fid);
+                }
+            }
+            catch (Exception ex)
+            {
+                // 静默回退：只记日志，不打扰用户
+                Log("恢复上次浏览位置失败：" + ex.Message + "（已回到根目录）");
+                try { ResetNav(); } catch { }
+            }
+        }
+
+        /// <summary>恢复「我的网盘」模式的上次目录。</summary>
+        private async Task RestoreDrivePositionAsync(string fid)
+        {
+            if (_client == null)
+            {
+                Log("未登录，跳过「我的网盘」浏览位置恢复。");
+                return;
+            }
+
+            // 先把模式切到「我的网盘」。
+            // ⚠️ 用 DriveModeRadio.IsChecked = true 会触发 OnModeChanged，
+            //    那里面会 ResetNav + 重新 LoadDirAsync —— 于是我们后续的
+            //    RestoreChainThenLoadAsync 就白做了。所以先挡掉它（_syncingNav
+            //    不适用，这里用一个"正在恢复"标记，见 _restoringBrowse）。
+            _restoringBrowse = true;
+            try
+            {
+                if (DriveModeRadio != null) DriveModeRadio.IsChecked = true;
+            }
+            finally { _restoringBrowse = false; }
+
+            await RestoreChainThenLoadAsync(fid, "网盘");
+        }
+
+        /// <summary>恢复分享模式的上次目录：先重新解析分享拿 stoken，再沿链导航。</summary>
+        private async Task RestoreSharePositionAsync(string pwdId, string fid)
+        {
+            try
+            {
+                // 同 RestoreDrivePositionAsync：用标记挡掉 OnModeChanged 的自动加载，
+                // 否则它会先 ResetNav + LoadDirAsync（把我们要恢复的状态冲掉）。
+                _restoringBrowse = true;
+                try
+                {
+                    if (ShareModeRadio != null) ShareModeRadio.IsChecked = true;
+                    if (SharePanel != null) SharePanel.Visibility = Visibility.Visible;
+                }
+                finally { _restoringBrowse = false; }
+
+                // 链接框回填，让用户看得见"恢复的是哪条分享"
+                try
+                {
+                    if (LinkBox != null && string.IsNullOrEmpty(LinkBox.Text))
+                        LinkBox.Text = "https://pan.quark.cn/s/" + pwdId;
+                    if (PassBox != null && string.IsNullOrEmpty(PassBox.Text.Trim())
+                        && !string.IsNullOrEmpty(_settings.LastSharePasscode))
+                        PassBox.Text = _settings.LastSharePasscode;
+                }
+                catch { }
+
+                // 拿 stoken（分享过期 / 提取码变了都会在这里失败）
+                _client?.Dispose();
+                _client = new QuarkClient(_settings.Cookie);
+
+                var shareInfo = await _client.GetShareInfoAsync(pwdId, _settings.LastSharePasscode ?? "");
+                if (shareInfo == null || string.IsNullOrEmpty(shareInfo.Stoken))
+                {
+                    Log("上次的分享已失效（可能过期或需要提取码），已回到根目录。");
+                    ResetNav();
+                    return;
+                }
+
+                _pwdId = pwdId;
+                _stoken = shareInfo.Stoken;
+                _sharePasscode = _settings.LastSharePasscode ?? "";
+                _shareStartFid = string.IsNullOrEmpty(_settings.LastShareStartFid) ? "0" : _settings.LastShareStartFid;
+                _linkCache.Clear();
+                _dirCache.Clear();
+                _dirSizeCache.Clear();
+
+                await RestoreChainThenLoadAsync(fid, "分享");
+            }
+            catch (Exception ex)
+            {
+                Log("恢复分享浏览位置失败：" + ex.Message + "（已回到根目录）");
+                try { ResetNav(); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 用设置里存的 fid 链重建 <c>_fidStack</c> / <c>_pathList</c>，然后加载目标目录。
+        /// <para>链长关系：fidChain 是 [根, …, 上一层]，nameChain 是 [第一层, …, 当前层]。
+        /// 正常情况 <c>nameChain.Count == fidChain.Count</c>（每一层都有一个名字）。
+        /// 不一致时以较短的为准，宁可少还原一层也不要把面包屑搞乱。</para>
+        /// </summary>
+        private async Task RestoreChainThenLoadAsync(string fid, string modeName)
+        {
+            try
+            {
+                var fids = _settings.LastBrowseFidChain ?? new List<string>();
+                var names = _settings.LastBrowseNameChain ?? new List<string>();
+
+                _files.Clear();
+                _fidStack.Clear();
+                _pathList.Clear();
+                _curFid = string.IsNullOrEmpty(fid) ? "0" : fid;
+
+                // 重建栈：栈底是根、栈顶是上一层 → 按 fidChain 顺序压入即可
+                for (int i = 0; i < fids.Count; i++)
+                    _fidStack.Push(fids[i]);
+
+                // 重建名字链：只取与 fidChain 等长的部分，避免多出来的名字对不上层级
+                int n = Math.Min(names.Count, fids.Count);
+                for (int i = 0; i < n; i++)
+                    _pathList.Add(names[i]);
+
+                UpdatePathText();
+
+                bool loadFailed = false;
+                await LoadDirAsync(_curFid, () => loadFailed = true);
+
+                // 【关键】加载失败 = 这个 fid 打不开了（分享过期 / 网盘里被删 / 被移走），
+                // 按用户选定的策略：静默回退到根目录，只在日志里记一行。
+                // 不能把"加载失败"当成"空目录"——那样用户会看到一个空列表，
+                // 却以为自己上次的目录里真的没东西（实测踩到过）。
+                if (loadFailed)
+                {
+                    Log("上次的" + modeName + "目录已打不开，已回到根目录。");
+                    ResetNav();
+                    await LoadDirAsync("0");
+                    return;
+                }
+
+                // 【补充规则】非根目录却拿到了空列表 → 判定为"目录已失效"并回退。
+                // 为什么这么判：夸克 API 对**不存在的 pdir_fid** 并不报错，
+                // 而是返回 code=0 + 空 list（实测：伪造一个无效 fid，客户端毫无异常，
+                // 界面上就是一片空）。所以只在异常路径上回退是不够的。
+                // 代价：用户上次若真的停在一个空文件夹，会被带回根目录 ——
+                // 但空目录本身没什么可浏览的，且日志会说明原因，可接受。
+                if (_files.Count == 0 && !string.IsNullOrEmpty(_curFid) && _curFid != "0")
+                {
+                    Log("上次的" + modeName + "目录已为空或不存在，已回到根目录。");
+                    ResetNav();
+                    await LoadDirAsync("0");
+                    return;
+                }
+
+                if (_files.Count == 0)
+                {
+                    // 目录能打开但空的（或是被删了只剩一个可进的壳）—— 也算恢复成功
+                    Log("已恢复上次的" + modeName + "浏览位置：" +
+                        (_pathList.Count > 0 ? string.Join(" / ", _pathList) : "根目录") + "（空目录）");
+                }
+                else
+                {
+                    Log("已恢复上次的" + modeName + "浏览位置：" +
+                        (_pathList.Count > 0 ? string.Join(" / ", _pathList) : "根目录") +
+                        "（" + _files.Count + " 项）");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("恢复目录失败：" + ex.Message + "（已回到根目录）");
+                try
+                {
+                    ResetNav();
+                    await LoadDirAsync("0");
+                }
+                catch { }
+            }
         }
 
         /// <summary>
@@ -1411,6 +1771,56 @@ namespace GeZi
             catch (Exception ex)
             {
                 Log("剪贴板设置保存失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 设置页「优先展示未完成的文件」勾选变化（2026-10-21 新增）。
+        ///
+        /// <para>用户需求：「假如有多个文件在文件夹下，应该优先展示未完成的文件，
+        /// 因为有时候需要滚动到底部才发现」。</para>
+        /// <para>开关一改就立刻重排并落盘 —— 用户想看到的是"勾上马上生效"，
+        /// 而不是下次启动才变。</para>
+        /// </summary>
+        private void OnTaskUnfinishedFirstChanged(object sender, RoutedEventArgs e)
+        {
+            // 回填控件时也会触发 Click（走 _applyingSettings 保护，同其它设置项）
+            if (_applyingSettings) return;
+            try
+            {
+                bool on = TaskUnfinishedFirstCheck.IsChecked == true;
+                _settings.TaskUnfinishedFirst = on;
+                SettingsStore.Save(_settings);
+
+                ApplyTaskOrder();
+                Log(on
+                    ? "任务列表已切换：未完成的文件排在前面（同组内仍按时间偏好排序）"
+                    : "任务列表已切换：不再把未完成的排前面（恢复纯时间序）");
+            }
+            catch (Exception ex)
+            {
+                Log("任务列表排序设置保存失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 设置页「启动时恢复上次浏览的目录」勾选变化（2026-10-21 新增）。
+        /// </summary>
+        private void OnRestoreBrowseChanged(object sender, RoutedEventArgs e)
+        {
+            if (_applyingSettings) return;
+            try
+            {
+                bool on = RestoreBrowseCheck.IsChecked == true;
+                _settings.RestoreBrowseOnStartup = on;
+                SettingsStore.Save(_settings);
+                Log(on
+                    ? "已开启：启动时自动恢复上次浏览的目录。"
+                    : "已关闭：启动时不再恢复浏览位置，总是从根目录开始。");
+            }
+            catch (Exception ex)
+            {
+                Log("浏览位置设置保存失败: " + ex.Message);
             }
         }
 
@@ -2446,8 +2856,13 @@ namespace GeZi
             catch { }
         }
 
-        private async Task LoadDirAsync(string fid)
+        /// <param name="failed">
+        /// 出参：本次加载是否**抛异常失败**（区别于"目录真的是空的"）。
+        /// 恢复浏览位置时用它在失效 fid 上回退到根目录，见 RestoreChainThenLoadAsync。
+        /// </param>
+        private async Task LoadDirAsync(string fid, Action onFailed = null)
         {
+            bool failed = false;
             SetBusy(true);
             // 【纯皮肤】置位加载态并立刻刷新一次 —— 让"正在加载…"在请求发出前
             // 就出现，而不是等 SetBusy 的按钮禁用生效后才补上（会闪一下空状态）。
@@ -2486,6 +2901,11 @@ namespace GeZi
             catch (Exception ex)
             {
                 Log("加载目录失败: " + ex.Message);
+                // 【2026-10-21】把失败标出来交给调用方。
+                // 恢复浏览位置时需要区分"目录真的是空的"和"这个 fid 根本打不开"——
+                // 前者算恢复成功（用户上次停在一个空目录），后者必须回退到根目录。
+                // 不加这个标记的话，失效 fid 会被当成"空目录"静默通过（实测踩到）。
+                failed = true;
             }
             finally
             {
@@ -2494,6 +2914,18 @@ namespace GeZi
                 // _files.CollectionChanged 在清空/填充时已经触发过 UpdateEmptyStates，
                 // 但"加载失败且一条都没有"这条路径不会动集合 —— 补一次保证加载态收掉。
                 UpdateEmptyStates();
+
+                // 【2026-10-21】每次目录加载完成（含缓存命中）都记一次浏览位置。
+                // 为什么放 finally 而不是每个导航入口各写一遍：
+                // 进子目录 / 上级 / 面包屑跳转 / 恢复位置 全都汇流到 LoadDirAsync，
+                // 在这里记最不容易漏；而且缓存命中那条路径是提前 return 的，
+                // 只有 finally 能覆盖到它。
+                // 写盘由 SettingsStore.Save 内部合并，连续点几下上级目录不会产生多次落盘。
+                //
+                // ⚠️ 失败时**不记**：否则失效 fid 会被写回设置，
+                // 下次启动又拿着同一个坏 fid 去恢复（等于把错误固化下来）。
+                if (!failed) SaveBrowsePosition();
+                else { try { onFailed?.Invoke(); } catch { } }
             }
         }
 
@@ -4982,6 +5414,12 @@ namespace GeZi
             // 不拦的话刚设好的 Paused 会被下一帧覆盖 → 图标先变三角又变回竖杠。
             // 进度数据本身照常更新（这样能看到速度渐降到 0，文案随之从「暂停中…」变「已暂停」）。
             bool keepPaused = item.PauseRequested && u.State == JobState.Downloading;
+            // 【2026-10-21】开启「优先展示未完成」时，任务从"未完成"变成"已完成/失败/取消"
+            // （或反过来，比如点 ▶ 续传一个暂停的任务）就需要重排一次 ——
+            // 否则它不会自动挪到后面/前面，用户还得手动切一下排序按钮才生效。
+            // 只在这个"已结束"标志真正翻转时才重排：进度更新每 500ms 一次，
+            // 每次都全表 Move 会让列表抖动且白耗性能。
+            bool wasFinished = IsFinished(item);
             if (!keepPaused)
             {
                 item.State = u.State;
@@ -4989,6 +5427,8 @@ namespace GeZi
                 if (u.State != JobState.Paused)
                     item.PauseRequested = false;
             }
+            if (_settings.TaskUnfinishedFirst && wasFinished != IsFinished(item))
+                ApplyTaskOrder();
             item.Error = u.Error ?? "";
             if ((u.State == JobState.Failed || u.State == JobState.Cancelled) && !string.IsNullOrEmpty(u.Error))
             {
@@ -5443,18 +5883,46 @@ namespace GeZi
         /// 按当前排序偏好重排**已有**任务（点击切换排序时调用）。
         /// 用 <see cref="ObservableCollection{T}.Move"/> 而不是 Clear+重填：
         /// Move 只挪位置、不销毁容器，选中项和滚动位置都不会乱跳。
+        ///
+        /// <para>【2026-10-21 新增「优先展示未完成」】用户反馈「假如有多个文件在文件夹下，
+        /// 应该优先展示未完成的文件，因为有时候需要滚动到底部才发现」。</para>
+        /// <para>实现要点：这里排的是 <c>_tasks</c> 这个**唯一真源**的顺序，
+        /// 分组视图的分组内顺序就是跟着它来的，所以只要在这里把"未完成"提到前面，
+        /// 每个文件夹卡片内部的顺序也就跟着变了 —— 不需要另写一套分组内排序。</para>
+        /// <para>为什么用稳定排序（OrderBy 本身就是稳定的）：先按"是否未完成"分组，
+        /// 再在组内按时间偏好排，等于给原有顺序加了一个主键；
+        /// 用户原来的"新任务在前 / 在后"偏好依然在组内生效，不会被打乱。</para>
         /// </summary>
         private void ApplyTaskOrder()
         {
-            var ordered = _settings.TaskNewestFirst
-                ? _tasks.OrderByDescending(t => t.Seq).ToList()
-                : _tasks.OrderBy(t => t.Seq).ToList();
+            IEnumerable<TaskItem> seq = _settings.TaskNewestFirst
+                ? _tasks.OrderByDescending(t => t.Seq)
+                : _tasks.OrderBy(t => t.Seq);
+
+            // 未完成优先：等于是加在时间序**之上**的第一排序键
+            if (_settings.TaskUnfinishedFirst)
+                seq = seq.OrderBy(t => IsFinished(t) ? 1 : 0);
+
+            var ordered = seq.ToList();
 
             for (int i = 0; i < ordered.Count; i++)
             {
                 int cur = _tasks.IndexOf(ordered[i]);
                 if (cur != i) _tasks.Move(cur, i);
             }
+        }
+
+        /// <summary>
+        /// 「这个任务算不算已经结束」—— 供「优先展示未完成」排序用。
+        /// <para>已结束：完成 / 失败 / 已取消。其余（下载中、排队、暂停、取消中）都算未完成，
+        /// 因为它们都还需要用户关注（暂停的要点继续、取消中的还在收尾）。</para>
+        /// </summary>
+        private static bool IsFinished(TaskItem t)
+        {
+            if (t == null) return true;
+            return t.State == JobState.Completed
+                || t.State == JobState.Failed
+                || t.State == JobState.Cancelled;
         }
 
         private void OnToggleTaskSort(object sender, RoutedEventArgs e)
@@ -7565,6 +8033,10 @@ namespace GeZi
                 // 剪贴板自动解析（默认开）。注意这里**只回填控件**：真正的注册在窗口句柄
                 // 建好之后由 AttachWindowHooks→ApplyClipboardListener 做。
                 ClipboardAutoParseCheck.IsChecked = _settings.ClipboardAutoParse;
+                // 【2026-10-21】「优先展示未完成的文件」（默认关）
+                TaskUnfinishedFirstCheck.IsChecked = _settings.TaskUnfinishedFirst;
+                // 【2026-10-21】「启动时恢复上次浏览的目录」（默认开）
+                RestoreBrowseCheck.IsChecked = _settings.RestoreBrowseOnStartup;
                 // 外观主题：把配置里的选择回填到三个单选（_applyingSettings 已挡掉 Checked）
                 SyncThemeRadios();
                 // 任务列表排序偏好 → 同步工具栏那颗切换按钮的文案与图标
@@ -8906,6 +9378,10 @@ namespace GeZi
 
             if (action == CloseAction.MinimizeToTray)
             {
+                // 【2026-10-21】隐藏到托盘时也立刻落盘：
+                // 用户可能挂在托盘里很久甚至几天，期间如果断电/强杀，
+                // 去抖还没落地的那次导航就丢了。
+                FlushBrowsePosition();
                 e.Cancel = true;      // 不真关，只隐藏
                 HideToTray();
                 return;
@@ -8924,6 +9400,9 @@ namespace GeZi
                 }
             }
             _exiting = true;
+            // 【2026-10-21】退出前把浏览位置**立刻**写盘：
+            // SaveBrowsePosition 是 1.5 秒去抖的，用户在去抖窗口内关程序会丢掉最后一次导航。
+            FlushBrowsePosition();
             // 不放行也不行：这里只做清理，真正退出统一走 ExitApp()，
             // 否则"最后关掉的那个窗口"会决定进程去留（App 已设 OnExplicitShutdown）。
             e.Cancel = true;
