@@ -146,9 +146,15 @@ namespace GeZi.Core.Update
                             && a.name.EndsWith("-win64.zip", StringComparison.OrdinalIgnoreCase))
                         {
                             rel.AssetSize = a.size;
+                            rel.AssetUrl = a.browser_download_url ?? "";
                             break;
                         }
                     }
+                    // 详情页兜底：GitHub 的 html_url 偶发缺失，按 owner/repo+tag 拼一个，
+                    // 否则「查看详情」按钮会打不开（IsValid 也会被拖累）。
+                    if (string.IsNullOrEmpty(rel.HtmlUrl))
+                        rel.HtmlUrl = "https://github.com/" + RepoOwner + "/" + RepoName
+                                      + "/releases/tag/" + (dto.tag_name ?? "");
                     return rel;
                 }
             }
@@ -180,6 +186,7 @@ namespace GeZi.Core.Update
         {
             [DataMember(Name = "name")] public string name;
             [DataMember(Name = "size")] public long size;
+            [DataMember(Name = "browser_download_url")] public string browser_download_url;
         }
     }
 }

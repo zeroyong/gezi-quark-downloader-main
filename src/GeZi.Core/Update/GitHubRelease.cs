@@ -1,4 +1,4 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -17,13 +17,18 @@ namespace GeZi.Core.Update
 {
     /// <summary>
     /// GitHub Releases 里的一个发布版本（2026-10-18「新一代检查更新」）。
-    /// 旧实现把更新包托管在夸克网盘分享里，找包、转存、下载、
-    /// 到期清理一整套都绑在夸克接口上（分享一失效整个更新流程就挂）。新版直接查
-    /// GitHub Releases API：不依赖登录态、不写用户网盘、没有中转清理。
-    /// 下载也不再由程序代劳 ——「前往下载」直接打开 Release 页，用户用浏览器下，
-    /// 省掉整套安装/覆盖/重启逻辑，也不会再被系统当成"自我更新行为"。
+    /// <para>
+    /// 【2026-10-22 双源化】GitHub 国内访问不稳定（启动检查常因 API 不通而静默失败），
+    /// 用户又习惯在夸克分享里取安装包，于是新增 <see cref="QuarkRelease"/>
+    /// （夸克分享源）。两者都实现 <see cref="IReleaseInfo"/>，由
+    /// <see cref="UpdateService"/> 取版本号更高的那个当「最新版本」。
+    /// </para>
+    /// <para>
+    /// GitHub release 的 asset 直链是公开可 GET 的（<c>browser_download_url</c>），
+    /// 所以它天生支持「一键更新」；取不到附件时才退化为打开网页手动下载。
+    /// </para>
     /// </summary>
-    public sealed class GitHubRelease
+    public sealed class GitHubRelease : IReleaseInfo
     {
         /// <summary>从 tag_name（如 <c>v2.2.0</c>）解析出的三段版本号。</summary>
         public UpdateVersion Version { get; set; }
@@ -46,10 +51,54 @@ namespace GeZi.Core.Update
         /// <summary>发布时间（UTC）；取不到为 null。</summary>
         public DateTime? PublishedAt { get; set; }
 
-        /// <summary>是否可用（至少要有版本号和详情页地址）。</summary>
+        /// <summary>win64 安装包的浏览器直链（<c>browser_download_url</c>）；取不到为空串。</summary>
+        public string AssetUrl { get; set; }
+
+        /// <summary>是否可用（至少要有版本号）。</summary>
         public bool IsValid
         {
-            get { return Version != null && !string.IsNullOrEmpty(HtmlUrl); }
+            get { return Version != null; }
+        }
+
+        // ---------------- IReleaseInfo ----------------
+
+        /// <summary>更新说明（Release body 原文）。</summary>
+        public string Notes
+        {
+            get { return Body ?? ""; }
+        }
+
+        /// <summary>「查看详情」打开 Release 详情页。</summary>
+        public string OpenUrl
+        {
+            get { return HtmlUrl ?? ""; }
+        }
+
+        /// <summary>安装包字节数。</summary>
+        public long PackageSize
+        {
+            get { return AssetSize; }
+        }
+
+        /// <summary>GitHub 发布一律标 GitHub，UI 转成中文标签。</summary>
+        public string SourceName
+        {
+            get { return ReleaseSourceNames.GitHub; }
+        }
+
+        /// <summary>
+        /// 能否一键更新：有 win64 安装包的直链就能。
+        /// GitHub 侧通常是有的（发版附件固定 <c>GeZi-vX.Y.Z-win64.zip</c>）。
+        /// </summary>
+        public bool CanAutoInstall
+        {
+            get { return !string.IsNullOrEmpty(AssetUrl); }
+        }
+
+        /// <summary>安装包直链（<c>browser_download_url</c>）。</summary>
+        public string PackageUrl
+        {
+            get { return AssetUrl ?? ""; }
         }
     }
 }

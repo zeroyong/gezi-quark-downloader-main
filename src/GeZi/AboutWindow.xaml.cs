@@ -179,7 +179,7 @@ namespace GeZi
         }
 
         /// <summary>打开「更新详情」窗；用户在窗内明确点「忽略此版本」才落盘。</summary>
-        private void OpenUpdatePrompt(GitHubRelease m)
+        private void OpenUpdatePrompt(IReleaseInfo m)
         {
             if (m == null) return;
 

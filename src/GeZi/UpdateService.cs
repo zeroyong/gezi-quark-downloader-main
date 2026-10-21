@@ -1,4 +1,4 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -13,6 +13,7 @@
 
 using System;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using GeZi.Core.Update;
 
@@ -20,17 +21,19 @@ namespace GeZi
 {
     /// <summary>
     /// 「检查更新」的 UI 层编排。
-    /// 把 Core 的 <see cref="GitHubReleaseChecker"/>（只查 GitHub Releases）接进界面：
-    /// 记录检查时间、判定"算不算有更新"、记住用户忽略过哪个版本。
-    /// 需求明确要求**不打断用户**：启动时只做后台检查，
-    /// 有新版本就点亮红点 + 弹一次气泡，用户不点就当没发生过。
-    /// 真正的窗口只在用户**主动点**「检查更新」之后才出现。
-    /// 启动时那次检查**吞掉所有异常并静默返回** ——
-    /// GitHub 访问不通、接口改版、断网，都不该让用户看到一个"更新检查失败"的弹窗。
-    /// 用户**手动点**「检查更新」时才把错误如实告诉他（那时他是真的想知道）。
-    /// ⚠️ <b>线程约定</b>：除 <see cref="CheckNowAsync"/> 外，会改写 <c>AppSettings</c> 的
-    /// 方法一律<b>只能在 UI 线程调用</b>（与设置页的 Save 同一条线程，避免并发写盘）。
-    /// 启动检查本来就是从 <c>Dispatcher.BeginInvoke</c> 里发起的，await 之后仍在 UI 线程。
+    /// <para>
+    /// 【2026-10-22 双源】原来是"只查 GitHub Releases"。GitHub 在国内网络下并不总通，
+    /// 启动那次检查一失败就等于永远看不到更新提示。现在把用户自己的夸克分享
+    /// （pan.quark.cn/s/065af2172c40，提取码 VD8m，游客可读）作为<b>第二个源</b>接进来：
+    /// 两个源各查一次，取<b>版本号更高</b>的那个当"最新版本"。
+    /// </para>
+    /// <para>
+    /// 需求明确要求<b>不打断用户</b>：启动时只做后台检查，有新版本就点亮红点 + 弹一次气泡，
+    /// 用户不点就当没发生过。真正的窗口只在用户<b>主动点</b>「检查更新」之后才出现。
+    /// </para>
+    /// ⚠️ <b>线程约定</b>：除 <see cref="CheckNowAsync"/> 与 <see cref="InstallAsync"/> 外，
+    /// 会改写 <c>AppSettings</c> 的方法<b>只能在 UI 线程调用</b>
+    /// （与设置页的 Save 同一条线程，避免并发写盘）。
     /// </summary>
     internal static class UpdateService
     {
@@ -43,6 +46,9 @@ namespace GeZi
 
         /// <summary>GitHub Releases 列表页（查询失败时给用户的手动入口）。</summary>
         public const string ReleasesPageUrl = GitHubReleaseChecker.ReleasesPageUrl;
+
+        /// <summary>夸克分享的更新包地址（用户 2026-10-22 指定的固定分享）。</summary>
+        public const string QuarkShareUrl = QuarkReleaseChecker.SharePageUrl;
 
         static UpdateService()
         {
@@ -60,15 +66,36 @@ namespace GeZi
         /// <summary>当前程序版本（从程序集读，不再手写一份）。</summary>
         public static UpdateVersion CurrentVersion { get; private set; }
 
+        /// <summary>来源标签数组，UI 用来显示"这次结果是哪个源给的"。</summary>
+        private static readonly string[] SourceLabels =
+        {
+            ReleaseSourceNames.GitHub, ReleaseSourceNames.Quark,
+        };
+
         /// <summary>
         /// 最近一次**实际查询**得到的发布信息（下载页地址、更新说明都要用）。
         /// ⚠️ 重启后为 null —— 落盘的只有版本号（字符串），要拿详情必须重新查一次。
         ///    所以「检查更新」按钮总是先查再动作，靠这里不会出现"有红点但打不开"的情况。
         /// </summary>
-        public static GitHubRelease Latest { get; private set; }
+        public static IReleaseInfo Latest { get; private set; }
 
         /// <summary>当前是否有（未被忽略的）新版本。红点与气泡都看它。</summary>
         public static bool HasUpdate { get; private set; }
+
+        /// <summary>最近一次检查的结果是哪个源（可能就是 "" = 没查到）。</summary>
+        public static string LatestSource { get; private set; }
+
+        /// <summary>「一键更新」的编排器（用当前进程所在的目录当覆盖目标）。</summary>
+        public static UpdateInstaller Installer
+        {
+            get
+            {
+                if (_installer == null)
+                    _installer = new UpdateInstaller(AppContext.BaseDirectory);
+                return _installer;
+            }
+        }
+        private static UpdateInstaller _installer;
 
         /// <summary>
         /// 由主窗口在启动时注入的配置对象。
@@ -118,6 +145,17 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 从两个源的结果里挑一个当"最新版本"：版本号高的赢。
+        /// 都一样高时平手 → 返回 GitHub 那个（说明更完整，UI 更值钱）。
+        /// </summary>
+        public static IReleaseInfo PickNewer(IReleaseInfo a, IReleaseInfo b)
+        {
+            if (a == null || !a.IsValid) return (b != null && b.IsValid) ? b : null;
+            if (b == null || !b.IsValid) return a;
+            return b.Version.CompareTo(a.Version) > 0 ? b : a;
+        }
+
+        /// <summary>
         /// 启动时调用：用**上次落盘的版本号**恢复红点状态。
         /// 这样即使本次因节流没去查，红点也能保持（否则用户重启一次红点就没了）。
         /// </summary>
@@ -162,23 +200,15 @@ namespace GeZi
         /// 启动检查。失败一律静默。
         /// </summary>
         /// <param name="onNewUpdate">确认有新版本时回调（UI 线程），用来弹气泡。</param>
-        public static async Task RunStartupCheckAsync(AppSettings s, Action<GitHubRelease> onNewUpdate)
+        public static async Task RunStartupCheckAsync(AppSettings s, Action<IReleaseInfo> onNewUpdate)
         {
             if (s == null) return;
             if (!ShouldCheck(s.UpdateLastCheckTicks, DateTime.Now)) return;
 
-            GitHubRelease found = null;
+            IReleaseInfo found = null;
             try
             {
-                // 不需要登录、不写网盘 —— GitHub Releases 是公开只读接口。
-                // 🚨
-                //    加了的后果（旧版实测踩到）：await 之后回到**线程池线程**，
-                //    于是下面的 Apply / onNewUpdate 也在非 UI 线程执行 ——
-                //    写日志、弹气泡（NotifyToast 是 Window）都会抛异常，
-                //    再被各自的 try/catch 吞掉，表现就是"什么都没发生、日志也没有一行"。
-                //    启动检查本来就跑在 UI 线程上，让它原样回到 UI 线程即可。
-                var checker = new GitHubReleaseChecker();
-                found = await checker.FindLatestAsync();
+                found = await QueryBothAsync().ConfigureAwait(true);
             }
             catch
             {
@@ -191,29 +221,116 @@ namespace GeZi
 
         /// <summary>
         /// 用户手动点「检查更新」：不做节流，失败也如实抛出（他是真的想知道结果）。
+        /// <para>
+        /// 这里是<b>双源</b>的：GitHub 与夸克分享各查一次，取版本号更高的那个。
+        /// GitHub 查不通时自动退到夸克；两个都查不通才抛异常（那时用户确实需要知道）。
+        /// </para>
         /// </summary>
-        public static async Task<GitHubRelease> CheckNowAsync()
+        public static async Task<IReleaseInfo> CheckNowAsync()
         {
-            var checker = new GitHubReleaseChecker();
-            var found = await checker.FindLatestAsync();
-            if (found == null)
+            IReleaseInfo winner = await QueryBothAsync().ConfigureAwait(false);
+            if (winner == null || !winner.IsValid)
                 throw new InvalidOperationException(
-                    "无法读取 GitHub Releases（网络不通或仓库地址有变）。");
-            return found;
+                    "两个更新源都没连上（GitHub " + ReleasesPageUrl + " / 夸克分享 " + QuarkShareUrl + "）。");
+            return winner;
+        }
+
+        /// <summary>
+        /// 两个源各查一次，取版本号更高的那个。任一个源抛异常只按"该源没有"处理
+        /// —— 一个源不通不该让另一次查询白跑。
+        /// </summary>
+        public static async Task<IReleaseInfo> QueryBothAsync()
+        {
+            var ghTask = QueryGitHubAsync();
+            var qkTask = QueryQuarkAsync();
+            await Task.WhenAny(Task.WhenAll(ghTask, qkTask)).ConfigureAwait(false);
+
+            IReleaseInfo gh = null;
+            try { gh = ghTask.Result; } catch { gh = null; }
+            IReleaseInfo qk = null;
+            try { qk = qkTask.Result; } catch { qk = null; }
+
+            return PickNewer(gh, qk);
+        }
+
+        private static async Task<IReleaseInfo> QueryGitHubAsync()
+        {
+            try
+            {
+                var checker = new GitHubReleaseChecker();
+                return await checker.FindLatestAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static async Task<IReleaseInfo> QueryQuarkAsync()
+        {
+            try
+            {
+                var checker = new QuarkReleaseChecker();
+                return await checker.FindLatestAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 「一键更新」：下载安装包 → 解压 → 外部脚本接力覆盖 → 重启。
+        /// 返回 true 表示脚本已启动，调用方应立刻 <c>Environment.Exit(0)</c>。
+        /// </summary>
+        public static async Task<bool> InstallAsync(IProgress<UpdateProgress> progress = null,
+            CancellationToken ct = default(CancellationToken))
+        {
+            var rel = Latest as QuarkRelease;
+            string url;
+            if (rel != null && rel.IsValid)
+            {
+                // 夸克源：直链有时效，必须在用户确认的那一刻现场取
+                url = await new QuarkReleaseChecker().ResolveDownloadUrlAsync(rel, ct)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                url = Latest != null ? Latest.PackageUrl : null;
+            }
+
+            if (string.IsNullOrEmpty(url))
+                return false;
+
+            return await Installer.InstallAsync(url,
+                rel != null ? rel.FileName : "",
+                Latest.Version, progress, ct).ConfigureAwait(false);
         }
 
         /// <summary>把一次检查结果落到设置与内存状态里。</summary>
-        public static void Apply(AppSettings s, GitHubRelease found, Action<GitHubRelease> onNewUpdate)
+        public static void Apply(AppSettings s, IReleaseInfo found, Action<IReleaseInfo> onNewUpdate)
         {
             if (s == null) return;
 
             s.UpdateLastCheckTicks = DateTime.Now.Ticks;
             Latest = (found != null && found.IsValid) ? found : null;
+            LatestSource = Latest != null ? Latest.SourceName : "";
             s.UpdateLatestVersion = Latest != null ? Latest.Version.ToString() : "";
             HasUpdate = ComputeHasUpdate(s.UpdateLatestVersion, s.UpdateIgnoredVersion, CurrentVersion);
 
             if (HasUpdate && onNewUpdate != null)
                 onNewUpdate(Latest);
+        }
+
+        /// <summary>把 "GitHub Releases" 这样的内部源名换成界面上说的话。</summary>
+        public static string SourceLabel(string source)
+        {
+            switch (source ?? "")
+            {
+                case ReleaseSourceNames.GitHub: return "GitHub Releases";
+                case ReleaseSourceNames.Quark: return "夸克网盘分享";
+                default: return "";
+            }
         }
     }
 }

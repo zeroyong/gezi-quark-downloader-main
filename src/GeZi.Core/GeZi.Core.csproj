@@ -20,6 +20,11 @@
     <!-- 零 NuGet 依赖，可离线编译：JSON 用框架自带 JavaScriptSerializer；HTTP 用 System.Net.Http -->
     <Reference Include="System.Net.Http" />
     <Reference Include="System.Web.Extensions" />
+    <!-- 【2026-10-22】一键更新要解压 zip 安装包。net48 下 ZipFile 在
+         System.IO.Compression.FileSystem（ZipFile.ExtractToDirectory）、
+         而 ZipArchive 本体在 System.IO.Compression，两个都要显式引用。 -->
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
     <!-- DPAPI（ProtectedData）加密 Cookie -->
     <Reference Include="System.Security" />
   </ItemGroup>

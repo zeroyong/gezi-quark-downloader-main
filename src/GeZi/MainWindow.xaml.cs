@@ -8365,17 +8365,19 @@ namespace GeZi
         /// 只做两件"不抢焦点"的事：应用内气泡 + 日志行；
         /// 真正的更新详情窗等用户去「关于 → 检查更新」才出现。
         /// </summary>
-        private void OnUpdateFound(GitHubRelease m)
+        private void OnUpdateFound(IReleaseInfo m)
         {
             try
             {
                 if (m == null) return;
-                string size = m.AssetSize > 0
-                    ? "，" + (m.AssetSize / 1048576.0).ToString("0.0") + " MB"
+                string size = m.PackageSize > 0
+                    ? "，" + (m.PackageSize / 1048576.0).ToString("0.0") + " MB"
                     : "";
+                string srcLabel = UpdateService.SourceLabel(m.SourceName);
                 NotifyToast.Show("发现新版本 v" + m.Version,
-                    "打开「关于」点「检查更新」查看更新说明并下载" + size, null);
-                Log("发现新版本 v" + m.Version + "（" + m.TagName + "）— 可在「关于」页点击「检查更新」。");
+                    "打开「关于」点「检查更新」查看更新说明并下载（来源：" + srcLabel + "）" + size, null);
+                Log("发现新版本 v" + m.Version + "（" + m.TagName + "，来源：" + srcLabel
+                    + "）— 可在「关于」页点击「检查更新」。");
 
                 // 【2026-10-21】设置页现在也有正式的更新入口，
                 // 气泡文案跟着改，并且把设置页的状态行/红点一起刷新。
