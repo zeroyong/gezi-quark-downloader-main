@@ -44,8 +44,11 @@ namespace GeZi
         /// 项目开源地址（GitHub）。
         /// 【为什么放显眼处】这类工具的用户最怕"来路不明的 exe"（见过太多捆绑木马的），
         /// 源码公开是他们判断可信度的第一依据 —— 比任何"本软件无毒"的声明都有用。
+        /// 【2026-10-21 修正】原来指向上游原作者仓库，但本项目的后续发布在
+        /// <c>zeroyong/gezi-quark-downloader-main</c>；「检查更新」也查这个仓库，
+        /// 两处必须一致，否则用户点开源地址看到的版本和检查更新说的对不上。
         /// </summary>
-        private const string RepoUrl = "https://github.com/huaotem-bot/gezi-quark-downloader";
+        private const string RepoUrl = "https://github.com/zeroyong/gezi-quark-downloader-main";
 
         /// <summary>功能特性（面向普通用户，一条一句话）。</summary>
         /// <remarks>

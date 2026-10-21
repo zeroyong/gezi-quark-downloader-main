@@ -380,6 +380,9 @@ namespace GeZi
             LoadSettingsToUi();
             // 检查更新：注入配置，恢复上次的红点状态（不在这里发网络请求）
             UpdateService.Attach(_settings);
+            // Attach 之后 HasUpdate 才有值（LoadSettingsToUi 跑在 Attach 之前，
+            // 那次刷新只能填上版本号）。这里再刷一次，把红点/状态行补对。
+            RefreshSettingsUpdateUi();
 
             // 加载完成后再提示未完成任务（此时窗口已就绪，弹窗才有 Owner）
             Loaded += (s, e) =>
@@ -1905,7 +1908,68 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 文件列表的**粘滞多选模式**（2026-10-21 新增，按 Alt 进入 / Esc 退出）。
+        ///
+        /// <para>【为什么要做】用户反馈「一直需要按 shift 才行 太麻烦」。
+        /// 原来只能 Shift+点击离散多选 —— 每点一个都得压着 Shift，
+        /// 选十几个文件时手一直绷着，很难受。</para>
+        ///
+        /// <para>【与 Shift 的分工】两者都能多选，但性质不同：
+        /// · Shift+点击 = **一次性**修饰：按着才有效，松手即恢复"单击进入文件夹"；
+        /// · Alt 模式   = **粘滞**开关：按一下进入，之后点选全程不用再按键，Esc 退出。
+        /// 进入后文件夹也不再"单击进入"（否则选文件夹时会被弹进目录），
+        /// 这正是多选场景想要的。</para>
+        /// </summary>
+        private bool _fileSelectMode;
+
+        private void EnterFileSelectMode()
+        {
+            if (_fileSelectMode) return;
+            _fileSelectMode = true;
+            try
+            {
+                if (FileSelectBar != null) FileSelectBar.Visibility = Visibility.Visible;
+            }
+            catch { }
+            UpdateFileSelectCount();
+            Log("已进入多选模式：点文件即可加选 / 取消（文件夹不再进入目录）；按 Esc 退出。");
+        }
+
+        /// <param name="clearSelection">退出时是否清空已选（Esc 默认清空，与任务页 z 模式一致）。</param>
+        private void ExitFileSelectMode(bool clearSelection = true)
+        {
+            if (!_fileSelectMode) return;
+            _fileSelectMode = false;
+            try
+            {
+                if (FileSelectBar != null) FileSelectBar.Visibility = Visibility.Collapsed;
+            }
+            catch { }
+            if (clearSelection) ClearFileSelection();
+            UpdateFileSelectCount();
+            Log("已退出多选模式。");
+        }
+
+        private void UpdateFileSelectCount()
+        {
+            try
+            {
+                if (FileSelectCountText == null) return;
+                int n = FileList != null ? FileList.SelectedItems.Count : 0;
+                FileSelectCountText.Text = "已选 " + n + " 项";
+            }
+            catch { }
+        }
+
+        private void OnFileListSelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            // 只在多选模式下维护计数，平时这个提示条是收起的
+            if (_fileSelectMode) UpdateFileSelectCount();
+        }
+
+        /// <summary>
         /// 文件列表的左键点击策略（在 PreviewMouseLeftButtonDown / 隧道阶段统一裁决）：
+        ///   · **Alt 多选模式**（粘滞）：点任意行 = 切换该行选中，文件夹不进入；
         ///   · **单击文件夹 = 直接进入**（2026-10-08 用户要求「单击就直接打开文件夹」）；
         ///   · **Shift+点击 = 离散多选**（只切换点中的这一项），**不做连选**；
         ///   · **Ctrl+点击 = 只选中这一个**，不进目录；
@@ -1960,6 +2024,19 @@ namespace GeZi
 
             if (item == null)
                 return;   // 点在空白处：交给默认处理（清空选择）
+
+            // ⓪.5 Alt 多选模式（粘滞，2026-10-21）：点任意行 = 切换该行选中。
+            //     必须排在 Shift / Ctrl / "单击文件夹进入" 之前 ——
+            //     这个模式存在的意义就是"点一下就切换，不用按修饰键、也不会被弹进目录"。
+            //     放在 item == null 之后：点空白处仍然走默认（清空选择），符合直觉。
+            if (_fileSelectMode && ReferenceEquals(sender, FileList))
+            {
+                e.Handled = true;
+                item.IsSelected = !item.IsSelected;
+                try { item.Focus(); } catch { }
+                UpdateFileSelectCount();
+                return;
+            }
 
             // ① Shift+点击 = 离散多选（只切换点中的这一项）
             if ((mods & ModifierKeys.Shift) != 0)
@@ -2017,6 +2094,11 @@ namespace GeZi
         private void ClearFileSelection()
         {
             try { FileList.SelectedItems.Clear(); } catch { }
+            // 【2026-10-21】多选模式下按 d / x 发送后只清选择、**保留模式**（用户要求），
+            // 但提示条上的「已选 N 项」必须跟着归零 —— 否则它还显示着刚才那批数量，
+            // 用户会以为没发送成功。SelectedItems.Clear 会触发 SelectionChanged，
+            // 那里已经刷过一次；这里再刷一次是为了覆盖"本来就没选中"等不触发事件的情况。
+            UpdateFileSelectCount();
         }
 
         /// <summary>
@@ -2567,6 +2649,8 @@ namespace GeZi
             {
                 FileList.SelectedItems.Clear();
                 lbi.IsSelected = true;
+                // 多选模式下右键换选也要同步「已选 N 项」
+                UpdateFileSelectCount();
             }
 
             // 「免转存下载」只在**分享**模式下有意义：网盘模式的文件本来就在自己网盘里，
@@ -2842,6 +2926,30 @@ namespace GeZi
         {
             // 光标在输入框里 → 这些字符是文字，不是快捷键
             if (IsTypingTarget(Keyboard.FocusedElement)) return;
+
+            // ⓪ Alt 多选模式（2026-10-21）：Alt 进入 / Esc 退出。
+            //    ⚠️ 必须排在下面那个"带修饰键就 return"之前 —— 否则按下 Alt 本身
+            //       就被当成修饰键直接放行了（Alt/Shift 这类纯修饰键也会走到这里，
+            //       e.Key 为 Key.System，真正的键在 e.SystemKey）。
+            if (e.Key == Key.System && e.SystemKey == Key.LeftAlt
+                || e.Key == Key.LeftAlt || e.Key == Key.RightAlt)
+            {
+                // 只在下载页有意义（列表在那一页）
+                if (Tabs.SelectedIndex == 0 && !_fileSelectMode)
+                {
+                    e.Handled = true;
+                    EnterFileSelectMode();
+                }
+                return;
+            }
+            // Esc 退出多选模式（任何页面都能退，避免切页后卡在模式里不自知）
+            if (_fileSelectMode && e.Key == Key.Escape)
+            {
+                e.Handled = true;
+                ExitFileSelectMode();
+                return;
+            }
+
             if ((Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Windows)) != 0)
                 return;
 
@@ -4355,6 +4463,11 @@ namespace GeZi
                 var warning = (System.Windows.Media.Brush)FindResource("WarningBrush");
                 var secondary = (System.Windows.Media.Brush)FindResource("TextSecondaryBrush");
                 var tertiary = (System.Windows.Media.Brush)FindResource("TextTertiaryBrush");
+                // 描边色统一走 BorderBrushSoft（令牌里只有 Soft/Strong 两档，
+                // 此前误写的 "BorderBrush" 并不存在，会在切换到开启态时抛
+                // ResourceReferenceKeyNotFoundException → 弹出「未处理错误」）。
+                var swOffBorder = (TryFindResource("BorderBrushSoft") as System.Windows.Media.Brush)
+                    ?? System.Windows.Media.Brushes.Gray;
 
                 if (ShutdownLabel != null)
                 {
@@ -4371,7 +4484,7 @@ namespace GeZi
                         : (System.Windows.Media.Brush)FindResource("SurfaceSunkenBrush");
                     ShutdownSw.BorderBrush = _shutdownAfterAll
                         ? warning
-                        : (System.Windows.Media.Brush)FindResource("BorderBrush");
+                        : swOffBorder;
                 }
                 if (ShutdownSwKnob != null)
                 {
@@ -6740,8 +6853,187 @@ namespace GeZi
                 NotifyToast.Show("发现新版本 v" + m.Version,
                     "打开「关于」点「检查更新」查看更新说明并下载" + size, null);
                 Log("发现新版本 v" + m.Version + "（" + m.TagName + "）— 可在「关于」页点击「检查更新」。");
+
+                // 【2026-10-21】设置页现在也有正式的更新入口，
+                // 气泡文案跟着改，并且把设置页的状态行/红点一起刷新。
+                RefreshSettingsUpdateUi();
             }
             catch { }
+        }
+
+        // ---------------- 设置页「关于与更新」（2026-10-21 新增） ----------------
+        //
+        // 【为什么要有】用户反馈："不是说接入了 GitHub 自动更新吗，在设置页没看到相关检查更新 UI"。
+        // 原因：更新功能确实接好了（UpdateService + AboutWindow），但入口只有一个 ——
+        // 侧栏品牌区那个「?」按钮打开「关于」窗口后，版本号旁边一个 10.5px 的小按钮。
+        // 对用户来说等于不存在。设置页是"找功能"的默认去处，这里给一个正式入口。
+
+        private bool _settingsCheckingUpdate;
+
+        /// <summary>
+        /// 状态行文案是否已被 <see cref="OnSettingsCheckUpdate"/> 的 catch 分支"钉住"。
+        /// <para>为什么需要：<see cref="RefreshSettingsUpdateUi"/> 会把状态行重置成默认/有新版本的文案，
+        /// 而它会在 finally 里再跑一次 —— 那正好把刚写好的「检查失败：…」抹掉，
+        /// 用户看到的就是"点了没反应"。</para>
+        /// </summary>
+        private bool _settingsUpdateStatusPinned;
+
+        /// <summary>
+        /// 刷新设置页的版本号 / 红点 / 状态文案（不联网，纯读内存状态）。
+        /// 可在任意时刻重复调用：启动完成、手动检查后、打开设置页时。
+        /// </summary>
+        private void RefreshSettingsUpdateUi()
+        {
+            try
+            {
+                if (SettingsVersionText != null)
+                {
+                    var v = UpdateService.CurrentVersion;
+                    SettingsVersionText.Text = v != null ? "v" + v.ToString() : "v—";
+                }
+
+                if (SettingsUpdateDot != null)
+                {
+                    SettingsUpdateDot.Visibility = UpdateService.HasUpdate
+                        ? System.Windows.Visibility.Visible
+                        : System.Windows.Visibility.Collapsed;
+                }
+
+                if (SettingsUpdateStatusText != null && !_settingsCheckingUpdate)
+                {
+                    // 注意：Latest 在重启后是 null（落盘的只有版本号字符串），
+                    // 所以这里只凭 HasUpdate + 落盘的版本号说话，不假设能拿到更新说明。
+                    if (UpdateService.HasUpdate)
+                    {
+                        string latest = _settings != null ? _settings.UpdateLatestVersion : "";
+                        SettingsUpdateStatusText.Text = string.IsNullOrEmpty(latest)
+                            ? "发现新版本，点「检查更新」查看更新说明。"
+                            : "发现新版本 v" + latest + "，点「检查更新」查看更新说明。";
+                    }
+                    else
+                    {
+                        SettingsUpdateStatusText.Text = "从 GitHub Releases 检查新版本";
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 设置页「检查更新」：语义与「关于」窗口里的那个按钮完全一致 ——
+        /// 不节流、失败如实告知、有新版本弹详情窗。
+        /// </summary>
+        private async void OnSettingsCheckUpdate(object sender, RoutedEventArgs e)
+        {
+            if (_settingsCheckingUpdate) return;
+            _settingsCheckingUpdate = true;
+            if (SettingsCheckUpdateBtn != null) SettingsCheckUpdateBtn.IsEnabled = false;
+
+            try
+            {
+                if (SettingsUpdateStatusText != null)
+                    SettingsUpdateStatusText.Text = "正在检查…";
+
+                var m = await UpdateService.CheckNowAsync();
+
+                if (UpdateService.Settings != null)
+                    UpdateService.Apply(UpdateService.Settings, m, null);
+                _settingsCheckingUpdate = false;
+                RefreshSettingsUpdateUi();
+
+                // 有新版本、但之前被忽略过 → 先问要不要恢复提醒（与关于页同款交互）
+                if (m != null && UpdateService.CurrentVersion != null
+                    && m.Version.CompareTo(UpdateService.CurrentVersion) > 0
+                    && UpdateService.IsIgnored(m.Version))
+                {
+                    var resume = AppDialog.Show(this,
+                        "你之前忽略了 v" + m.Version + " 的更新提醒。\n\n是否恢复提醒并查看更新？",
+                        "检查更新", MessageBoxButton.YesNo, MessageBoxImage.Information);
+                    if (resume != MessageBoxResult.Yes)
+                    {
+                        RefreshSettingsUpdateUi();
+                        return;
+                    }
+
+                    if (UpdateService.Settings != null)
+                    {
+                        UpdateService.ClearIgnore(UpdateService.Settings);
+                        SettingsStore.Save(UpdateService.Settings);
+                    }
+                    RefreshSettingsUpdateUi();
+                }
+
+                if (UpdateService.HasUpdate && m != null)
+                {
+                    var prompt = new UpdatePromptWindow(m) { Owner = this };
+                    prompt.ShowDialog();
+
+                    if (prompt.IgnoredByUser && UpdateService.Settings != null)
+                    {
+                        UpdateService.IgnoreCurrent(UpdateService.Settings);
+                        SettingsStore.Save(UpdateService.Settings);
+                        Log("已忽略 v" + m.Version + " 的更新提醒。");
+                    }
+                }
+                else if (UpdateService.Latest != null
+                         && UpdateService.CurrentVersion != null
+                         && UpdateService.Latest.Version.CompareTo(UpdateService.CurrentVersion) > 0)
+                {
+                    AppDialog.Show(this,
+                        "你已忽略 v" + UpdateService.Latest.Version + " 的更新提醒。\n"
+                        + "当前版本仍是 v" + UpdateService.CurrentVersion + "。\n\n"
+                        + "想恢复提醒：再点一次「检查更新」即可。",
+                        "检查更新");
+                }
+                else
+                {
+                    AppDialog.Show(this,
+                        "当前已是最新版本（v"
+                        + (UpdateService.CurrentVersion != null ? UpdateService.CurrentVersion.ToString() : "?")
+                        + "）。",
+                        "检查更新");
+                }
+            }
+            catch (Exception ex)
+            {
+                _settingsCheckingUpdate = false;
+                RefreshSettingsUpdateUi();
+                if (SettingsUpdateStatusText != null)
+                    SettingsUpdateStatusText.Text = "检查失败：" + ex.Message;
+                // ⚠️ 这里给状态行留个标记：finally 里的 RefreshSettingsUpdateUi
+                // 会把文案重置成默认值，那会把"检查失败"这个用户最需要的信息抹掉。
+                _settingsUpdateStatusPinned = true;
+
+                AppDialog.Show(this,
+                    "检查更新失败：" + ex.Message
+                    + "\n\n你也可以手动打开 Releases 页查看：\n" + UpdateService.ReleasesPageUrl,
+                    "检查更新", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            finally
+            {
+                _settingsCheckingUpdate = false;
+                if (SettingsCheckUpdateBtn != null) SettingsCheckUpdateBtn.IsEnabled = true;
+                // 失败时状态行已由 catch 写好，不要再覆盖（见上面的 _settingsUpdateStatusPinned）
+                if (_settingsUpdateStatusPinned) _settingsUpdateStatusPinned = false;
+                else RefreshSettingsUpdateUi();
+            }
+        }
+
+        /// <summary>设置页「打开发布页」：浏览器打开 GitHub Releases。</summary>
+        private void OnOpenReleasesPage(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = UpdateService.ReleasesPageUrl,
+                    UseShellExecute = true,
+                });
+            }
+            catch (Exception ex)
+            {
+                Log("打开发布页失败：" + ex.Message);
+            }
         }
 
         // ---------------- 播放器探测（边下边播用） ----------------
@@ -6939,6 +7231,10 @@ namespace GeZi
                 // 任务列表展示方式（文件夹分组 / 平铺）→ 应用分组 + 同步按钮
                 ApplyTaskGrouping();
                 UpdateTaskViewButton();
+                // 【2026-10-21】设置页「关于与更新」：填版本号 + 恢复红点状态。
+                // 此时 UpdateService.Attach 已执行过（见构造函数里的顺序），
+                // HasUpdate 是从上次落盘的版本号算出来的，不会发网络请求。
+                RefreshSettingsUpdateUi();
             }
             finally
             {
@@ -8511,6 +8807,17 @@ namespace GeZi
             // 而用户此时并没有在选东西。
             if (_taskSelectMode && Tabs.SelectedIndex != 1)
                 ExitTaskSelectMode();
+
+            // 【2026-10-21】同理：离开下载页就退出多选模式。
+            // 否则切到别的页面时提示条不见了、模式却还开着，回来点文件会对不上预期。
+            if (_fileSelectMode && Tabs.SelectedIndex != 0)
+                ExitFileSelectMode(clearSelection: false);
+
+            // 【2026-10-21】进入设置页时刷一次「关于与更新」卡片：
+            // 启动检查是异步的，可能在用户切过来之后才拿到结果。
+            // Tab 顺序：0 下载 / 1 任务 / 2 设置 / 3 登录
+            if (Tabs.SelectedIndex == 2)
+                RefreshSettingsUpdateUi();
 
             if (_syncingNav)
                 return;

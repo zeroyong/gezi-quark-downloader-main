@@ -665,20 +665,60 @@
                             <Border Grid.Row="1" Style="{StaticResource Card}" Padding="0">
                                 <Grid>
                                     <Grid.RowDefinitions>
+                                        <!-- 【2026-10-21】顶部多出一行：Alt 多选模式的提示条
+                                             （默认 Collapsed，不占高度） -->
+                                        <RowDefinition Height="Auto"/>
                                         <!-- 列表占满；底部那行只在"还有没加载完的"时候才有高度 -->
                                         <RowDefinition Height="*"/>
                                         <RowDefinition Height="Auto"/>
                                     </Grid.RowDefinitions>
+
+                                    <!-- Alt 多选模式提示条（按住 Alt 进入 / 松开或 Esc 退出）。
+                                         用户反馈「一直需要按 shift 才行 太麻烦」——
+                                         Shift 是"按住修饰键点选"的离散多选，手要一直压着；
+                                         这里给一个**粘滞**模式：按一下 Alt 就进，点选全程不用再按键。
+                                         视觉与任务页「删除选择模式」提示条同一套语言，只是换成主色。 -->
+                                    <Border x:Name="FileSelectBar" Grid.Row="0"
+                                            Visibility="Collapsed" Margin="10,10,10,0" Padding="10,7"
+                                            CornerRadius="8"
+                                            Background="{DynamicResource PrimaryLightBrush}"
+                                            BorderBrush="{DynamicResource PrimarySoftBrush}"
+                                            BorderThickness="1"
+                                            HorizontalAlignment="Left">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Path Data="{StaticResource IconMultiSelect}" Stretch="Uniform"
+                                                  Width="13" Height="13" VerticalAlignment="Center"
+                                                  Stroke="{DynamicResource PrimaryBrush}" StrokeThickness="1.8"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                  StrokeLineJoin="Round"/>
+                                            <TextBlock Text="多选模式" Margin="8,0,0,0" FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource PrimaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="点文件 = 加选 / 取消 · 文件夹不再进入目录"
+                                                       Margin="10,0,0,0" FontSize="11.5"
+                                                       Foreground="{DynamicResource TextSecondaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock x:Name="FileSelectCountText" Text="已选 0 项"
+                                                       Margin="14,0,0,0" FontSize="11.5" FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource PrimaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                            <TextBlock Text="Esc 退出" Margin="12,0,0,0" FontSize="11"
+                                                       Foreground="{DynamicResource TextTertiaryBrush}"
+                                                       VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Border>
+
                                     <!-- ⚠️ SelectionMode=Extended 本来 Shift+点击 = **连选**（整段区间）。
                                          用户要求「可以使用 shift 多选，但不是连选」——
                                          即 Shift+点击只切换**这一个**项的选中态。
                                          做法见 OnListPreviewMouseDown（拦下 Shift 点击自己处理）。
                                          【2026-10-08】单击文件夹 = **直接进入**，也在这个处理器里裁决，
                                          所以不再挂 MouseDoubleClick（双击会多进一层）。 -->
-                                    <ListBox x:Name="FileList" SelectionMode="Extended"
+                                    <ListBox x:Name="FileList" Grid.Row="1" SelectionMode="Extended"
                                              Style="{StaticResource PlainListBox}"
                                              ItemContainerStyle="{StaticResource FileListItem}"
                                              PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
+                                             SelectionChanged="OnFileListSelectionChanged"
                                              MouseRightButtonUp="OnFileListRightClick">
                                         <ListBox.ContextMenu>
                                             <ContextMenu>
@@ -799,8 +839,10 @@
                                     </StackPanel>
 
                                     <!-- 【2026-10-09】分页提示：目录大时列表一次只"露"一批条目，
-                                         这行告诉用户"下面还有"，滚到底会自动续上（见 LoadMoreItems）。 -->
-                                    <TextBlock x:Name="FileMoreHint" Grid.Row="1"
+                                         这行告诉用户"下面还有"，滚到底会自动续上（见 LoadMoreItems）。
+                                         【2026-10-21】所在 Grid 多了一行（Alt 多选提示条），
+                                         列表从第 1 行挪到第 2 行，这里同步改成第 2 行。 -->
+                                    <TextBlock x:Name="FileMoreHint" Grid.Row="2"
                                                Visibility="Collapsed"
                                                HorizontalAlignment="Center" Margin="0,2,0,10"
                                                Foreground="{DynamicResource TextTertiaryBrush}"
@@ -981,7 +1023,7 @@
                                                     CornerRadius="9.5" Margin="9,0,0,0"
                                                     VerticalAlignment="Center"
                                                     Background="{DynamicResource SurfaceSunkenBrush}"
-                                                    BorderBrush="{DynamicResource BorderBrush}"
+                                                    BorderBrush="{DynamicResource BorderBrushSoft}"
                                                     BorderThickness="1">
                                                 <Border x:Name="ShutdownSwKnob" Width="14" Height="14"
                                                         CornerRadius="7" Margin="2,0,0,0"
@@ -1314,10 +1356,24 @@
                                                     <ColumnDefinition Width="Auto"/>
                                                     <ColumnDefinition Width="Auto"/>
                                                 </Grid.ColumnDefinitions>
-                                                <!-- 20 格车道：固定宽度，按比例点亮 -->
+                                                <!-- 20 格车道：固定宽度，按比例点亮
+                                                     【2026-10-21】只在「下载中」显示（用户要求）：
+                                                     完成 / 暂停 / 排队 / 失败 / 取消时整排收起 ——
+                                                     这些状态下连接数不再变化，留着只是视觉噪音，
+                                                     而且会白占 60+66px，把进度条挤短。 -->
                                                 <ItemsControl Grid.Column="0" ItemsSource="{Binding Lanes}"
                                                               VerticalAlignment="Center"
                                                               ToolTip="{Binding LaneText}">
+                                                    <ItemsControl.Style>
+                                                        <Style TargetType="ItemsControl">
+                                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding State}" Value="Downloading">
+                                                                    <Setter Property="Visibility" Value="Visible"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </ItemsControl.Style>
                                                     <ItemsControl.ItemsPanel>
                                                         <ItemsPanelTemplate>
                                                             <UniformGrid Rows="1"/>
@@ -1343,11 +1399,23 @@
                                                         </DataTemplate>
                                                     </ItemsControl.ItemTemplate>
                                                 </ItemsControl>
-                                                <!-- 连接数文字：如「12/32 连接」 -->
+                                                <!-- 连接数文字：如「12/32 连接」。
+                                                     与车道同步：只在下载中显示（见上方注释）。 -->
                                                 <TextBlock Grid.Column="1" Text="{Binding LaneText}"
                                                            Margin="8,0,0,0" MinWidth="66"
-                                                           FontSize="11" VerticalAlignment="Center"
-                                                           Style="{StaticResource TertiaryText}"/>
+                                                           FontSize="11" VerticalAlignment="Center">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock"
+                                                               BasedOn="{StaticResource TertiaryText}">
+                                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding State}" Value="Downloading">
+                                                                    <Setter Property="Visibility" Value="Visible"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
                                                 <!-- 【2026-10-13】进度条按状态上色（与方案 A 一致）：
                                                      下载中 = 主色靛蓝；完成 = 绿；暂停 = 橙；失败 = 红；
                                                      已取消 = 中性灰。轨道统一改成凹槽色，避免整条都是蓝。 -->
@@ -1895,6 +1963,76 @@
                                     </StackPanel>
                                 </Border>
                             </Grid>
+
+                            <!-- ============ 关于与更新 ============
+                                 【2026-10-21 新增】用户反馈「不是说接入了 GitHub 自动更新吗，
+                                 在设置页没看到相关检查更新 UI」—— 之前只有「关于」窗口里
+                                 一个小按钮，藏在侧栏品牌区的「?」后面，等于找不到。
+                                 这里给一个正式入口：当前版本 + 检查按钮 + 状态行。
+                                 启动时的静默检查仍有（有新版本点亮红点 + 气泡），
+                                 这里负责「我想手动查一下」和「看到版本号」。
+                                 放在快捷键卡片之前：它是设置页的收尾信息，
+                                 不该插在会被经常改的并发/存储中间。 -->
+                            <TextBlock Text="关于与更新" Style="{StaticResource SectionLabel}" Margin="0,22,0,10"/>
+                            <Border Style="{StaticResource MutedCard}" Margin="0,0,0,4">
+                                <StackPanel>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="Auto"/>
+                                        </Grid.ColumnDefinitions>
+
+                                        <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                            <StackPanel Orientation="Horizontal">
+                                                <Path Data="{StaticResource IconUpdate}" Stretch="Uniform"
+                                                      Width="14" Height="14" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource PrimaryBrush}"
+                                                      StrokeThickness="1.8"
+                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                      StrokeLineJoin="Round"/>
+                                                <TextBlock Text="鸽子下载" Margin="7,0,0,0"
+                                                           VerticalAlignment="Center"
+                                                           Style="{StaticResource CardTitleText}"
+                                                           FontSize="14"/>
+                                                <!-- 当前版本号（LoadSettingsToUi 里从程序集填） -->
+                                                <TextBlock x:Name="SettingsVersionText" Margin="8,0,0,0"
+                                                           VerticalAlignment="Center"
+                                                           FontSize="12"
+                                                           Foreground="{DynamicResource TextTertiaryBrush}"
+                                                           Text="v—"/>
+                                                <!-- 有新版本时的红点（与「关于」窗口同源：UpdateService.HasUpdate） -->
+                                                <Ellipse x:Name="SettingsUpdateDot" Width="6" Height="6"
+                                                         Margin="7,0,0,0" VerticalAlignment="Center"
+                                                         Fill="{DynamicResource DangerBrush}"
+                                                         Visibility="Collapsed"
+                                                         ToolTip="有新版本可用"/>
+                                            </StackPanel>
+                                            <TextBlock x:Name="SettingsUpdateStatusText"
+                                                       Text="从 GitHub Releases 检查新版本"
+                                                       Margin="0,6,0,0" TextWrapping="Wrap"
+                                                       Style="{StaticResource ProseText}"/>
+                                        </StackPanel>
+
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal"
+                                                    VerticalAlignment="Center" Margin="12,0,0,0">
+                                            <Button x:Name="SettingsCheckUpdateBtn" Content="检查更新"
+                                                    Click="OnSettingsCheckUpdate"
+                                                    AutomationProperties.Name="设置页检查更新"
+                                                    Style="{StaticResource SecondaryButton}"
+                                                    Margin="0,0,8,0"
+                                                    ToolTip="立即从 GitHub Releases 检查新版本（不受启动检查的节流限制）"/>
+                                            <Button x:Name="SettingsOpenReleasesBtn" Content="打开发布页"
+                                                    Click="OnOpenReleasesPage"
+                                                    AutomationProperties.Name="打开发布页"
+                                                    Style="{StaticResource GhostButton}"
+                                                    ToolTip="在浏览器中打开 GitHub Releases 页面"/>
+                                        </StackPanel>
+                                    </Grid>
+
+                                    <TextBlock Style="{StaticResource ProseText}" Margin="0,10,0,0"
+                                               Text="启动时会静默检查一次，有新版本只点亮红点并弹一次提示，不会打断你。这里可以随时手动再查。"/>
+                                </StackPanel>
+                            </Border>
 
                             <!-- ============ 快捷键 ============
                                  【2026-10-08 新增】放在设置页最下面 —— 它是"查一下"的东西，

@@ -101,7 +101,7 @@
                             Cursor="Hand" Background="Transparent" BorderThickness="0"
                             Padding="0">
                         <TextBlock x:Name="RepoText"
-                                   Text="开源地址：github.com/huaotem-bot/gezi-quark-downloader"
+                                   Text="开源地址：github.com/zeroyong/gezi-quark-downloader-main"
                                    FontSize="11.5" TextDecorations="Underline"
                                    TextWrapping="Wrap"
                                    Foreground="{DynamicResource PrimaryBrush}"/>

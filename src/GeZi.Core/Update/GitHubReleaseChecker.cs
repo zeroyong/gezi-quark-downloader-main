@@ -1,4 +1,4 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
 // Copyright (C) 2026  Yi Yuan
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -23,7 +23,7 @@ namespace GeZi.Core.Update
 {
     /// <summary>
     /// 查 GitHub Releases 的「最新发布」（2026-10-18 新一代检查更新）。
-    /// 项目已开源（github.com/huaotem-bot/gezi-quark-downloader），
+    /// 项目已开源（github.com/zeroyong/gezi-quark-downloader-main），
     /// Release 天然带 tag_name（版本号）、body（更新说明）、html_url（下载页），
     /// 不依赖夸克登录态、不写用户网盘、无中转清理 —— 旧那套网盘更新源整套退役。
     /// GitHub API 对没有 User-Agent 的请求直接 403。
@@ -32,11 +32,20 @@ namespace GeZi.Core.Update
     /// </summary>
     public sealed class GitHubReleaseChecker
     {
-        /// <summary>仓库归属（与 README 的开源地址一致）。</summary>
-        public const string RepoOwner = "huaotem-bot";
+        /// <summary>
+        /// 仓库归属（与 README 的开源地址、关于页的链接一致）。
+        /// </summary>
+        /// <remarks>
+        /// 【2026-10-21 修正】原来写的是上游原作者仓库 <c>huaotem-bot/gezi-quark-downloader</c>，
+        /// 但上面只有原作者的历史版本（最新 v2.3.1），而本仓已远高于它（v2.7.0）——
+        /// 结果就是"永远显示已是最新版本"，更新功能形同虚设。
+        /// 本项目的后续发布在 <c>zeroyong/gezi-quark-downloader-main</c>，
+        /// 检查更新与「打开发布页」都必须指向它。
+        /// </remarks>
+        public const string RepoOwner = "zeroyong";
 
         /// <summary>仓库名（与 README 的开源地址一致）。</summary>
-        public const string RepoName = "gezi-quark-downloader";
+        public const string RepoName = "gezi-quark-downloader-main";
 
         /// <summary>最新发布接口（GitHub 固定语义：永远指向 latest release）。</summary>
         public const string LatestApiUrl =

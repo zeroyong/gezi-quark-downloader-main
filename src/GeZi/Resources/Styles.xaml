@@ -349,7 +349,7 @@
     <Style x:Key="ShutdownPillBorder" TargetType="Border">
         <Setter Property="CornerRadius" Value="7"/>
         <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushSoft}"/>
         <Setter Property="BorderThickness" Value="1"/>
         <Style.Triggers>
             <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="on">

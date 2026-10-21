@@ -166,4 +166,12 @@
     <!-- 【2026-10-20】「完成后关机」图标：经典电源符号（竖线 + 缺口圆弧） -->
     <Geometry x:Key="IconShutdown">M12,3 V12 M7.5,6.5 A7,7 0 1 0 16.5,6.5</Geometry>
 
+    <!-- 【2026-10-21】「检查更新」图标：向上箭头入托盘（软件更新的通用符号，
+         与 IconDownload 的向下箭头方向相反，一眼能区分「更新」和「下载」） -->
+    <Geometry x:Key="IconUpdate">M12,16 V4 M7,9 L12,4 L17,9 M4,20 H20</Geometry>
+
+    <!-- 【2026-10-21】「多选模式」图标：三个方框 + 两个对勾（表示"一次选多项"）。
+         与 IconCheck（单个对勾）区分开，用在下载页 Alt 多选提示条上。 -->
+    <Geometry x:Key="IconMultiSelect">M3,5 H12 V14 H3 Z M6,18 L8.5,20.5 L13,16 M15,10 L17.5,12.5 L22,8</Geometry>
+
 </ResourceDictionary>
