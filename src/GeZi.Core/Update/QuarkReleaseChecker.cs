@@ -29,7 +29,7 @@ namespace GeZi.Core.Update
     /// 夸克网盘分享里的安装包 —— 更新的第二个来源。
     /// <para>
     /// 【包名不含中文】安装包文件名规则见 <see cref="PackageNamePattern"/>
-    /// （形如 <c>GeZi-v2.8.1-win64.zip</c>），与界面上的品牌名无关 ——
+    /// （形如 <c>GeZi-v2.8.2-win64.zip</c>），与界面上的品牌名无关 ——
     /// 改名只影响界面文案，不要动包名规则，否则就找不到自己传上去的包了。
     /// </para>
     /// <para>

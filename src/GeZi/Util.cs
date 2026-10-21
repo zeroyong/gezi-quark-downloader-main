@@ -95,7 +95,7 @@ namespace GeZi
         /// （便携模式），于是<b>同一个程序的每一份副本各存各的</b>：</para>
         /// <list type="bullet">
         /// <item>Debug 版（src\GeZi\bin\Debug\net48\）写自己那份 state.json；</item>
-        /// <item>发行包（dist\GeZi-v2.8.1-win64\）写另一份；</item>
+        /// <item>发行包（dist\GeZi-v2.8.2-win64\）写另一份；</item>
         /// <item>原版 v2.3.1 又是另一份。</item>
         /// </list>
         /// <para>后果实测（用户报告）：<b>下载是发行包发起的，任务记录却只在 Debug 那份里有</b> ——

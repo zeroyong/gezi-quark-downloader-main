@@ -79,12 +79,18 @@
 
 ### 方式一：下载发行版（推荐）
 
-1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.8.1-win64.zip` 并解压到任意目录
+1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.8.2-win64.zip` 并解压到任意目录
 2. 双击 `GeZi.exe` 即可运行
 3. 若系统缺少 .NET Framework 4.8，Windows 会弹窗提示，按引导安装即可
 
 > **免安装、免 Python**：解压即用。安装包约 **3 MB**（含 OpenSSL 与 ZXing 两个原生库），
 > 只含运行必需的文件 —— 调试符号、账号配置一律不进包。
+
+> **数据存放位置**：配置、账号、任务历史统一保存在
+> `%LOCALAPPDATA%\鸽子下载\`，**与 exe 所在目录无关**。
+> 因此 Debug 版、发行包、放在不同目录的多个副本**共享同一份数据**，
+> 换目录启动不会"任务不见了"，也不会出现两份程序互相踩分片。
+> 首次启动时若发现旧版把数据放在 exe 同目录（便携模式），会自动迁移过来。
 
 ### 方式二：从源码构建
 
@@ -114,7 +120,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package.ps1
 ```
 
 > ⚠️ 打包**不会**把 `GeZi.config.xml`（含登录 Cookie）与 `accounts/`（账号档案）
-> 放进 zip —— 那是本机隐私。如果想要带登录态的便携版，把这两个手动拷到解压目录即可。
+> 放进 zip —— 那是本机隐私。现在数据固定存放在 `%LOCALAPPDATA%\鸽子下载\`，
+> 发行包解压后**不含任何用户数据**，第一次启动会自动在数据目录里新建配置
+> （登录一次，之后就长期保留在那里）。
 
 ---
 
@@ -135,7 +143,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package.ps1
 | 夸克网盘分享（回退） | `https://pan.quark.cn/s/065af2172c40`（提取码 `VD8m`） | 分享内 `GeZi-vX.Y.Z-win64.zip` |
 
 双源并发检查，取**版本号更高者**；版本相同时优先 GitHub。无论是哪个源，更新都**不会回退到更低版本**。
-当前应用版本号从程序集读取（如 `2.8.1`），更新检测据此判断是否有新版本。
+当前应用版本号从程序集读取（如 `2.8.2`），更新检测据此判断是否有新版本。
 
 > 说明（方案选择）：一键更新采用「解压覆盖 + 外部小脚本接力」的方式 —— 主进程先退出，
 > 再由 `gezi-updater.cmd` 用 `xcopy` 覆盖文件并拉起新版本，避免「程序自我覆盖」的占用冲突。
