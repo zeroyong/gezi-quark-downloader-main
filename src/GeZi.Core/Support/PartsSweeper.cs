@@ -196,6 +196,14 @@ namespace GeZi.Core.Support
             if (name.EndsWith(".qmeta", StringComparison.OrdinalIgnoreCase)) return true;
             if (name.Equals("meta.json", StringComparison.OrdinalIgnoreCase)) return true;
             if (name.IndexOf(".part", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+
+            // 【2026-10-21】File.Replace 的中间态残留：`{名字}~RF{随机}.TMP`。
+            // 例：`xxx.mkv.qmeta~RF8db9bdf.TMP`（用户实测在下载目录里发现过）。
+            // 它是替换过程留下的垃圾，不参与任何续传判断，纳入清扫可防止长期堆积；
+            // 真正在用的 `*.qmeta.tmp`（SavePlan 自己的临时文件）不含 ~RF，不会误删。
+            if (name.IndexOf("~RF", StringComparison.OrdinalIgnoreCase) >= 0
+                && name.EndsWith(".TMP", StringComparison.OrdinalIgnoreCase)) return true;
+
             return false;
         }
 

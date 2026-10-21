@@ -3261,7 +3261,21 @@ namespace GeZi
             return sum;
         }
 
+        /// <summary>
+        /// 工具栏「刷新」按钮。
+        /// <para>【2026-10-21】用户要求「r 相当于点击刷新功能」，所以把实际逻辑抽到
+        /// <see cref="RefreshCurrentDirAsync"/>，按钮与快捷键共用同一份，
+        /// 不会出现"按钮刷了、r 刷的是别的"这种分叉。</para>
+        /// </summary>
         private async void OnRefresh(object sender, RoutedEventArgs e)
+        {
+            await RefreshCurrentDirAsync();
+        }
+
+        /// <summary>
+        /// 刷新当前目录（绕过缓存重新请求）。按钮点击与 <c>r</c> 快捷键共用。
+        /// </summary>
+        private async Task RefreshCurrentDirAsync()
         {
             // 刷新要重新拉一次目录（网络）→ 按钮就地变成"刷新中…"
             long t0 = BusyClock();
@@ -3657,6 +3671,29 @@ namespace GeZi
                 else EnterFileSelectMode();
                 return;
             }
+
+            // ⓪.1 Esc 隐藏「已在下载 / 已下载过」提示条（2026-10-21 用户要求）。
+            //      顺序讲究：先收提示，再轮到下面的"退出多选模式" ——
+            //      提示条是刚出现的临时信息，用户按 Esc 的第一意图几乎总是"关掉它"。
+            if (e.Key == Key.Escape && DuplicateHintBar != null
+                && DuplicateHintBar.Visibility == Visibility.Visible)
+            {
+                e.Handled = true;
+                HideDuplicateHint();
+                return;
+            }
+
+            // ⓪.2 r = 刷新当前目录（等价于点工具栏那颗「刷新」，2026-10-21 用户要求）。
+            //      只在下载页有意义：刷新的是文件列表。
+            //      复用 OnRefresh 意味着同样会**绕过缓存**、走真实请求 ——
+            //      这样从本地缓存恢复后，r 就是"去看有没有更新"的快捷方式。
+            if (e.Key == Key.R && Tabs.SelectedIndex == 0)
+            {
+                e.Handled = true;
+                RefreshCurrentDirAsync();
+                return;
+            }
+
             // Esc 退出多选模式
             if (_fileSelectMode && e.Key == Key.Escape)
             {
@@ -4244,7 +4281,8 @@ namespace GeZi
             if (_client == null) { Log("请先登录或解析分享"); return; }
 
             var list = new List<LinkExporter.Item>();
-            int skipped = 0;
+ int skipped = 0;
+ var pathSkippedNames = new List<string>();   // 路径级去重跳过的文件名（供 UI 提示）
             foreach (var it in items)
             {
                 if (string.IsNullOrEmpty(it.Url)) { skipped++; continue; }
@@ -4375,6 +4413,155 @@ namespace GeZi
         // 【做法】在**入队前**按目标路径查一遍任务列表，命中就跳过并记日志，
         //        从源头上不产生第二条任务。核心层那道互斥继续留着当最后一道保险。
 
+        // ---------------- 重复下载提示（2026-10-21 新增） ----------------
+        //
+        // 【需求】用户要求：「当检查重复下载时，应该要添加提示信息，提示用户已经下载过，
+        //        现在只是不入队」。
+        // 【为什么不能只写日志】去重原来只 Log 一行，而日志在**任务页**、用户点的是
+        //        **下载页**的按钮 —— 点了没反应、任务数也没变，很容易以为按钮坏了。
+        //        所以在按钮下方给一条看得见的说明，把"跳过"变成明确结果。
+
+        /// <summary>
+        /// 「已在下载 / 已下载过」提示条的自动隐藏定时器（2026-10-21 用户要求
+        /// 「最好过段时间自动隐藏，不要一直展示」）。
+        /// </summary>
+        private DispatcherTimer _dupHintTimer;
+
+        /// <summary>提示条自动隐藏延时（毫秒）。</summary>
+        /// <remarks>
+        /// 取 8 秒的理由：这条提示是要被**读完**的（含文件名），比纯状态提示需要更久；
+        /// 但它只是个通知，不该长期占着按钮上方的空间。
+        /// 鼠标悬停在提示条上时会暂停计时（见 OnDuplicateHintMouseEnter/Leave），
+        /// 用户正在读或准备点「打开下载目录」时不会被抢走。
+        /// </remarks>
+        private const int DupHintAutoHideMs = 8000;
+
+        /// <summary>启动（或重启）提示条的自动隐藏计时。</summary>
+        private void RestartDuplicateHintTimer()
+        {
+            try
+            {
+                if (_dupHintTimer == null)
+                {
+                    _dupHintTimer = new DispatcherTimer
+                    {
+                        Interval = TimeSpan.FromMilliseconds(DupHintAutoHideMs),
+                    };
+                    _dupHintTimer.Tick += (s, e) =>
+                    {
+                        try
+                        {
+                            _dupHintTimer.Stop();
+                            HideDuplicateHint();
+                        }
+                        catch { }
+                    };
+                }
+                _dupHintTimer.Stop();
+                _dupHintTimer.Start();
+            }
+            catch { }
+        }
+
+        /// <summary>鼠标移到提示条上 → 暂停自动隐藏（用户正在看）。</summary>
+        private void OnDuplicateHintMouseEnter(object sender, MouseEventArgs e)
+        {
+            try { _dupHintTimer?.Stop(); } catch { }
+        }
+
+        /// <summary>鼠标离开提示条 → 重新开始计时（给足一整轮时间再收）。</summary>
+        private void OnDuplicateHintMouseLeave(object sender, MouseEventArgs e)
+        {
+            if (DuplicateHintBar != null && DuplicateHintBar.Visibility == Visibility.Visible)
+                RestartDuplicateHintTimer();
+        }
+
+        /// <summary>
+        /// 显示「已在下载 / 已下载过」提示条。
+        /// </summary>
+        /// <param name="skippedNames">被跳过的文件名（用于文案；只列举前几个）。</param>
+        /// <param name="allSkipped">true = 本次选择**全部**都已存在，一个都没入队。</param>
+        private void ShowDuplicateHint(IList<string> skippedNames, bool allSkipped)
+        {
+            try
+            {
+                if (DuplicateHintBar == null || DuplicateHintText == null) return;
+                int n = skippedNames != null ? skippedNames.Count : 0;
+                if (n == 0) return;
+
+                // 文案：全跳过 vs 部分跳过，说清"没有入队"这件事
+                string head = allSkipped
+                    ? "这些文件已经下载过或正在下载，本次没有加入队列。"
+                    : "已跳过 " + n + " 个已在任务列表里的文件（其余文件正常加入队列）。";
+
+                // 最多列 3 个名字，避免提示条被撑得过长
+                var sb = new StringBuilder(head);
+                int show = Math.Min(n, 3);
+                for (int i = 0; i < show; i++)
+                {
+                    sb.Append(i == 0 ? "　" : "、");
+                    sb.Append(skippedNames[i]);
+                }
+                if (n > show) sb.Append(" 等 " + n + " 个");
+
+                DuplicateHintText.Text = sb.ToString();
+
+                // 全部跳过 → 警示色（用户什么都没得到，需要明确解释）
+                // 部分跳过 → 中性色（任务照常进行了，只是少几个）
+                DuplicateHintBar.Background = allSkipped
+                    ? (Brush)(TryFindResource("WarningLightBrush") ?? Brushes.Transparent)
+                    : (Brush)(TryFindResource("SurfaceAltBrush") ?? Brushes.Transparent);
+                DuplicateHintBar.BorderBrush = (Brush)(TryFindResource("WarningBrush") ?? Brushes.Gray);
+
+                // 「打开下载目录」只在全都跳过时才有意义（部分跳过时用户关注的是新任务）
+                if (DuplicateOpenDirBtn != null)
+                    DuplicateOpenDirBtn.Visibility = allSkipped ? Visibility.Visible : Visibility.Collapsed;
+
+                DuplicateHintBar.Visibility = Visibility.Visible;
+
+                // 自动隐藏（用户要求）：显示后开始计时，到点自己收起
+                RestartDuplicateHintTimer();
+            }
+            catch { }
+        }
+
+        /// <summary>收起提示条（用户点「知道了」，或自动隐藏到点）。</summary>
+        private void OnDismissDuplicateHint(object sender, RoutedEventArgs e)
+        {
+            HideDuplicateHint();
+        }
+
+        /// <summary>提示条上的「打开下载目录」：直接去看已经下好的文件。</summary>
+        private void OnOpenDownloadDirFromHint(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                string dir = _settings != null ? _settings.OutDir : null;
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+                {
+                    Log("下载目录还不存在：" + (dir ?? "(未设置)"));
+                    return;
+                }
+                if (!ShellLaunch.OpenFolder(dir))
+                    Log("打开下载目录失败：" + dir);
+            }
+            catch (Exception ex)
+            {
+                Log("打开下载目录失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>用户做了新的下载动作、或提示到时/被关闭时隐藏提示条。</summary>
+        private void HideDuplicateHint()
+        {
+            try
+            {
+                _dupHintTimer?.Stop();     // 收起了就别再跑计时器
+                if (DuplicateHintBar != null) DuplicateHintBar.Visibility = Visibility.Collapsed;
+            }
+            catch { }
+        }
+
         /// <summary>
         /// 从待下载列表里剔除**已经下过或正在下**的文件（2026-10-21 新增，用户要求"在发请求之前判断"）。
         ///
@@ -4391,7 +4578,7 @@ namespace GeZi
         /// <para>【原地修改】直接把重复项从 <paramref name="files"/> 里移除，
         /// 返回被剔除的数量，调用方据此判断"是不是全都被跳过了"。</para>
         /// </summary>
-        private int FilterAlreadyQueued(List<ShareFileItem> files)
+        private int FilterAlreadyQueued(List<ShareFileItem> files, List<string> skippedNames = null)
         {
             if (files == null || files.Count == 0) return 0;
             int removed = 0;
@@ -4411,6 +4598,7 @@ namespace GeZi
 
                     files.RemoveAt(i);
                     removed++;
+                    skippedNames?.Add(f.Name);   // 供 UI 提示条列举（2026-10-21）
                     string why = hit.State == JobState.Completed ? "已下载过" : "已在任务列表里";
                     Log(why + "，跳过：" + f.Name);
                 }
@@ -4503,7 +4691,8 @@ namespace GeZi
             var alloc = AllocateThreads(items.Select(i => i.Size).ToList());
             var jobs = new List<DownloadJob>();
             var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // 本批已占用路径
-            int skipped = 0;
+ int skipped = 0;
+ var pathSkippedNames = new List<string>();   // 路径级去重跳过的文件名（供 UI 提示）
             for (int i = 0; i < items.Count; i++)
             {
                 var it = items[i];
@@ -4513,7 +4702,7 @@ namespace GeZi
                 catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
 
                 string dest = ResolveDestOrSkip(destDir, it.Name, taken);
-                if (dest == null) { skipped++; Log("已在下载，跳过：" + it.Name); continue; }
+                if (dest == null) { skipped++; pathSkippedNames.Add(it.Name); Log("已在下载，跳过：" + it.Name); continue; }
                 var item = it;
                 jobs.Add(new DownloadJob
                 {
@@ -4543,8 +4732,12 @@ namespace GeZi
                 Log(skipped > 0
                     ? "这些文件都已在下载队列里，没有新增任务。"
                     : "没有可下载的条目。");
+                // 用户要求：检查重复时要给看得见的提示（不能只写日志）
+                if (skipped > 0) ShowDuplicateHint(pathSkippedNames, allSkipped: true);
                 return;
             }
+            if (skipped > 0) ShowDuplicateHint(pathSkippedNames, allSkipped: false);
+            else HideDuplicateHint();
 
             LogAllocation(alloc);
             foreach (var job in jobs)
@@ -4574,7 +4767,28 @@ namespace GeZi
             try
             {
                 // 把选中的文件夹递归展开成文件列表（保留相对目录）
-                var files = await CollectFilesAsync(selected, "", 0, ct);
+                //
+                // 【2026-10-21 修复】起点从 "" 改为**当前所在的目录名**。
+                //
+                // 原来的问题（用户反馈「任务页的文件夹分类展示是正常的，但是下载的文件
+                // 没有放到对应文件夹位置，反而直接下载，和任务页看到的不符合」）：
+                //   · 用户在「《亚马逊原版电子书》…」这个目录里选中若干**文件**下载；
+                //   · CollectFilesAsync 的起点是 ""，而这些文件不在任何子文件夹里，
+                //     于是它们的 RelDir 就是 ""；
+                //   · 落盘路径 = OutDir + "" + 文件名 → 文件全铺在下载根目录；
+                //   · 但任务页分组名用的是 CurrentFolderGroupName()（= 当前浏览目录名），
+                //     所以界面上归好了组、磁盘上却没建目录 —— 两边不一致。
+                //
+                // 修法：起点用**当前目录名**（但不是 _shareRootName）。
+                //
+                // ⚠️ 为什么不能用 CurrentFolderGroupName()：那个函数在"分享根目录"时会
+                //    回退到 _shareRootName（分享标题），而 _shareRootName 的注释明确写着
+                //    「只用于任务页的文件夹分组显示，不参与目标路径拼接」。
+                //    拿它拼磁盘路径会凭空造出一个以分享标题命名的大文件夹 —— 不是用户要的。
+                //    所以这里只取 _pathList 的最后一层：那是**用户真正点进去的目录**，
+                //    有它才说明"文件应该归到这个目录里"。
+                string baseRel = _pathList.Count > 0 ? (_pathList[_pathList.Count - 1] ?? "") : "";
+                var files = await CollectFilesAsync(selected, baseRel, 0, ct);
                 ct.ThrowIfCancellationRequested();
                 if (files.Count == 0)
                 {
@@ -4631,12 +4845,19 @@ namespace GeZi
                 //   · 同一个 fid 就是同一个文件，无论目标路径是否被 UniquePath 改过名；
                 //   · 上一版按路径判断有个致命漏洞 —— 已完成的任务会让 UniquePath 把新任务
                 //     改名成 "xxx (1)"，路径不同了于是判定"不重复"，结果又下了一份。
-                int preSkipped = FilterAlreadyQueued(files);
+                var skippedNames = new List<string>();
+                int preSkipped = FilterAlreadyQueued(files, skippedNames);
                 if (preSkipped > 0 && files.Count == 0)
                 {
                     Log("这些文件都已经在任务列表里了，没有新增下载。");
+                    // 用户要求「添加提示信息，提示用户已经下载过，现在只是不入队」——
+                    // 全部重复时一个任务都不会新增，必须在界面上说清楚。
+                    ShowDuplicateHint(skippedNames, allSkipped: true);
                     return;
                 }
+                // 部分重复：提示"跳过 N 个"，但继续处理其余文件
+                if (preSkipped > 0) ShowDuplicateHint(skippedNames, allSkipped: false);
+                else HideDuplicateHint();   // 没有重复 → 收掉上一条旧提示
 
                 var items = await GetDownloadItemsAsync(files, forceNoSave);
 
@@ -4645,7 +4866,8 @@ namespace GeZi
 
                 var jobs = new List<DownloadJob>();
                 var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                int skipped = 0;
+ int skipped = 0;
+ var pathSkippedNames = new List<string>();   // 路径级去重跳过的文件名（供 UI 提示）
                 for (int i = 0; i < items.Count; i++)
                 {
                     var it = items[i];
@@ -4653,7 +4875,7 @@ namespace GeZi
                     try { Directory.CreateDirectory(destDir); }
                     catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
                     string dest = ResolveDestOrSkip(destDir, it.Name, taken);
-                    if (dest == null) { skipped++; Log("已在下载，跳过：" + it.Name); continue; }
+                    if (dest == null) { skipped++; pathSkippedNames.Add(it.Name); Log("已在下载，跳过：" + it.Name); continue; }
                     var item = it;   // 闭包捕获：每次循环一个新变量，避免所有回调指向同一个
                     jobs.Add(new DownloadJob
                     {
@@ -4688,8 +4910,11 @@ namespace GeZi
                     Log(skipped > 0
                         ? "这些文件都已在下载队列里，没有新增任务。"
                         : "没有取得直链（分享者可能关闭直链或游客额度限制）");
+                    // 用户要求：检查重复时要给看得见的提示（不能只写日志）
+                    if (skipped > 0) ShowDuplicateHint(pathSkippedNames, allSkipped: true);
                     return;
                 }
+                if (skipped > 0) ShowDuplicateHint(pathSkippedNames, allSkipped: false);
 
                 LogAllocation(alloc);
                 foreach (var job in jobs)
@@ -10543,6 +10768,9 @@ namespace GeZi
         }
     }
 }
+
+
+
 
 
 

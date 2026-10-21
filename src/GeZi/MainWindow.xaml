@@ -363,6 +363,8 @@
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="*"/>
                             <RowDefinition Height="Auto"/>
+                            <!-- Row5 = 「已在下载 / 已下载过」提示条（默认 Collapsed 不占位） -->
+                            <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
 
                         <!-- 页头 -->
@@ -916,6 +918,52 @@
                                     Foreground="{DynamicResource DangerBrush}"/>
                             </TextBlock>
                         </StackPanel>
+
+                        <!-- ═══ 「已在下载 / 已下载过」提示条（2026-10-21 新增） ═══
+                             用户要求：「当检查重复下载时，应该要添加提示信息，提示用户已经下载过，
+                             现在只是不入队」。
+
+                             为什么要有这条：去重逻辑原来**只写日志**，而日志在任务页里、
+                             用户点的是下载页的按钮 —— 点了没反应、任务也没多，会以为按钮坏了。
+                             这里在按钮正下方给一条明确说明，让"跳过"成为看得见的结果。
+
+                             两种形态（由 RefreshDuplicateHint 控制）：
+                               · 全部重复 → 警示色，说明"都已下载过，没有入队"，并给「打开下载目录」
+                               · 部分重复 → 中性色，说明"已跳过 N 个，其余已在下载"
+                             默认 Collapsed，不占位。 -->
+                        <Border x:Name="DuplicateHintBar" Grid.Row="5"
+                                Visibility="Collapsed" Margin="0,10,0,0" Padding="11,8"
+                                CornerRadius="8"
+                                Background="{DynamicResource WarningLightBrush}"
+                                BorderBrush="{DynamicResource WarningBrush}"
+                                BorderThickness="1"
+                                HorizontalAlignment="Left"
+                                MouseEnter="OnDuplicateHintMouseEnter"
+                                MouseLeave="OnDuplicateHintMouseLeave"
+                                ToolTip="这条提示会在 8 秒后自动收起；鼠标停在这里时会暂停计时">
+                            <StackPanel Orientation="Horizontal">
+                                <Path Data="{StaticResource IconInfo}" Stretch="Uniform" Width="14"
+                                      Height="14" VerticalAlignment="Center"
+                                      Stroke="{DynamicResource WarningBrush}" StrokeThickness="1.8"
+                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                <TextBlock x:Name="DuplicateHintText" Margin="9,0,0,0"
+                                           FontSize="12" VerticalAlignment="Center"
+                                           TextWrapping="Wrap" MaxWidth="620"
+                                           Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                <!-- 「打开下载目录」：用户知道"已经下过了"之后，
+                                     最可能的下一步就是去看那个文件，所以这里直接给入口。 -->
+                                <Button x:Name="DuplicateOpenDirBtn" Content="打开下载目录"
+                                        Click="OnOpenDownloadDirFromHint"
+                                        Style="{StaticResource GhostButton}"
+                                        FontSize="11" Padding="8,3" Margin="12,0,0,0"
+                                        VerticalAlignment="Center"/>
+                                <Button Content="知道了" Click="OnDismissDuplicateHint"
+                                        Style="{StaticResource GhostButton}"
+                                        FontSize="11" Padding="8,3" Margin="4,0,0,0"
+                                        VerticalAlignment="Center"
+                                        ToolTip="收起这条提示"/>
+                            </StackPanel>
+                        </Border>
                     </Grid>
                 </TabItem>
 
@@ -2376,7 +2424,7 @@
                                     </Grid>
 
                                     <TextBlock Style="{StaticResource ProseText}" Margin="0,14,0,0"
-                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史、全屏在任何页面都可用；a / d / s / x / g / i 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件有两种方式：按 s 进入粘滞多选（再按 s 或 Esc 退出，全程不用按键），或按住 Shift 临时多选（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
+                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史、全屏在任何页面都可用；a / d / s / r / x / g / i 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件有两种方式：按 s 进入粘滞多选（再按 s 或 Esc 退出，全程不用按键）、r 刷新当前目录，或按住 Shift 临时多选（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
                                 </StackPanel>
                             </Border>
                         </StackPanel>
@@ -2792,5 +2840,6 @@
         </Grid>
     </Border>
 </Window>
+
 
 

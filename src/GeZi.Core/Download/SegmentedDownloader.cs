@@ -2945,6 +2945,12 @@ namespace GeZi.Core.Download
                 }
 
                 try { File.Delete(metaPath); } catch { }
+                // 【2026-10-21】完工时也扫一遍 File.Replace 的残留（~RF*.TMP）。
+                // 用户实测反馈：下载完成、任务页显示已完成，但下载目录里还躺着一个
+                // "xxx.mkv.qmeta~RF8db9bdf.TMP"（0.15MB）。那正是 SavePlan 里
+                // File.Replace 的中间态没被清掉留下的。这里在做完最后一次 .qmeta 删除后
+                // 顺手清干净，保证"下载完成 = 目录里只剩成品文件"。
+                CleanupReplaceLeftovers(metaPath);
                 if (mergeMode)
                 {
                     // 分片文件在每片合并后即已删除，这里兜底清掉目录本身
@@ -3084,6 +3090,42 @@ namespace GeZi.Core.Download
             }
         }
 
+        /// <summary>
+        /// 清理 <c>File.Replace</c> 可能留下的临时文件（2026-10-21 新增）。
+        ///
+        /// <para>【要清什么】File.Replace 的内部实现会先把**目标**重命名成
+        /// <c>{目标名}~RF{随机}.TMP</c>，换上新的之后再删掉它。
+        /// 删除这一步在以下情况会失败：目标被别的进程打开、杀毒软件正在扫描、
+        /// 进程恰好在那一瞬间退出 —— 于是用户目录里就会躺着一个
+        /// <c>xxx.mkv.qmeta~RF8db9bdf.TMP</c>。用户实测反馈过这个文件
+        /// （任务页显示已完成，磁盘上却多出一个 0.15MB 的 .TMP）。</para>
+        ///
+        /// <para>【为什么可以安全删除】这些 ~RF*.TMP 只是替换过程的中间态，
+        /// 真正的数据在 <paramref name="metaPath"/> 里已经落好了；
+        /// 它们不参与续传判断（LoadPlan 只读 metaPath）。</para>
+        ///
+        /// <para>【为什么不删 *.tmp】<c>metaPath + ".tmp"</c> 是 SavePlan 自己正在写的
+        /// 中间文件，删它会把本次写入搞坏。所以只按 <c>~RF</c> 这个特征匹配。</para>
+        /// </summary>
+        private static void CleanupReplaceLeftovers(string metaPath)
+        {
+            try
+            {
+                string dir = System.IO.Path.GetDirectoryName(metaPath);
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+
+                string pattern = System.IO.Path.GetFileName(metaPath) + "~RF*.TMP";
+                foreach (var f in Directory.GetFiles(dir, pattern))
+                {
+                    try { File.Delete(f); } catch { }   // 被占用就算了，下次还会再清
+                }
+            }
+            catch
+            {
+                // 清理失败不影响下载：这只是顺手收垃圾
+            }
+        }
+
         private static void SavePlan(string metaPath, DownloadPlan plan)
         {
             // 原子写：先落 .tmp，再整体替换。
@@ -3103,23 +3145,48 @@ namespace GeZi.Core.Download
                 }
                 string tmp = metaPath + ".tmp";
                 File.WriteAllText(tmp, sb.ToString());
-                // File.Move 的目标已存在时会抛异常，所以原先是"先 Delete 再 Move"——
-                // 但这两步之间有窗口：若在 Delete 之后、Move 之前断电/进程被杀，
-                // 就变成既没有 .qmeta 也没有可用的 .tmp，LoadPlan 返回 null，
-                // 下载器会把整个任务当成全新的、从零开始 —— 正是本方法要防的事。
+                // 原子替换的写法演进：
                 //
-                // 正确做法是一步替换。.NET Framework 的 File.Move 不支持 overwrite 重载，
-                // 但 File.Replace 语义是"用 tmp 替换 metaPath"，且是原子的，
-                // 还顺带处理目标不存在的情况（不存在时抛错，故先判断）。
+                // ① 原先是"先 Delete 再 Move"—— 两步之间有窗口：若在 Delete 之后、
+                //    Move 之前断电/进程被杀，就变成既没有 .qmeta 也没有可用的 .tmp，
+                //    LoadPlan 返回 null，下载器会把整个任务当成全新的、从零开始。
+                // ② 于是改成 File.Replace(tmp, metaPath, null) —— 语义原子、也不产生备份。
+                //    但**实测留下了垃圾文件**（用户反馈）：
+                //      "B 百变星君….mkv.qmeta~RF8db9bdf.TMP"  0.15MB
+                //    File.Replace 内部会先把目标重命名成 ~RFxxxx.TMP（替换的中间态），
+                //    成功后删掉；一旦目标被占用/替换失败/进程在这瞬间退出，它就留下了。
+                //    而外层是 catch{}，于是这个垃圾悄悄躺在用户的下载目录里 ——
+                //    任务页显示已完成，磁盘上却多一个没人认识的 .TMP，很吓人。
+                // ③ 现在：先尝试 File.Replace（首选，仍是最稳的原子语义），
+                //    失败则退化为 Delete+Move（有极小窗口，但只发生在 Replace 失败时），
+                //    并且**每次都顺手清理 metaPath 旁的 ~RF*.TMP 残留**。
+                bool replaced = false;
                 if (File.Exists(metaPath))
                 {
-                    // File.Replace 要求三者同卷；tmp 与 metaPath 同目录，必然满足。
-                    // 备份文件参数传 null，不额外产生垃圾。
-                    File.Replace(tmp, metaPath, null);
+                    try
+                    {
+                        // 备份文件参数传 null，不额外产生垃圾
+                        File.Replace(tmp, metaPath, null);
+                        replaced = true;
+                    }
+                    catch
+                    {
+                        // Replace 失败（目标被占用 / 跨卷 / 杀毒软件锁定等）→ 退化处理
+                    }
+                }
+                if (!replaced)
+                {
+                    // 目标不存在（首次写）或 Replace 失败：直接覆盖。
+                    // .NET Framework 的 File.Move 不支持 overwrite 重载，所以先删后移。
+                    try { if (File.Exists(metaPath)) File.Delete(metaPath); } catch { }
+                    File.Move(tmp, metaPath);
                 }
                 else
                 {
-                    File.Move(tmp, metaPath);
+                    // Replace 走的是"先重命名成 ~RF*.TMP 再换上"的内部路径。
+                    // 正常情况它自己会清理，但上一步的失败分支、或进程在中间态退出时
+                    // 可能留下残留 —— 这里主动扫一遍，把同前缀的垃圾删掉。
+                    CleanupReplaceLeftovers(metaPath);
                 }
             }
             catch
