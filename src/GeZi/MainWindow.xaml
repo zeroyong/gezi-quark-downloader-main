@@ -222,7 +222,7 @@
                         <StackPanel Grid.Row="2" Margin="15,0,0,7">
                             <!-- 第一行：多选文件的两种方式。
                                  【2026-10-21】用户反馈「一直需要按 shift 才行 太麻烦」，
-                                 所以补了 Alt 粘滞多选模式；这里把更省事的 Alt 放前面，
+                                 所以补了粘滞多选模式（初版用 Alt，因 Alt+Tab 误触发已改为 s）；这里把更省事的 s 放前面，
                                  Shift 作为"临时按一下"的补充（两行都保留，各有适用场景）。 -->
                             <StackPanel Orientation="Horizontal">
                                 <TextBlock Text="按" FontSize="11" VerticalAlignment="Center"
@@ -230,9 +230,9 @@
                                 <Border Background="{DynamicResource SurfaceSunkenBrush}"
                                         BorderBrush="{DynamicResource BorderBrushStrong}"
                                         BorderThickness="1" CornerRadius="4"
-                                        Padding="5,0" Margin="4,0" MinWidth="26"
+                                        Padding="5,0" Margin="4,0" MinWidth="20"
                                         VerticalAlignment="Center">
-                                    <TextBlock Text="Alt" FontSize="10" FontWeight="SemiBold"
+                                    <TextBlock Text="s" FontSize="10" FontWeight="SemiBold"
                                                HorizontalAlignment="Center"
                                                Foreground="{DynamicResource TextSecondaryBrush}"/>
                                 </Border>
@@ -684,7 +684,7 @@
                             <Border Grid.Row="1" Style="{StaticResource Card}" Padding="0">
                                 <Grid>
                                     <Grid.RowDefinitions>
-                                        <!-- 【2026-10-21】顶部多出一行：Alt 多选模式的提示条
+                                        <!-- 【2026-10-21】顶部多出一行：多选模式的提示条
                                              （默认 Collapsed，不占高度） -->
                                         <RowDefinition Height="Auto"/>
                                         <!-- 列表占满；底部那行只在"还有没加载完的"时候才有高度 -->
@@ -692,10 +692,10 @@
                                         <RowDefinition Height="Auto"/>
                                     </Grid.RowDefinitions>
 
-                                    <!-- Alt 多选模式提示条（按住 Alt 进入 / 松开或 Esc 退出）。
+                                    <!-- 多选模式提示条（按 s 进入 / 再按 s 或 Esc 退出）。
                                          用户反馈「一直需要按 shift 才行 太麻烦」——
                                          Shift 是"按住修饰键点选"的离散多选，手要一直压着；
-                                         这里给一个**粘滞**模式：按一下 Alt 就进，点选全程不用再按键。
+                                         这里给一个**粘滞**模式：按一下 s 就进，点选全程不用再按键。
                                          视觉与任务页「删除选择模式」提示条同一套语言，只是换成主色。 -->
                                     <Border x:Name="FileSelectBar" Grid.Row="0"
                                             Visibility="Collapsed" Margin="10,10,10,0" Padding="10,7"
@@ -721,7 +721,7 @@
                                                        Margin="14,0,0,0" FontSize="11.5" FontWeight="SemiBold"
                                                        Foreground="{DynamicResource PrimaryBrush}"
                                                        VerticalAlignment="Center"/>
-                                            <TextBlock Text="Esc / Alt 退出" Margin="12,0,0,0" FontSize="11"
+                                            <TextBlock Text="Esc / s 退出" Margin="12,0,0,0" FontSize="11"
                                                        Foreground="{DynamicResource TextTertiaryBrush}"
                                                        VerticalAlignment="Center"/>
                                         </StackPanel>
@@ -859,7 +859,7 @@
 
                                     <!-- 【2026-10-09】分页提示：目录大时列表一次只"露"一批条目，
                                          这行告诉用户"下面还有"，滚到底会自动续上（见 LoadMoreItems）。
-                                         【2026-10-21】所在 Grid 多了一行（Alt 多选提示条），
+                                         【2026-10-21】所在 Grid 多了一行（多选提示条），
                                          列表从第 1 行挪到第 2 行，这里同步改成第 2 行。 -->
                                     <TextBlock x:Name="FileMoreHint" Grid.Row="2"
                                                Visibility="Collapsed"
@@ -2376,7 +2376,7 @@
                                     </Grid>
 
                                     <TextBlock Style="{StaticResource ProseText}" Margin="0,14,0,0"
-                                               Text="都是单键，不需要按 Ctrl/Alt（Alt 例外：它是「下载」页的多选开关，见下文）。切页、关于、解析历史、全屏在任何页面都可用；a / d / x / g / i 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件有两种方式：按 Alt 进入粘滞多选（再按一次 Alt 或 Esc 退出，全程不用按键），或按住 Shift 临时多选（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
+                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史、全屏在任何页面都可用；a / d / s / x / g / i 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件有两种方式：按 s 进入粘滞多选（再按 s 或 Esc 退出，全程不用按键），或按住 Shift 临时多选（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
                                 </StackPanel>
                             </Border>
                         </StackPanel>
@@ -2792,3 +2792,5 @@
         </Grid>
     </Border>
 </Window>
+
+

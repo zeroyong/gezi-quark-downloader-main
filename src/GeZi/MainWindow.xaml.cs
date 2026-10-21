@@ -2329,7 +2329,7 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 文件列表的**粘滞多选模式**（2026-10-21 新增，按 Alt 进入 / Esc 退出）。
+        /// 文件列表的**粘滞多选模式**（2026-10-21 新增，按 s 进入 / 再按 s 或 Esc 退出）。
         ///
         /// <para>【为什么要做】用户反馈「一直需要按 shift 才行 太麻烦」。
         /// 原来只能 Shift+点击离散多选 —— 每点一个都得压着 Shift，
@@ -2337,7 +2337,7 @@ namespace GeZi
         ///
         /// <para>【与 Shift 的分工】两者都能多选，但性质不同：
         /// · Shift+点击 = **一次性**修饰：按着才有效，松手即恢复"单击进入文件夹"；
-        /// · Alt 模式   = **粘滞**开关：按一下进入，之后点选全程不用再按键，Esc 退出。
+        /// · s 多选模式 = **粘滞**开关：按一下进入，之后点选全程不用再按键，再按 s 或 Esc 退出。
         /// 进入后文件夹也不再"单击进入"（否则选文件夹时会被弹进目录），
         /// 这正是多选场景想要的。</para>
         /// </summary>
@@ -2346,7 +2346,7 @@ namespace GeZi
         /// <summary>
         /// 当前文件列表里是否有可选的条目（考虑筛选词）。
         /// <para>用于决定多选模式能否进入 —— 空列表里进多选模式毫无意义，
-        /// 只会看到一条提示条挂在那里，用户反馈「没有文件按 Alt 也会展示多选提示」。</para>
+        /// 只会看到一条提示条挂在那里，用户反馈过"没有文件也会展示多选提示"。</para>
         /// </summary>
         private bool HasSelectableFiles()
         {
@@ -2383,7 +2383,7 @@ namespace GeZi
             catch { }
             UpdateFileSelectCount();
             if (!silent)
-                Log("已进入多选模式：点文件即可加选 / 取消（文件夹不再进入目录）；再按 Alt 或 Esc 退出。");
+                Log("已进入多选模式：点文件即可加选 / 取消（文件夹不再进入目录）；再按 s 或 Esc 退出。");
             return true;
         }
 
@@ -2422,7 +2422,7 @@ namespace GeZi
 
         /// <summary>
         /// 文件列表的左键点击策略（在 PreviewMouseLeftButtonDown / 隧道阶段统一裁决）：
-        ///   · **Alt 多选模式**（粘滞）：点任意行 = 切换该行选中，文件夹不进入；
+        ///   · **s 多选模式**（粘滞）：点任意行 = 切换该行选中，文件夹不进入；
         ///   · **单击文件夹 = 直接进入**（2026-10-08 用户要求「单击就直接打开文件夹」）；
         ///   · **Shift+点击 = 离散多选**（只切换点中的这一项），**不做连选**；
         ///   · **Ctrl+点击 = 只选中这一个**，不进目录；
@@ -2478,7 +2478,7 @@ namespace GeZi
             if (item == null)
                 return;   // 点在空白处：交给默认处理（清空选择）
 
-            // ⓪.5 Alt 多选模式（粘滞，2026-10-21）：点任意行 = 切换该行选中。
+            // ⓪.5 多选模式（粘滞，2026-10-21）：点任意行 = 切换该行选中。
             //     必须排在 Shift / Ctrl / "单击文件夹进入" 之前 ——
             //     这个模式存在的意义就是"点一下就切换，不用按修饰键、也不会被弹进目录"。
             //     放在 item == null 之后：点空白处仍然走默认（清空选择），符合直觉。
@@ -3402,24 +3402,27 @@ namespace GeZi
             // 光标在输入框里 → 这些字符是文字，不是快捷键
             if (IsTypingTarget(Keyboard.FocusedElement)) return;
 
-            // ⓪ Alt 多选模式（2026-10-21）：**再按一次 Alt 也能退出**（用户要求），
-            //    与 Esc 等价。⚠️ 必须排在下面那个"带修饰键就 return"之前 ——
-            //    否则按下 Alt 本身就被当成修饰键直接放行了
-            //    （Alt/Shift 这类纯修饰键也会走到这里，e.Key 为 Key.System，
-            //      真正的键在 e.SystemKey）。
-            if (e.Key == Key.System && e.SystemKey == Key.LeftAlt
-                || e.Key == Key.LeftAlt || e.Key == Key.RightAlt)
+            // ⓪ 多选模式开关（2026-10-21 新增，2026-10-21 晚改键）：
+            //    **s 键切换进入 / 退出**，Esc 也能退出（任何页面都能退，
+            //    避免切页后卡在模式里不自知）。
+            //
+            // 【为什么不用 Alt】用户反馈「现在 alt 键会导致误触发，比如 Alt+Tab 切换窗口，
+            // 然后切换回去会自动进入多选」。
+            // 根因：Alt 是**系统级修饰键**，Alt+Tab / Alt+F4 / Alt+空格 都会先产生一次
+            // "Alt 被按下"的 KeyDown —— 而我们当时只要看到 KeyDown 就切换模式，
+            // 于是每次切窗口都会把多选模式翻一次（切走翻成开、切回来又翻一次，看着像"自动进入"）。
+            // 而且用"抬起时判定"也治不好：切换窗口期间键盘焦点不在我们窗口上，
+            // KeyUp 可能收不到，状态就更容易错乱。
+            // 结论：修饰键不适合当这种"粘滞开关"，换成一个普通字母键最干净。
+            // 字母键走的是下面的普通分支（不带修饰键），与所有系统快捷键零冲突。
+            if (e.Key == Key.S && Tabs.SelectedIndex == 0)
             {
-                // 只在下载页有意义（文件列表在那一页）
-                if (Tabs.SelectedIndex == 0)
-                {
-                    e.Handled = true;
-                    if (_fileSelectMode) ExitFileSelectMode();
-                    else EnterFileSelectMode();
-                }
+                e.Handled = true;
+                if (_fileSelectMode) ExitFileSelectMode();
+                else EnterFileSelectMode();
                 return;
             }
-            // Esc 退出多选模式（任何页面都能退，避免切页后卡在模式里不自知）
+            // Esc 退出多选模式
             if (_fileSelectMode && e.Key == Key.Escape)
             {
                 e.Handled = true;
@@ -10054,3 +10057,5 @@ namespace GeZi
         }
     }
 }
+
+
