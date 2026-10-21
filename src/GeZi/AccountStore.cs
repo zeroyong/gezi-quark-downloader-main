@@ -64,12 +64,15 @@ namespace GeZi
         private static readonly XmlSerializer Ser = new XmlSerializer(typeof(AccountProfile));
         private static readonly object Locker = new object();
 
-        /// <summary>账号档案目录。与 SettingsStore 同根，保证便携/回退策略一致。</summary>
+        /// <summary>
+        /// 账号档案目录。与 SettingsStore 同根（统一数据目录 %LOCALAPPDATA%\鸽子下载\），
+        /// 保证 Debug / 发行包 / 任何副本看到的是<b>同一批账号</b>。
+        /// </summary>
         public static string AccountsDir
         {
             get
             {
-                string root = Path.GetDirectoryName(SettingsStore.FilePath) ?? AppDomain.CurrentDomain.BaseDirectory;
+                string root = Path.GetDirectoryName(SettingsStore.FilePath) ?? Util.GetDataDir();
                 return Path.Combine(root, "accounts");
             }
         }

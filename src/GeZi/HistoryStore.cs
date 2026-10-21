@@ -119,7 +119,7 @@ namespace GeZi
                 }
                 catch
                 {
-                    return Path.Combine(Util.GetLocalAppDataDir(), "GeZi.state.json");
+                    return Path.Combine(Util.GetDataDir(), "GeZi.state.json");
                 }
             }
         }

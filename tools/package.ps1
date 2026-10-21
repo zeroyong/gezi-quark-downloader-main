@@ -18,6 +18,12 @@
 #       accounts\ into the zip. Those carry the user's session cookie and
 #       history; shipping them would leak the login state to whoever gets
 #       the package. Copy them over manually if you want a portable profile.
+#
+# 【2026-10-22】更进一步：连**暂存目录里都不放**它们了。数据目录已固定为
+#       %LOCALAPPDATA%\鸽子下载\（Debug / 发行包 / 任何副本共享同一份），
+#       以前把 Debug 的 state.json 拷进发行包，导致发行包里躺着一份
+#       "打包那一刻的旧快照" —— 用户实测表现为"重启后任务不见了"
+#       （下载是发行包发起的，记录却只在 Debug 那份文件里）。
 
 param(
     [string]$Version = "",
@@ -62,30 +68,18 @@ if (Test-Path $stage) {
 # These live next to the exe in the staged folder and would otherwise be
 # wiped when the folder is recreated below. Copy them to a scratch folder
 # FIRST, because the originals disappear with the staged folder.
-$profileFiles = @('GeZi.config.xml', 'GeZi.state.json', 'GeZi.state.json.bak')
-$profileScratch = Join-Path $env:TEMP ("gezi_profile_" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Force -Path $profileScratch | Out-Null
-if (Test-Path $stage) {
-    foreach ($pf in $profileFiles) {
-        $p = Join-Path $stage $pf
-        if (Test-Path $p) { Copy-Item $p $profileScratch -Force }
-    }
-    $acc = Join-Path $stage 'accounts'
-    if (Test-Path $acc) { Copy-Item $acc $profileScratch -Recurse -Force }
-}
+#
+# 【2026-10-22】数据目录已固定为 %LOCALAPPDATA%\鸽子下载\（见 SettingsStore.ResolveFilePath），
+# 所以**发行包目录里不再需要任何 profile 文件** —— 删掉这一整段"保留 profile"的逻辑：
+#   * 保留它会把**打包那一刻的旧快照**带进发行包（用户实测：发行包里那份 state.json
+#     是打包时的旧副本，里面没有后来下载的任务 → "重启后任务不见了"）；
+#   * GeZi.config.xml 里是 DPAPI 加密的登录 Cookie，随包分发属于隐私事故。
+# 现在发行包是**干净的**：第一次启动会在统一目录里新建配置，用户自己登录即可。
+$profileFiles = @()
+$profileScratch = $null
 
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-# Restore the profile that was just saved.
-try {
-    Get-ChildItem $profileScratch -Force | ForEach-Object {
-        Copy-Item $_.FullName $stage -Recurse -Force
-        Write-Host "      kept profile: $($_.Name)" -ForegroundColor DarkGray
-    }
-} finally {
-    Remove-Item $profileScratch -Recurse -Force -ErrorAction SilentlyContinue
-}
 
 # Whitelist: every one of these is required to run.
 $mustHave = @(
@@ -108,21 +102,30 @@ foreach ($f in $mustHave) {
 
 # Two different kinds of files live in the staged folder:
 #   * program files  -> go into the zip
-#   * profile files  -> stay in the folder (so the user keeps their login
-#                       and history) but must NOT go into the zip, because
-#                       GeZi.config.xml holds the encrypted session cookie.
-$profileNames = @('GeZi.config.xml', 'GeZi.state.json', 'GeZi.state.json.bak')
+#   * user data      -> must NEVER go into the zip (and now must not even
+#                       be staged): GeZi.config.xml holds the DPAPI-encrypted
+#                       session cookie, GeZi.state.json holds the task list /
+#                       history. Shipping them leaks the login state and
+#                       injects a stale snapshot into the fresh install.
+#                       Since 2026-10-22 the app stores all of it under
+#                       %LOCALAPPDATA%\鸽子下载\, so the staged folder needs
+#                       none of these.
+$userDataNames = @('GeZi.config.xml', 'GeZi.state.json', 'GeZi.state.json.bak',
+                   'GeZi.config.xml.bak', 'GeZi.state.json.tmp', 'GeZi.config.xml.tmp')
 
-# Safety net: drop anything that is neither program nor profile
-# (e.g. .pdb, stray .xml, leftover logs).
+# Safety net: drop anything that is not on the program whitelist
+# (e.g. .pdb, stray .xml, leftover logs, and any user data).
 $keep = $mustHave | ForEach-Object { $_.ToLowerInvariant() }
-$keepProfile = $profileNames | ForEach-Object { $_.ToLowerInvariant() }
 Get-ChildItem $stage -File | Where-Object {
     $n = $_.Name.ToLowerInvariant()
-    ($keep -notcontains $n) -and ($keepProfile -notcontains $n)
+    ($keep -notcontains $n) -and ($userDataNames -notcontains $n)
 } | ForEach-Object {
     Write-Host "      excluded $($_.Name)" -ForegroundColor DarkGray
     Remove-Item $_.FullName -Force
+}
+Get-ChildItem $stage -Directory | Where-Object { $_.Name -eq 'accounts' } | ForEach-Object {
+    Write-Host "      excluded accounts\" -ForegroundColor DarkGray
+    Remove-Item $_.FullName -Recurse -Force
 }
 
 # ---------- 3. Compress ----------
@@ -159,5 +162,6 @@ Get-ChildItem $stage -File | Sort-Object Name | ForEach-Object {
     Write-Host ("        {0,10:N0} KB  {1}" -f ($_.Length/1KB), $_.Name)
 }
 Write-Host ""
-Write-Host "      NOTE: copy GeZi.config.xml / GeZi.state.json / accounts\ over"
-Write-Host "            manually if you want your login + history in this copy."
+Write-Host "      NOTE: user data is NOT in the package. Config / accounts / task"
+Write-Host "            history live in %LOCALAPPDATA%\鸽子下载\ and are created"
+Write-Host "            on first run (log in once and they are kept there)."

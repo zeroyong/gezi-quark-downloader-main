@@ -393,9 +393,16 @@ namespace GeZi
         private static bool _loaded;
 
         /// <summary>
-        /// 配置文件路径：优先 exe 同目录（绿色便携，数据随 U 盘走）；
-        /// 同目录不可写（装在 Program Files、"受控文件夹访问" 拦截等）时
-        /// 回退到 %LOCALAPPDATA%\鸽子下载\，保证任何情况下都能存住设置。
+        /// 配置文件路径：<b>固定在 %LOCALAPPDATA%\鸽子下载\</b>。
+        ///
+        /// <para>【2026-10-22 变更】原先是"exe 同目录优先"（绿色便携）。改固定的根因：</para>
+        /// <list type="bullet">
+        /// <item>同一程序的每一份副本各写各的 state.json → <b>换目录启动就"任务不见了"</b>
+        ///       （用户实测：下载是发行包发起的，记录却只在 Debug 那份里有）；</item>
+        /// <item>两个副本同时下载同一文件 → 写同一份分片目录 → <b>互相踩坏</b>。</item>
+        /// </list>
+        /// <para>固定后所有副本共享同一份数据，任务/进度/账号/设置互通。
+        /// 老的便携数据由 <see cref="Util.MigrateLegacyProfile"/> 在首次启动时搬过来。</para>
         /// </summary>
         public static string FilePath
         {
@@ -412,27 +419,18 @@ namespace GeZi
 
         private static string ResolveFilePath()
         {
-            string portable = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "GeZi.config.xml");
-
-            // exe 同目录已经有一份配置文件 → 无条件沿用（避免老用户设置"搬家"到别处）
+            string dir = Util.GetDataDir();
             try
             {
-                if (File.Exists(portable))
-                    return portable;
+                Directory.CreateDirectory(dir);
             }
-            catch { }
-
-            // 试着真的在 exe 同目录落一个文件，确认可写
-            if (Util.IsWritable(AppDomain.CurrentDomain.BaseDirectory))
-                return portable;
-
-            string fallbackDir = Util.GetLocalAppDataDir();
-            try
+            catch
             {
-                Directory.CreateDirectory(fallbackDir);
+                // 建不出目录（权限/受控文件夹访问）→ 退回 exe 同目录，
+                // 至少保证程序还能起来。
+                dir = AppDomain.CurrentDomain.BaseDirectory;
             }
-            catch { }
-            return Path.Combine(fallbackDir, "GeZi.config.xml");
+            return Path.Combine(dir, "GeZi.config.xml");
         }
 
         /// <summary>上一次 Load/Save 是否踩到了异常（供 UI 提示用户设置未能持久化）。</summary>
@@ -455,9 +453,15 @@ namespace GeZi
                 }
                 else
                 {
-                    // 便携路径没文件时，兜底再看一眼 %LOCALAPPDATA%，实现两种位置互认
-                    string alt = Path.Combine(Util.GetLocalAppDataDir(), "GeZi.config.xml");
-                    if (File.Exists(alt))
+                    // 统一目录里没文件时，兜底再看一眼**旧位置**（exe 同目录）。
+                    // 【2026-10-22】以前这里是"便携优先 + LOCALAPPDATA 兜底"，
+                    // 现在主路径固定在 LOCALAPPDATA，这个兜底改成救"旧位置的老用户" ——
+                    // 迁移没跑成（权限/竞态）时，至少还能把老配置读出来，不至于设置全丢。
+                    string alt = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "GeZi.config.xml");
+                    if (!string.Equals(Path.GetFullPath(alt),
+                                       Path.GetFullPath(FilePath),
+                                       StringComparison.OrdinalIgnoreCase)
+                        && File.Exists(alt))
                     {
                         using (var fs = File.OpenRead(alt))
                         {

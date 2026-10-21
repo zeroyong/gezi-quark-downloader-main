@@ -87,5 +87,125 @@ namespace GeZi
             return Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "鸽子下载");
         }
+
+        /// <summary>
+        /// 统一数据目录：<b>固定在 %LOCALAPPDATA%\鸽子下载\</b>，不再跟 exe 目录走。
+        ///
+        /// <para><b>为什么 2026-10-22 改成固定</b>：原先的规则是"exe 同目录优先"
+        /// （便携模式），于是<b>同一个程序的每一份副本各存各的</b>：</para>
+        /// <list type="bullet">
+        /// <item>Debug 版（src\GeZi\bin\Debug\net48\）写自己那份 state.json；</item>
+        /// <item>发行包（dist\GeZi-v2.8.1-win64\）写另一份；</item>
+        /// <item>原版 v2.3.1 又是另一份。</item>
+        /// </list>
+        /// <para>后果实测（用户报告）：<b>下载是发行包发起的，任务记录却只在 Debug 那份里有</b> ——
+        /// 切到哪个目录启动，就只能看到那个目录上次写下的记录，"重启后任务不见了"。
+        /// 更危险的是两个副本<b>同时下载同一个文件</b>会写同一份分片目录，互相踩坏。</para>
+        ///
+        /// <para>改成固定目录后，Debug / 发行包 / 任何副本<b>共享同一份</b>数据：
+        /// 任务、进度、账号、设置全都互通，也从根本上杜绝了"两份程序互相踩分片"。</para>
+        ///
+        /// <para><b>迁移</b>：老用户的配置与历史可能躺在 exe 同目录（便携模式留下的）。
+        /// 首次启动时若统一目录里还没有、而 exe 目录里有，就把它搬过去（见
+        /// <see cref="MigrateLegacyProfile"/>）。搬完把旧文件改名成 .migrated，
+        /// 不删除 —— 万一搬错了还能手动找回。</para>
+        /// </remarks>
+        public static string GetDataDir()
+        {
+            return GetLocalAppDataDir();
+        }
+
+        /// <summary>
+        /// 一次性迁移：把 exe 同目录里的旧配置 / 任务快照 / 账号档案搬到统一数据目录。
+        ///
+        /// <para><b>触发条件</b>：统一目录里<b>还没有</b> GeZi.config.xml，
+        /// 而 exe 同目录里<b>有</b> —— 说明用户是"便携模式"的老用户，配置还在 exe 旁边。</para>
+        ///
+        /// <para><b>为什么不无条件搬</b>：统一目录里已经有配置时，说明迁移做过了
+        /// （或用户就是用固定目录用的），再搬会把统一目录的现有数据覆盖掉。</para>
+        ///
+        /// <para><b>失败不致命</b>：任何一步出错都只是放弃迁移，程序照常启动
+        /// （配置会新建一份，用户重新登录即可）。</para>
+        /// </summary>
+        public static void MigrateLegacyProfile()
+        {
+            try
+            {
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string destDir = GetDataDir();
+
+                // 已经在统一目录里了（而不是 exe 同目录）→ 没有可迁移的东西
+                if (string.Equals(Path.GetFullPath(baseDir).TrimEnd('\\'),
+                                 Path.GetFullPath(destDir).TrimEnd('\\'),
+                                 StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                Directory.CreateDirectory(destDir);
+
+                string destCfg = Path.Combine(destDir, "GeZi.config.xml");
+                if (File.Exists(destCfg))
+                    return;   // 已经迁过了
+
+                // ---- 配置 ----
+                string legacyCfg = Path.Combine(baseDir, "GeZi.config.xml");
+                if (File.Exists(legacyCfg))
+                {
+                    File.Copy(legacyCfg, destCfg, true);
+                    TryMarkMigrated(legacyCfg);
+                }
+
+                // ---- 任务快照 ----
+                foreach (var name in new[] { "GeZi.state.json", "GeZi.state.json.bak" })
+                {
+                    string src = Path.Combine(baseDir, name);
+                    if (!File.Exists(src)) continue;
+                    string dst = Path.Combine(destDir, name);
+                    if (File.Exists(dst)) continue;
+                    File.Copy(src, dst, true);
+                    TryMarkMigrated(src);
+                }
+
+                // ---- 账号档案 ----
+                string legacyAcc = Path.Combine(baseDir, "accounts");
+                if (Directory.Exists(legacyAcc))
+                {
+                    string destAcc = Path.Combine(destDir, "accounts");
+                    if (!Directory.Exists(destAcc))
+                    {
+                        Directory.CreateDirectory(destAcc);
+                        foreach (var f in Directory.GetFiles(legacyAcc, "*.xml"))
+                        {
+                            string dst = Path.Combine(destAcc, Path.GetFileName(f));
+                            if (!File.Exists(dst))
+                                File.Copy(f, dst, true);
+                        }
+                    }
+                    TryMarkMigrated(legacyAcc);
+                }
+            }
+            catch
+            {
+                // 迁移失败不拦启动：配置会新建一份，用户重新登录即可
+            }
+        }
+
+        /// <summary>给已迁移的旧文件/目录改名（加 .migrated 后缀），便于用户确认与回退。</summary>
+        private static void TryMarkMigrated(string path)
+        {
+            try
+            {
+                if (Directory.Exists(path))
+                {
+                    string d = path + ".migrated";
+                    if (!Directory.Exists(d)) Directory.Move(path, d);
+                }
+                else if (File.Exists(path))
+                {
+                    string f = path + ".migrated";
+                    if (!File.Exists(f)) File.Move(path, f);
+                }
+            }
+            catch { }
+        }
     }
 }
