@@ -676,6 +676,11 @@ namespace GeZi
                 // 它随总速度变化，跟进度日志同一个节拍（每 10 秒）正好。
                 if (_shutdownAfterAll) RefreshShutdownPill();
 
+                // 【2026-10-21】底部状态栏同节拍刷新（方案 C）。
+                // 放在 active.Count==0 的提前 return 之前 —— 全部完成/全部暂停时
+                // 状态栏也得更新到"没有在跑"的正确形态，不能停在最后一帧。
+                RefreshTotalStatusBar();
+
                 var active = _tasks.Where(t => t.State == JobState.Downloading
                                             || t.State == JobState.Queued
                                             || t.State == JobState.Paused
@@ -4555,6 +4560,213 @@ namespace GeZi
             SetShutdownAfterAll(false, announce: true);
         }
 
+        // ---------------- 底部状态栏：总进度 / 总速度 / 剩余（方案 C · 2026-10-21） ----------------
+        //
+        // 【为什么要有】任务页原来只能逐行看每个文件，没有一个"整体还剩多少"的答案。
+        // 【为什么放底部】总进度这类是"背景信息"：想瞟一眼就有，但不该占住视线主路径、
+        //   更不该挤压任务列表（顶部仪表条 / 环形卡都验证过，代价是 40~132px 的列表高度）。
+        //   底部 32px + 顶边一条 2px 光带，几乎零代价。
+        //
+        // 【口径】与 LogAggregateProgress / FormatRemainingTotalEta 完全一致，避免两处数字打架：
+        //   · 分母 = **未完成**任务的字节总和（已完成的不再算进度，否则永远到不了 100%）；
+        //   · 总速度 = 各下载中任务速度求和；
+        //   · 剩余时间 = 各下载中任务的**最大**剩余（并发任务同时结束，取最慢那个，不求和）。
+
+        /// <summary>
+        /// 状态栏顶边光带的「待算百分比」。
+        /// <para>-1 = 已经算好，不用再补；≥0 = 因为容器宽度还没测量出来，等 SizeChanged 补算。</para>
+        /// </summary>
+        private double _totalPctForLine = -1;
+
+        /// <summary>
+        /// 状态栏尺寸变化时补算光带宽度。
+        /// <para>首次 RefreshTotalStatusBar 往往发生在布局之前（ActualWidth=0），
+        /// 那时算出来的光带宽度是 0 —— 表现为"顶边那条进度光带根本不出现"。
+        /// 这里等真实宽度出来后再补一次。</para>
+        /// </summary>
+        private void OnTotalStatusBarSizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (_totalPctForLine < 0) return;
+            try
+            {
+                if (TotalProgressLine == null) return;
+                var parent = TotalProgressLine.Parent as FrameworkElement;
+                double full = (parent != null && parent.ActualWidth > 0)
+                    ? parent.ActualWidth
+                    : TotalStatusBar.ActualWidth;
+                if (full <= 0) return;
+
+                TotalProgressLine.Width = Math.Round(full * _totalPctForLine / 100.0, 1);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 刷新底部状态栏。可在任意时刻重复调用（内部分支都已判空）。
+        /// 由 <see cref="LogAggregateProgress"/> 按 10 秒节拍驱动，任务增删时也会主动调一次。
+        /// </summary>
+        private void RefreshTotalStatusBar()
+        {
+            try
+            {
+                if (TotalStatusBar == null) return;
+
+                // 参与统计的任务：未完成且不是"取消中"（取消中的不算进度，避免进度回退）
+                var pending = _tasks.Where(t => t.State == JobState.Queued
+                                             || t.State == JobState.Downloading
+                                             || t.State == JobState.Paused).ToList();
+
+                long totalBytes = pending.Sum(t => t.Total);
+                long doneBytes = pending.Sum(t => t.Done);
+                double speed = _tasks.Where(t => t.State == JobState.Downloading).Sum(t => t.Speed);
+
+                // ---- 总进度 ----
+                double pct = totalBytes > 0
+                    ? Math.Max(0, Math.Min(100, doneBytes * 100.0 / totalBytes))
+                    : 0;
+
+                if (TotalPctText != null)
+                    TotalPctText.Text = totalBytes > 0 ? pct.ToString("F1") + "%" : "—";
+
+                // 光带与进度条：按百分比设宽度。
+                // ⚠️ 光带的父级宽度在首次刷新时可能还没测量出来（ActualWidth=0），
+                //    直接算会得到 0 宽 —— 表现为"光带根本不出现"。
+                //    所以拿不到宽度时**记个待办**，等 SizeChanged 再补一次（见 OnTotalStatusBarSizeChanged）。
+                double barTotal = 150;      // TotalBarWrap 的固定宽（XAML 里 Width="150"）
+                if (TotalBarFill != null)
+                    TotalBarFill.Width = Math.Round(barTotal * pct / 100.0, 1);
+
+                if (TotalProgressLine != null)
+                {
+                    double full = 0;
+                    var parent = TotalProgressLine.Parent as FrameworkElement;
+                    if (parent != null && parent.ActualWidth > 0) full = parent.ActualWidth;
+                    else if (TotalStatusBar.ActualWidth > 0) full = TotalStatusBar.ActualWidth;
+
+                    if (full > 0)
+                    {
+                        TotalProgressLine.Width = Math.Round(full * pct / 100.0, 1);
+                        _totalPctForLine = -1;      // 已算好，清掉待办
+                    }
+                    else
+                    {
+                        // 宽度未知：把百分比存下来，交给 SizeChanged 补算
+                        _totalPctForLine = pct;
+                    }
+                }
+
+                // ---- 总速度 ----
+                if (TotalSpeedText != null)
+                {
+                    TotalSpeedText.Text = speed > 1024
+                        ? Util.FormatSize((long)speed) + "/s"
+                        : (pending.Count > 0 ? "0 B/s" : "—");
+                }
+
+                // ---- 剩余时间 ----
+                if (TotalEtaText != null)
+                {
+                    // 直接复用关机提示条那套"取最慢任务"的算法，口径一致。
+                    // 三种形态说清当前状态，避免一直挂着"计算中"这种假忙碌：
+                    //   · 有下载中任务且速度够 → 「约 9 分」
+                    //   · 有下载中任务但速度太低 → 「计算中」（速度回来就会给出数字）
+                    //   · 没有在下的任务（全暂停/全完成） → 「—」
+                    string eta = FormatRemainingTotalEta();
+                    if (!string.IsNullOrEmpty(eta))
+                    {
+                        TotalEtaText.Text = "约 " + eta;
+                    }
+                    else
+                    {
+                        bool anyRunning = _tasks.Any(t => t.State == JobState.Downloading);
+                        TotalEtaText.Text = anyRunning ? "计算中" : "—";
+                    }
+                }
+
+                // ---- 已下 / 总量 ----
+                if (TotalSizeText != null)
+                {
+                    TotalSizeText.Text = totalBytes > 0
+                        ? Util.FormatSize(doneBytes) + " / " + Util.FormatSize(totalBytes)
+                        : "—";
+                }
+
+                // ---- 任务状态点阵 ----
+                UpdateTotalDots();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 重建状态栏右端的任务点阵：每个任务一个 5px 圆点，颜色区分状态。
+        ///
+        /// <para>为什么用点阵而不是"3/12 下载中"这种文字：任务数量变化时文字长度会跳，
+        /// 而点阵是固定节奏的视觉块，扫一眼就知道"几个在跑、几个完了、几个停了"。</para>
+        /// <para>最多画 40 个点：再多就失去"一眼可数"的意义，改成右侧补一个总数。</para>
+        /// </summary>
+        private void UpdateTotalDots()
+        {
+            if (TotalDotsPanel == null) return;
+            TotalDotsPanel.Children.Clear();
+
+            const int MaxDots = 40;
+            var all = _tasks.ToList();
+            if (all.Count == 0) return;
+
+            int draw = Math.Min(all.Count, MaxDots);
+
+            // 排序：下载中优先、然后排队、暂停、完成、失败/取消 ——
+            // 让"正在动"的点集中在左边，扫视时更容易先看到
+            var ordered = all
+                .OrderBy(t => t.State == JobState.Downloading ? 0
+                            : t.State == JobState.Queued ? 1
+                            : t.State == JobState.Paused ? 2
+                            : t.State == JobState.Completed ? 3 : 4)
+                .Take(draw);
+
+            foreach (var t in ordered)
+            {
+                Brush brush;
+                switch (t.State)
+                {
+                    case JobState.Downloading: brush = Res("PrimaryBrush"); break;
+                    case JobState.Completed: brush = Res("SuccessBrush"); break;
+                    case JobState.Paused: brush = Res("WarningBrush"); break;
+                    case JobState.Failed: brush = Res("DangerBrush"); break;
+                    case JobState.Queued: brush = Res("TextTertiaryBrush"); break;
+                    default: brush = Res("BorderBrushStrong"); break;
+                }
+
+                TotalDotsPanel.Children.Add(new System.Windows.Shapes.Ellipse
+                {
+                    Width = 5,
+                    Height = 5,
+                    Margin = new Thickness(0, 0, 3, 0),
+                    Fill = brush,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    ToolTip = t.Name + " · " + t.State.ToString(),
+                });
+            }
+
+            // 超出 MaxDots 时补一个「+N」，避免用户以为点数就是全部
+            if (all.Count > draw)
+            {
+                TotalDotsPanel.Children.Add(new TextBlock
+                {
+                    Text = "+" + (all.Count - draw),
+                    FontSize = 10,
+                    Margin = new Thickness(0, 0, 0, 0),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Foreground = Res("TextTertiaryBrush"),
+                });
+            }
+
+            Brush Res(string key)
+            {
+                return (TryFindResource(key) as Brush) ?? System.Windows.Media.Brushes.Gray;
+            }
+        }
+
         /// <summary>
         /// 执行关机：先给用户一个可取消的确认，再调用系统 shutdown。
         ///
@@ -5096,6 +5308,10 @@ namespace GeZi
                 _tasks.Insert(0, t);
             else
                 _tasks.Add(t);
+
+            // 【2026-10-21】入队后立刻刷新底部状态栏，否则新任务要等
+            // 下一个 10 秒节拍才出现在点阵里，看着像"没加进去"。
+            RefreshTotalStatusBar();
         }
 
         /// <summary>

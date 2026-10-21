@@ -902,11 +902,14 @@
 
                 <!-- ============ 任务 ============ -->
                 <TabItem Style="{StaticResource HeadlessTabItem}">
-                    <Grid Margin="20,18,20,18">
+                    <Grid Margin="20,18,20,10">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                            <!-- 【2026-10-21】底部状态栏：总进度 / 总速度 / 剩余 / 已下总量
+                                 （方案 C 选型，原型见 gezi-task-design/Total-C-statusbar.html） -->
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
 
@@ -1582,6 +1585,97 @@
                             </Grid>
                             <TextBox x:Name="LogBox" Grid.Row="1" Style="{StaticResource LogTextBox}"/>
                         </Grid>
+
+                        <!-- ═══ 底部状态栏（方案 C · 2026-10-21） ═══
+                             为什么做成贴底通栏而不是顶部大卡片：
+                             总进度 / 总速度 / 剩余时间是"背景信息"，想瞟一眼就有，
+                             但不该占住视线主路径、更不该挤压任务列表。
+                             这里只吃 32px，列表能多显示一行多。
+                             顶边那 1px 光带 = 总进度的可视化，不读数字也能感知。
+                             数据由 RefreshTotalStatusBar() 维护，与进度日志同一节拍刷新。 -->
+                        <Border x:Name="TotalStatusBar" Grid.Row="4" Margin="0,10,0,0"
+                                Height="32" CornerRadius="8"
+                                Background="{DynamicResource SurfaceBrush}"
+                                BorderBrush="{DynamicResource BorderBrushSoft}"
+                                BorderThickness="1"
+                                SizeChanged="OnTotalStatusBarSizeChanged">
+                            <Grid>
+                                <!-- 顶边总进度光带：宽度由代码按百分比设置 -->
+                                <Border x:Name="TotalProgressLine" Height="2"
+                                        HorizontalAlignment="Left" VerticalAlignment="Top"
+                                        CornerRadius="1,0,1,0" Width="0"
+                                        Background="{DynamicResource PrimaryBrush}"/>
+
+                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center"
+                                            Margin="12,0">
+                                    <!-- 总进度百分比 -->
+                                    <TextBlock Text="总进度" FontSize="10.5"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                    <TextBlock x:Name="TotalPctText" Text="—" Margin="6,0,0,0"
+                                               FontSize="12.5" FontWeight="SemiBold"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource PrimaryBrush}"
+                                               Style="{StaticResource NumericText}"/>
+
+                                    <Border Width="1" Height="14" Margin="12,0"
+                                            Background="{DynamicResource BorderBrushSoft}"/>
+
+                                    <!-- 中段细进度条（吃掉剩余宽度） -->
+                                    <Grid x:Name="TotalBarWrap" Width="150" VerticalAlignment="Center">
+                                        <Border Height="5" CornerRadius="2.5"
+                                                Background="{DynamicResource SurfaceSunkenBrush}"/>
+                                        <Border x:Name="TotalBarFill" Height="5" CornerRadius="2.5"
+                                                HorizontalAlignment="Left" Width="0"
+                                                Background="{DynamicResource PrimaryBrush}"/>
+                                    </Grid>
+
+                                    <Border Width="1" Height="14" Margin="12,0"
+                                            Background="{DynamicResource BorderBrushSoft}"/>
+
+                                    <!-- 总速度 -->
+                                    <TextBlock Text="总速度" FontSize="10.5"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                    <TextBlock x:Name="TotalSpeedText" Text="—" Margin="6,0,0,0"
+                                               FontSize="12" FontWeight="SemiBold"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource PrimaryBrush}"
+                                               Style="{StaticResource NumericText}"/>
+
+                                    <Border Width="1" Height="14" Margin="12,0"
+                                            Background="{DynamicResource BorderBrushSoft}"/>
+
+                                    <!-- 剩余时间 -->
+                                    <TextBlock Text="剩余" FontSize="10.5"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                    <TextBlock x:Name="TotalEtaText" Text="—" Margin="6,0,0,0"
+                                               FontSize="12" FontWeight="SemiBold"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextPrimaryBrush}"
+                                               Style="{StaticResource NumericText}"/>
+
+                                    <Border Width="1" Height="14" Margin="12,0"
+                                            Background="{DynamicResource BorderBrushSoft}"/>
+
+                                    <!-- 已下 / 总量 -->
+                                    <TextBlock x:Name="TotalSizeText" Text="—" FontSize="11"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"
+                                               Style="{StaticResource NumericText}"/>
+
+                                    <Border Width="1" Height="14" Margin="12,0"
+                                            Background="{DynamicResource BorderBrushSoft}"/>
+
+                                    <!-- 任务状态点阵：每个任务一个点，颜色区分状态。
+                                         比文字"3/12 下载中"更快扫，也不占宽度。
+                                         由 RefreshTotalStatusBar() 重建子元素。 -->
+                                    <StackPanel x:Name="TotalDotsPanel" Orientation="Horizontal"
+                                                VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
                     </Grid>
                 </TabItem>
 
