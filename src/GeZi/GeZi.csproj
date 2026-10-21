@@ -9,13 +9,15 @@
     <Nullable>disable</Nullable>
     <AssemblyName>GeZi</AssemblyName>
     <RootNamespace>GeZi</RootNamespace>
-    <Product>鸽子下载</Product>
-    <AssemblyTitle>鸽子下载</AssemblyTitle>
-    <Version>2.7.0</Version>
+    <Product>鸽子下载自用版</Product>
+    <AssemblyTitle>鸽子下载自用版</AssemblyTitle>
+    <!-- 【2026-10-22】版本号升到 2.8.1。
+         版本号从程序集读（关于页 / 设置页 / 更新检查都用它），不要在别处手写一份。 -->
+    <Version>2.8.1</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <StartupObject>GeZi.App</StartupObject>
     <!-- 【2026-10-03】应用图标：exe 文件图标 + 任务栏/Alt-Tab 图标。
-         图标是"衔橄榄枝的鸽子"，与「鸽子下载」对应（用户提供）。
+         图标是"衔橄榄枝的鸽子"，与「鸽子下载自用版」对应（用户提供）。
          另外把 .ico 也作为 WPF Resource 发布，供窗口 Icon 使用。 -->
     <ApplicationIcon>Resources\app.ico</ApplicationIcon>
     <!-- 【2026-10-04】PathMap：把编译机的绝对路径映射成占位前缀。

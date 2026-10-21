@@ -366,7 +366,7 @@ namespace GeZi
             string[] candidates =
             {
                 _settings.OutDir,
-                Path.Combine(Util.GetDownloadsFolder(), "鸽子下载"),
+                Path.Combine(Util.GetDownloadsFolder(), "鸽子下载自用版"),
                 Util.GetLocalAppDataDir(),
                 Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Downloads"),
             };
@@ -6138,7 +6138,7 @@ namespace GeZi
 
                 // /s = 关机；/t 60 = 60 秒倒计时（给用户反悔的机会）；/c = 注释
                 var psi = new System.Diagnostics.ProcessStartInfo("shutdown.exe",
-                    "/s /t 60 /c \"鸽子下载：全部任务已完成，即将关机。\"")
+                    "/s /t 60 /c \"鸽子下载自用版：全部任务已完成，即将关机。\"")
                 {
                     UseShellExecute = false,
                     CreateNoWindow = true,
@@ -10683,7 +10683,7 @@ namespace GeZi
             {
                 bool dontAsk;
                 var r = AppDialog.ShowWithDontAsk(this,
-                    "要让鸽子下载继续在后台下载吗？\n\n" +
+                    "要让鸽子下载自用版继续在后台下载吗？\n\n" +
                     "· 最小化到托盘：窗口收进通知区，下载继续跑；\n" +
                     "   想彻底退出，右键托盘图标选「退出」。\n" +
                     "· 直接退出程序：立即结束进程（已下部分会保留，下次可续传）。",
@@ -10754,7 +10754,7 @@ namespace GeZi
                 if (_tray != null && !_trayHintShown)
                 {
                     _trayHintShown = true;
-                    _tray.ShowBalloon("鸽子下载仍在后台运行",
+                    _tray.ShowBalloon("鸽子下载自用版仍在后台运行",
                         "下载会继续。双击托盘图标可重新打开窗口，右键可选「退出」。");
                 }
                 Log("已最小化到托盘，下载继续。右键托盘图标可选「退出」。");
@@ -10799,7 +10799,7 @@ namespace GeZi
             try
             {
                 // 提示文案要把"单击/双击"讲清楚 —— 这两种行为不写出来没人猜得到。
-                _tray = new TrayIcon("鸽子下载 · 单击开关小窗，双击打开主窗口，右键更多");
+                _tray = new TrayIcon("鸽子下载自用版 · 单击开关小窗，双击打开主窗口，右键更多");
                 // 用户指定：**单击 = 小窗，双击 = 主窗口**。
                 // （单击动作在 TrayIcon 里延迟一个双击间隔执行，否则双击会先触发单击。）
                 _tray.SingleClickRequested += ToggleMiniWindow;

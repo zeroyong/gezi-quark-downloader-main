@@ -76,6 +76,12 @@ namespace GeZi
         }
 
         /// <summary>应用本地数据目录（%LOCALAPPDATA%，系统保证可写、不受「受控文件夹访问」保护）。</summary>
+        /// <remarks>
+        /// ⚠️ 【2026-10-22】目录名**保持「鸽子下载」不变**（不要跟着品牌改名走）：
+        /// 这里是配置、账号档案、任务快照的存放位置，改了的话老用户升级后
+        /// 会"设置全丢、账号不见了、任务历史没了" —— 属于破坏性变更。
+        /// 品牌名只影响**界面与提示文案**。
+        /// </remarks>
         public static string GetLocalAppDataDir()
         {
             return Path.Combine(

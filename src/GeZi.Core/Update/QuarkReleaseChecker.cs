@@ -26,7 +26,12 @@ using GeZi.Core.Models;
 namespace GeZi.Core.Update
 {
     /// <summary>
-    /// 夸克网盘分享里的「鸽子下载」安装包 —— 更新的第二个来源。
+    /// 夸克网盘分享里的安装包 —— 更新的第二个来源。
+    /// <para>
+    /// 【包名不含中文】安装包文件名规则见 <see cref="PackageNamePattern"/>
+    /// （形如 <c>GeZi-v2.8.1-win64.zip</c>），与界面上的品牌名无关 ——
+    /// 改名只影响界面文案，不要动包名规则，否则就找不到自己传上去的包了。
+    /// </para>
     /// <para>
     /// 【为什么要第二个源】GitHub Releases 在国内网络下并不总通（api.github.com 偶发
     /// 超时/DNS 污染），启动时那次静默检查失败就等于"永远不提示更新"。

@@ -91,7 +91,7 @@ namespace GeZi
                                       || t.State == JobState.Cancelling).ToList();
             int finished = _all.Count(t => t.State == JobState.Completed);
 
-            TitleText.Text = active.Count == 0 ? "鸽子下载" : ("下载中（" + active.Count + "）");
+            TitleText.Text = active.Count == 0 ? "鸽子下载自用版" : ("下载中（" + active.Count + "）");
             RemainText.Text = active.Count == 0 ? "—" : (active.Count + " 个");
 
             // 「总进度」不写百分比，写**已完成数/总任务数**（用户要求）。

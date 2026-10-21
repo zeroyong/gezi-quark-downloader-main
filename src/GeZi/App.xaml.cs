@@ -78,13 +78,13 @@ namespace GeZi
                 {
                     AppDialog.Show(Current != null ? Current.MainWindow : null,
                         "程序发生未处理错误：\n\n" + args.Exception.Message,
-                        "鸽子下载", MessageBoxButton.OK, MessageBoxImage.Error);
+                        "鸽子下载自用版", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
                 catch
                 {
                     // 对话框自身失败时退回系统弹窗，保证用户至少能看到错误
                     MessageBox.Show("程序发生未处理错误：\n\n" + args.Exception.Message,
-                        "鸽子下载", MessageBoxButton.OK, MessageBoxImage.Error);
+                        "鸽子下载自用版", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
                 args.Handled = true;
             };
@@ -209,10 +209,10 @@ namespace GeZi
                     var sb = new StringBuilder(256);
                     NativeMethods.GetWindowTextW(hWnd, sb, sb.Capacity);
                     string title = sb.ToString();
-                    if (title.IndexOf("鸽子下载", StringComparison.Ordinal) < 0)
+                    if (title.IndexOf("鸽子下载自用版", StringComparison.Ordinal) < 0)
                         return true;   // 继续枚举
 
-                    // 确认属于同名进程（防止匹配到别的程序里含"鸽子下载"字样的窗口）
+                    // 确认属于同名进程（防止匹配到别的程序里含"鸽子下载自用版"字样的窗口）
                     uint pid;
                     NativeMethods.GetWindowThreadProcessId(hWnd, out pid);
                     try

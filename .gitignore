@@ -16,6 +16,13 @@ cookie*.txt
 .claude/
 .cursor/
 
+# ---------- 打包产物 ----------
+# dist/ 里是打好包的发布目录，**含有本机的 GeZi.config.xml（登录 Cookie）
+# 与 accounts/（账号档案）** —— 绝不能入库。
+# 发布包请自行从 dist/ 取出分发，不要提交进仓库。
+dist/
+*.zip
+
 # ---------- Agent 会话临时产物（汇报页缓存等，不入库） ----------
 .dsh/
 

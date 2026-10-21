@@ -6,8 +6,8 @@
     <Nullable>disable</Nullable>
     <AssemblyName>GeZi.Core</AssemblyName>
     <RootNamespace>GeZi.Core</RootNamespace>
-    <Product>鸽子下载</Product>
-    <AssemblyTitle>鸽子下载</AssemblyTitle>
+    <Product>鸽子下载自用版</Product>
+    <AssemblyTitle>鸽子下载自用版</AssemblyTitle>
     <Version>2.2.0</Version>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <!-- 【2026-10-04】PathMap：别让编译机的绝对路径（含用户名）进产物。

@@ -36,7 +36,7 @@ namespace GeZi.Core.Update
         /// <summary>原始 tag（如 <c>v2.2.0</c>），展示用。</summary>
         public string TagName { get; set; }
 
-        /// <summary>Release 标题（GitHub 的 name 字段，如「鸽子下载 v2.2.0 —— …」）。</summary>
+        /// <summary>Release 标题（GitHub 的 name 字段，如「鸽子下载自用版 v2.2.0 —— …」）。</summary>
         public string Title { get; set; }
 
         /// <summary>更新说明（Markdown 原文）。可能为空。</summary>
