@@ -308,6 +308,61 @@ namespace GeZi
         /// <para>用于区分"用户主动关掉了"与"老配置里没这个节点"——两者反序列化后都是 false。</para>
         /// </summary>
         public bool RestoreBrowseSet { get; set; }
+
+        /// <summary>
+        /// 上次浏览目录的**文件列表快照**（2026-10-21 新增，用户要求"把正在浏览的层级、滑动位置
+        /// 存在本地，不然每次打开都重复请求，只有点击刷新才检查更新"）。
+        ///
+        /// <para>【与旧方案的区别】旧方案只存层级，启动时**重新请求**目录；
+        /// 用户觉得"每次打开都在发请求"不可接受，要求**本地缓存优先**：
+        /// 启动时直接用这份快照铺列表，一个请求都不发；
+        /// 只有用户主动点「刷新」才去服务端核对最新内容。</para>
+        ///
+        /// <para>【只存当前这一层、只存已铺开的前若干条】不存整个目录树 ——
+        /// 否则几千项的分享会把配置文件撑到几 MB。够用于"接着上次继续看"即可。</para>
+        /// </summary>
+        public BrowseSnapshotCache LastBrowseCache { get; set; }
+    }
+
+    /// <summary>
+    /// 下载页「上次浏览位置」的文件列表快照（与 <see cref="AppSettings.LastBrowseCache"/> 配套）。
+    /// 字段都做成最简单的可序列化类型，XmlSerializer 直接能处理。
+    /// </summary>
+    public class BrowseSnapshotCache
+    {
+        /// <summary>这份快照属于哪个目录（与 AppSettings.LastBrowseFid 对照，防错配）。</summary>
+        public string Fid { get; set; }
+
+        /// <summary>是否分享模式（true）/ 网盘模式（false）。</summary>
+        public bool FromShare { get; set; }
+
+        /// <summary>快照保存时刻（Ticks），用于在界面上说明"这是什么时候的数据"。</summary>
+        public long SavedTicks { get; set; }
+
+        /// <summary>
+        /// 列表滚动位置（像素）。用户要求"滑动位置存在本地" ——
+        /// 恢复后直接回到上次看的那一行附近，而不是停在顶部。
+        /// </summary>
+        public double ScrollOffset { get; set; }
+
+        /// <summary>当时已在界面上露出的条数（分页用的游标）。</summary>
+        public int RevealCount { get; set; }
+
+        /// <summary>服务端还有没有下一页（决定底部"下面还有"提示是否出现）。</summary>
+        public bool HasMore { get; set; }
+
+        /// <summary>条目列表。</summary>
+        public List<BrowseCacheItem> Items { get; set; } = new List<BrowseCacheItem>();
+    }
+
+    /// <summary>快照里的一个条目（对应 <c>ShareFileItem</c> 的持久化形态）。</summary>
+    public class BrowseCacheItem
+    {
+        public string Fid { get; set; }
+        public string Token { get; set; }
+        public string Name { get; set; }
+        public long Size { get; set; }
+        public bool IsDir { get; set; }
     }
 
     /// <summary>任务列表展示方式。</summary>

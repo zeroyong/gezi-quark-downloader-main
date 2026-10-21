@@ -1118,6 +1118,7 @@ namespace GeZi
             try
             {
                 CaptureBrowsePosition();   // 先把意图记到 _settings 上（纯内存，便宜）
+                CaptureBrowseCache();      // 列表快照同理（含滚动位置）
 
                 if (_browseSaveTimer == null)
                 {
@@ -1151,6 +1152,10 @@ namespace GeZi
             {
                 _browseSaveTimer?.Stop();
                 CaptureBrowsePosition();
+                // 【2026-10-21】顺手把列表快照也存下来（含滚动位置）——
+                // 这是"下次打开不用重新请求"的关键。放在这里而不是只在 LoadDirAsync 里存，
+                // 是因为用户可能只是滚动浏览了一下就关掉程序，那时并没有触发目录加载。
+                CaptureBrowseCache();
                 if (_settings != null) SettingsStore.Save(_settings);
             }
             catch { }
@@ -1243,7 +1248,13 @@ namespace GeZi
         /// <summary>恢复「我的网盘」模式的上次目录。</summary>
         private async Task RestoreDrivePositionAsync(string fid)
         {
-            if (_client == null)
+            // 【2026-10-21】有本地缓存时不需要登录态：缓存里就是列表内容，
+            // 铺出来即可。只有缓存缺失（需要真发请求）才要求 _client。
+            var cached = _settings.LastBrowseCache;
+            bool haveUsableCache = cached != null && cached.Items != null && cached.Items.Count > 0
+                && !cached.FromShare && string.Equals(cached.Fid, fid, StringComparison.Ordinal);
+
+            if (_client == null && !haveUsableCache)
             {
                 Log("未登录，跳过「我的网盘」浏览位置恢复。");
                 return;
@@ -1290,25 +1301,47 @@ namespace GeZi
                 }
                 catch { }
 
-                // 拿 stoken（分享过期 / 提取码变了都会在这里失败）
-                _client?.Dispose();
-                _client = new QuarkClient(_settings.Cookie);
-
-                var shareInfo = await _client.GetShareInfoAsync(pwdId, _settings.LastSharePasscode ?? "");
-                if (shareInfo == null || string.IsNullOrEmpty(shareInfo.Stoken))
-                {
-                    Log("上次的分享已失效（可能过期或需要提取码），已回到根目录。");
-                    ResetNav();
-                    return;
-                }
-
+                // 【2026-10-21 用户要求】优先走本地缓存，**不发任何请求**。
+                // 缓存能对上就直接铺，只有缓存缺失/不匹配才去取 stoken + 请求目录。
+                // 想检查服务端有没有更新，点界面上的「刷新」（绕开缓存走正常加载）。
                 _pwdId = pwdId;
-                _stoken = shareInfo.Stoken;
                 _sharePasscode = _settings.LastSharePasscode ?? "";
                 _shareStartFid = string.IsNullOrEmpty(_settings.LastShareStartFid) ? "0" : _settings.LastShareStartFid;
-                _linkCache.Clear();
-                _dirCache.Clear();
-                _dirSizeCache.Clear();
+
+                // 链接文本框回填（用户要能看见"恢复的是哪条分享"）
+                try
+                {
+                    if (LinkBox != null && string.IsNullOrEmpty(LinkBox.Text))
+                        LinkBox.Text = "https://pan.quark.cn/s/" + pwdId;
+                    if (PassBox != null && string.IsNullOrEmpty(PassBox.Text.Trim())
+                        && !string.IsNullOrEmpty(_sharePasscode))
+                        PassBox.Text = _sharePasscode;
+                }
+                catch { }
+
+                // 只有缓存用不上时才需要 stoken（它只对"真正发请求"有用）
+                var cached = _settings.LastBrowseCache;
+                bool haveUsableCache = cached != null && cached.Items != null && cached.Items.Count > 0
+                    && cached.FromShare && string.Equals(cached.Fid, fid, StringComparison.Ordinal);
+
+                if (!haveUsableCache)
+                {
+                    // 拿 stoken 后才能真正拉目录（分享过期 / 提取码变了会在这里失败）
+                    _client?.Dispose();
+                    _client = new QuarkClient(_settings.Cookie);
+
+                    var shareInfo = await _client.GetShareInfoAsync(pwdId, _sharePasscode);
+                    if (shareInfo == null || string.IsNullOrEmpty(shareInfo.Stoken))
+                    {
+                        Log("上次的分享已失效（可能过期或需要提取码），已回到根目录。");
+                        ResetNav();
+                        return;
+                    }
+                    _stoken = shareInfo.Stoken;
+                    _linkCache.Clear();
+                    _dirCache.Clear();
+                    _dirSizeCache.Clear();
+                }
 
                 await RestoreChainThenLoadAsync(fid, "分享");
             }
@@ -1316,6 +1349,129 @@ namespace GeZi
             {
                 Log("恢复分享浏览位置失败：" + ex.Message + "（已回到根目录）");
                 try { ResetNav(); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// 把当前目录的文件列表存成快照（2026-10-21 新增）。
+        ///
+        /// <para>【为什么只存前 <see cref="BrowseCacheMaxItems"/> 条】用户要求"存在本地，
+        /// 不然每次打开都重复请求"。但几千项的分享全存进 config.xml 会让设置文件膨胀到几 MB，
+        /// 每次读写都变慢。存前若干条足够"接着上次继续看"，其余滚到底部时再按需请求。</para>
+        ///
+        /// <para>【只存"列表内容"不存下载进度】进度属于任务页的事，与浏览快照无关。</para>
+        /// </summary>
+        private void CaptureBrowseCache()
+        {
+            try
+            {
+                if (_settings == null) return;
+                // 目录是空的就不覆盖旧快照 —— 多半是加载失败/切页清空，
+                // 用空列表覆盖会让用户的"上次内容"白丢。
+                if (_files == null || _files.Count == 0) return;
+
+                var snap = new BrowseSnapshotCache
+                {
+                    Fid = _curFid ?? "0",
+                    FromShare = ShareMode,
+                    SavedTicks = DateTime.Now.Ticks,
+                    // 滚动位置：用户明确要求存这个，恢复后能回到上次看的地方
+                    ScrollOffset = _fileScroller != null ? _fileScroller.VerticalOffset : 0,
+                    RevealCount = _files.Count,
+                    HasMore = _curDir != null && _curDir.HasMore,
+                    Items = new List<BrowseCacheItem>(),
+                };
+
+                int take = Math.Min(_files.Count, BrowseCacheMaxItems);
+                for (int i = 0; i < take; i++)
+                {
+                    var f = _files[i];
+                    if (f == null) continue;
+                    snap.Items.Add(new BrowseCacheItem
+                    {
+                        Fid = f.Fid, Token = f.Token, Name = f.Name,
+                        Size = f.Size, IsDir = f.IsDir,
+                    });
+                }
+
+                _settings.LastBrowseCache = snap;
+            }
+            catch { }
+        }
+
+        /// <summary>快照最多存多少条（见 CaptureBrowseCache 的注释）。</summary>
+        private const int BrowseCacheMaxItems = 200;
+
+        /// <summary>
+        /// 用本地快照**直接铺出上次的列表**，一个网络请求都不发（用户要求）。
+        ///
+        /// <para>返回 true = 快照可用且已铺好；false = 没有快照/快照不匹配，
+        /// 调用方应退回"正常加载"。</para>
+        ///
+        /// <para>要点：
+        /// ① 快照必须与目标目录（fid）和模式都对得上，否则宁可不铺 ——
+        ///    拿另一个目录的列表冒充当前目录会让人以为数据错了；
+        /// ② 铺完后把滚动位置还原；
+        /// ③ 界面上给一句"缓存内容，点刷新可更新"的提示，避免用户误以为是实时数据。</para>
+        /// </summary>
+        private bool TryApplyBrowseCacheFromSettings(string fid, string modeName)
+        {
+            try
+            {
+                var snap = _settings?.LastBrowseCache;
+                if (snap == null || snap.Items == null || snap.Items.Count == 0) return false;
+
+                // 校验归属：fid 与模式都要对得上
+                if (!string.IsNullOrEmpty(snap.Fid)
+                    && !string.Equals(snap.Fid, fid, StringComparison.Ordinal))
+                    return false;
+                if (snap.FromShare != ShareMode) return false;
+
+                // 铺列表
+                _files.Clear();
+                var entry = new DirCacheEntry
+                {
+                    NextPage = 2,
+                    HasMore = snap.HasMore,
+                    RevealCount = snap.RevealCount > 0 ? snap.RevealCount : snap.Items.Count,
+                    ScrollOffset = snap.ScrollOffset,
+                };
+                foreach (var c in snap.Items)
+                {
+                    if (c == null) continue;
+                    entry.Items.Add(new ShareFileItem
+                    {
+                        Fid = c.Fid, Token = c.Token, Name = c.Name,
+                        Size = c.Size, IsDir = c.IsDir,
+                    });
+                }
+
+                // 放进内存缓存：后续"上级/再进来"都走缓存，不再请求
+                _dirCache[DirCacheKey(fid)] = entry;
+                _curDir = entry;
+                _curDirFromCache = true;   // 见字段注释：这种状态下不自动续页
+
+                // restore: true → 同时还原已露条数与滚动位置
+                ApplyDirView(entry, restore: true);
+
+                string when = "";
+                try
+                {
+                    if (snap.SavedTicks > 0)
+                        when = "（" + new DateTime(snap.SavedTicks).ToString("MM-dd HH:mm") + " 的数据）";
+                }
+                catch { }
+
+                Log("已用本地缓存恢复上次的" + modeName + "目录"
+                    + (_pathList.Count > 0 ? "：" + string.Join(" / ", _pathList) : "：根目录")
+                    + "，共 " + entry.Items.Count + " 项" + when + "。"
+                    + "要检查有没有更新，点「刷新」。");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("应用本地浏览缓存失败：" + ex.Message);
+                return false;
             }
         }
 
@@ -1347,6 +1503,13 @@ namespace GeZi
                     _pathList.Add(names[i]);
 
                 UpdatePathText();
+
+                // 【2026-10-21 用户要求】优先用**本地缓存**恢复，一个请求都不发。
+                // 原先是重新请求目录，用户反馈"每次打开都在重复请求"。
+                // 现在：缓存能对上就直接铺；只有缓存缺失/不匹配才去请求。
+                // 想检查服务端有没有更新，点界面上的「刷新」按钮（走正常加载，绕开缓存）。
+                if (TryApplyBrowseCacheFromSettings(_curFid, modeName))
+                    return;
 
                 bool loadFailed = false;
                 await LoadDirAsync(_curFid, () => loadFailed = true);
@@ -2555,9 +2718,13 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 搜索框里按 Esc：**退出焦点**、把键盘交回文件列表
-        /// （用户要求「i 光标焦点到搜索文件的输入框里（esc 退出焦点）」）。
-        /// 注意全局快捷键处理器遇到输入框会直接放行，所以 Esc 必须在这里单独处理。
+        /// 搜索框里按 Esc：退出焦点、把键盘交回文件列表。
+        ///
+        /// <para>【2026-10-21】全局的「Esc 退出任何输入框」已经统一在
+        /// <see cref="OnShortcutKeyDown"/> 里做了（见 ReleaseTypingFocus），
+        /// 这里只保留一份最短路径 —— 因为搜索框的 KeyDown 比窗口的 PreviewKeyDown
+        /// 更早触发，不在这里挡一下会走两遍（日志会打两行）。
+        /// 行为与统一逻辑一致：焦点回列表、**筛选内容保留**。</para>
         /// </summary>
         private void OnFileFilterKeyDown(object sender, KeyEventArgs e)
         {
@@ -2614,6 +2781,14 @@ namespace GeZi
 
         /// <summary>当前目录对应的那一份缓存（没加载过时为 null）。</summary>
         private DirCacheEntry _curDir;
+
+        /// <summary>
+        /// 当前列表是**从本地快照铺出来的**（2026-10-21）。
+        /// <para>这种状态下没有可用的会话凭证（缓存恢复刻意零请求），
+        /// 所以不自动续页，也不该悄悄失败 —— 由用户点「刷新」触发真正的加载。
+        /// 任何一次真实加载（LoadDirAsync / OnRefresh）都会把它清掉。</para>
+        /// </summary>
+        private bool _curDirFromCache;
 
         /// <summary>文件列表模板里的那个 ScrollViewer（滚动时顺手记下来，恢复位置要用）。</summary>
         private ScrollViewer _fileScroller;
@@ -2789,6 +2964,17 @@ namespace GeZi
             }
             if (!_curDir.HasMore) return;      // 真到底了
 
+            // 【2026-10-21】从本地缓存恢复出来的目录，**不自动续页**。
+            // 原因：缓存铺出来时并没有取过 stoken / 会话（这正是"零请求"的代价），
+            // 一滚到底就去请求必然失败（实测日志：guest missing pwd_id or stoken）。
+            // 用户要的语义也是"只有点击刷新才检查更新"，所以这里直接提示去点刷新，
+            // 把网络动作留给用户显式触发。
+            if (_curDirFromCache)
+            {
+                UpdateDirMoreHint();
+                return;
+            }
+
             _dirLoadingMore = true;
             int token = _dirLoadToken;
             string fid = _curFid;
@@ -2827,7 +3013,11 @@ namespace GeZi
                     FileMoreHint.Visibility = Visibility.Collapsed;
                     return;
                 }
-                FileMoreHint.Text = "已显示 " + _files.Count + " 项 · 下面还有，下滑继续加载";
+                // 从本地快照铺出来的列表：下面还有内容，但需要用户主动刷新才能取
+                // （此刻没有会话凭证，自动请求必然失败 —— 见 _curDirFromCache 注释）
+                FileMoreHint.Text = _curDirFromCache
+                    ? "已显示 " + _files.Count + " 项 · 这是本地缓存，点「刷新」加载最新内容"
+                    : "已显示 " + _files.Count + " 项 · 下面还有，下滑继续加载";
                 FileMoreHint.Visibility = Visibility.Visible;
             }
             catch { }
@@ -2863,6 +3053,8 @@ namespace GeZi
         private async Task LoadDirAsync(string fid, Action onFailed = null)
         {
             bool failed = false;
+            // 真实加载开始了 → 这份列表不再是"快照铺出来的"，允许后续自动续页
+            _curDirFromCache = false;
             SetBusy(true);
             // 【纯皮肤】置位加载态并立刻刷新一次 —— 让"正在加载…"在请求发出前
             // 就出现，而不是等 SetBusy 的按钮禁用生效后才补上（会闪一下空状态）。
@@ -2880,8 +3072,7 @@ namespace GeZi
                     ApplyDirView(hit, restore: true);
                     LogDetail("目录来自缓存: 共 " + hit.Items.Count + " 项，已恢复 "
                         + hit.RevealCount + " 项（未重新请求）");
-                    return;
-                }
+                    return;                }
 
                 // ② 只取第一页就先显示，剩下的等滚到底部再取
                 var page = await FetchDirPageAsync(fid, 1);
@@ -2924,7 +3115,13 @@ namespace GeZi
                 //
                 // ⚠️ 失败时**不记**：否则失效 fid 会被写回设置，
                 // 下次启动又拿着同一个坏 fid 去恢复（等于把错误固化下来）。
-                if (!failed) SaveBrowsePosition();
+                if (!failed)
+                {
+                    SaveBrowsePosition();
+                    // 【2026-10-21】同时把列表内容存成快照 —— 用户要求"存在本地，
+                    // 不然每次打开都重复请求"。只存层级的话，下次启动还是得发请求。
+                    CaptureBrowseCache();
+                }
                 else { try { onFailed?.Invoke(); } catch { } }
             }
         }
@@ -3071,6 +3268,26 @@ namespace GeZi
             if (!BeginBusy(DriveRefreshBtn, "刷新中")) return;
             try
             {
+                // 【2026-10-21】分享模式下，从缓存恢复后是没有 stoken 的
+                // （那正是"零请求"的代价）。刷新是用户显式要求联网的动作，
+                // 所以在这里补取一次，否则刷新必定失败（guest missing pwd_id or stoken）。
+                if (ShareMode && string.IsNullOrEmpty(_stoken)
+                    && !string.IsNullOrEmpty(_pwdId) && _client != null)
+                {
+                    try
+                    {
+                        var info = await _client.GetShareInfoAsync(_pwdId, _sharePasscode);
+                        if (info != null && !string.IsNullOrEmpty(info.Stoken))
+                            _stoken = info.Stoken;
+                        else
+                            Log("刷新前获取分享凭证失败（分享可能已过期或需要提取码）。");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("刷新前获取分享凭证失败：" + ex.Message);
+                    }
+                }
+
                 // 「刷新」的语义就是要**绕过缓存**重新取一次
                 _dirCache.Remove(DirCacheKey(_curFid));
                 await LoadDirAsync(_curFid);
@@ -3399,6 +3616,24 @@ namespace GeZi
         /// <summary>窗口级快捷键。挂在 Window 的 PreviewKeyDown 上（XAML 里）。</summary>
         private void OnShortcutKeyDown(object sender, KeyEventArgs e)
         {
+            // ⓪-1 Esc 退出任何输入框（2026-10-21 用户要求：
+            //      「添加 esc 退出所有输入框功能，不管是链接输入还是搜索」）。
+            //
+            // ⚠️ 必须排在 IsTypingTarget 那个"在打字就放行"的判断**之前** ——
+            //    否则焦点在输入框里时 Esc 会被直接放过，这个功能就等于没做。
+            //    这也正是原来只有搜索框能 Esc 退出的原因：它在 OnFileFilterKeyDown
+            //    里单独处理了一份；现在统一收到这里，所有输入框行为一致。
+            //
+            // 行为：把焦点交还给当前页的主容器（而不是某个具体控件），
+            // 这样后续单键快捷键能正常触发；输入框里的内容**不清空**
+            // （用户只是"退出输入"，不是"放弃已输入的内容"）。
+            if (e.Key == Key.Escape && IsTypingTarget(Keyboard.FocusedElement))
+            {
+                e.Handled = true;
+                ReleaseTypingFocus();
+                return;
+            }
+
             // 光标在输入框里 → 这些字符是文字，不是快捷键
             if (IsTypingTarget(Keyboard.FocusedElement)) return;
 
@@ -3563,6 +3798,95 @@ namespace GeZi
                 ? WindowState.Normal
                 : WindowState.Maximized;
             Log(WindowState == WindowState.Maximized ? "已进入全屏（最大化）" : "已还原窗口");
+        }
+
+        /// <summary>
+        /// 把键盘焦点从当前输入框交还给所在页，用于「Esc 退出输入」（2026-10-21）。
+        ///
+        /// <para>【为什么不 Focus 到某个具体控件】各页结构不同，硬指定容易拿到不该有焦点的元素
+        /// （比如只读的按钮反而被高亮）。这里按"当前在哪一页"选一个合理的归宿：
+        /// 下载页 → 文件列表（这样 a/d/s/x/g 等单键立刻可用）；
+        /// 其余页 → 让页容器自己接管。</para>
+        ///
+        /// <para>【不影响内容】只移焦点，不改文本。用户按 Esc 通常是想"先去点别的东西"，
+        /// 把已输入的内容清掉会很恼人。</para>
+        /// </summary>
+        private void ReleaseTypingFocus()
+        {
+            try
+            {
+                // 记下是哪种输入框，日志里能说清楚（排查"按了没反应"时有用）
+                string kind = "输入框";
+                var focused = Keyboard.FocusedElement;
+                var fe = focused as FrameworkElement;
+                if (focused is PasswordBox) kind = "密码框";
+                else if (focused is TextBox) kind = "文本框";
+                else if (focused is ComboBox) kind = "下拉框";
+                string name = fe != null && !string.IsNullOrEmpty(fe.Name) ? "（" + fe.Name + "）" : "";
+
+                // 【关键】焦点必须从"正在打字的那个控件"**主动移走**，
+                // 光调别的控件 Focus() 不一定有用 —— 实测点进链接框后
+                // 调 FileList.Focus() 无效：焦点仍留在 LinkBox，于是接着按 s/a/d
+                // 还是被当成打字，单键快捷键全部失效。
+                //
+                // 做法（顺序有讲究）：
+                // ① 先把当前输入框设为不可聚焦（Keyboard.ClearFocus 在 WPF 里没有直接对应，
+                //    最可靠的替代是把焦点明确交给一个"能接收焦点"的容器）；
+                // ② 下载页优先给文件列表（这样 a/d/s/x/g 立刻可用），
+                //    其它页给页容器；
+                // ③ 兜底：把焦点交给窗口本身（Window 是 IInputElement，一定能接住）。
+                bool moved = false;
+
+                if (Tabs.SelectedIndex == 0 && FileList != null)
+                {
+                    try
+                    {
+                        FileList.Focus();
+                        moved = ReferenceEquals(Keyboard.FocusedElement, FileList)
+                             || !IsTypingTarget(Keyboard.FocusedElement);
+                    }
+                    catch { }
+                }
+
+                if (!moved)
+                {
+                    // 用 MoveFocus 把焦点从当前元素顺着逻辑树挪走，
+                    // 比"指名某个控件"更通用（设置页/登录页各有各的控件树）。
+                    try
+                    {
+                        var from = focused as UIElement;
+                        if (from != null)
+                        {
+                            from.MoveFocus(new TraversalRequest(FocusNavigationDirection.Next));
+                            moved = !IsTypingTarget(Keyboard.FocusedElement);
+                        }
+                    }
+                    catch { }
+                }
+
+                if (!moved)
+                {
+                    // 最后兜底：交给窗口自己。窗口持有焦点时 IsTypingTarget 为 false，
+                    // 单键快捷键一定会重新生效。
+                    try
+                    {
+                        // Window 默认 Focusable=false，直接 Focus() 会被忽略 ——
+                        // 临时打开它、抢到焦点后再关掉，这样键盘输入不会落到窗口本身。
+                        bool old = Focusable;
+                        Focusable = true;
+                        Focus();
+                        moved = !IsTypingTarget(Keyboard.FocusedElement);
+                        Focusable = old;
+                    }
+                    catch { }
+                }
+
+                Log("已退出" + kind + name + "的输入状态（内容保留）" + (moved ? "" : "（提示：焦点可能未完全移开）"));
+            }
+            catch
+            {
+                // 拿不到焦点目标也不能让程序出错：静默即可，功能降级为"这次没退出"
+            }
         }
 
         /// <summary>
@@ -4039,6 +4363,137 @@ namespace GeZi
                 DownloadConnBudget, sb, MinThreadsPerFile));
         }
 
+        // ---------------- 重复下载检测（2026-10-21 新增） ----------------
+        //
+        // 【问题】用户问「不小心误选了同样文件，是否会重复下载」。
+        // 当时有两层保护，但都不够：
+        //   ① 核心层 DownloadScheduler._activeDests 同路径互斥 —— 但它是在**开始下载那一刻**
+        //      才判定，冲突时把第二个任务标成 JobState.Failed（"已跳过：同一文件正在下载中"）。
+        //      结果：任务页多出一行红色失败任务，看着像出错了，还挺碍眼。
+        //   ② PathUtil.UniquePath 只查**磁盘**上是否已存在同名文件。
+        //      "文件还没落盘（或只落了部分）"时它查不到，于是同一个文件可以被排进队列两次。
+        // 【做法】在**入队前**按目标路径查一遍任务列表，命中就跳过并记日志，
+        //        从源头上不产生第二条任务。核心层那道互斥继续留着当最后一道保险。
+
+        /// <summary>
+        /// 从待下载列表里剔除**已经下过或正在下**的文件（2026-10-21 新增，用户要求"在发请求之前判断"）。
+        ///
+        /// <para>【为什么按 fid 而不是按路径】fid 是文件在网盘/分享里的唯一编号，
+        /// 同一个 fid 必然是同一个文件。而路径会变：<c>UniquePath</c> 发现磁盘上已有同名文件时
+        /// 会把它改成 "xxx (1)"，于是"按路径判断"就会认为这是个新文件 —— 这正是上一版
+        /// 仍然重复下载的根因（用户实测反馈"还是会重复下载"）。</para>
+        ///
+        /// <para>【什么算"已经下过"】任务列表里存在同 fid 的行，且该行**不是失败/取消**：
+        /// · 排队 / 下载中 / 暂停 / 取消中 → 正在处理，跳过；
+        /// · 已完成 → 文件已经在了，默认跳过（用户明确要"避免重复下载"）；
+        /// · 失败 / 已取消 → 允许重新下载（否则失败一次就再也下不了了）。</para>
+        ///
+        /// <para>【原地修改】直接把重复项从 <paramref name="files"/> 里移除，
+        /// 返回被剔除的数量，调用方据此判断"是不是全都被跳过了"。</para>
+        /// </summary>
+        private int FilterAlreadyQueued(List<ShareFileItem> files)
+        {
+            if (files == null || files.Count == 0) return 0;
+            int removed = 0;
+            try
+            {
+                for (int i = files.Count - 1; i >= 0; i--)
+                {
+                    var f = files[i];
+                    if (f == null || string.IsNullOrEmpty(f.Fid)) continue;
+
+                    var hit = _tasks.FirstOrDefault(t =>
+                        t != null && t.Job != null && t.Job.Pending != null
+                        && string.Equals(t.Job.Pending.Fid, f.Fid, StringComparison.Ordinal)
+                        && ShouldBlockRedownload(t.State));
+
+                    if (hit == null) continue;
+
+                    files.RemoveAt(i);
+                    removed++;
+                    string why = hit.State == JobState.Completed ? "已下载过" : "已在任务列表里";
+                    Log(why + "，跳过：" + f.Name);
+                }
+            }
+            catch { }
+            return removed;
+        }
+
+        /// <summary>
+        /// 处于这些状态的任务，会阻止同一文件被再次加入下载。
+        /// <para>失败 / 已取消**不阻止** —— 否则一次失败就再也下不了同一个文件了。</para>
+        /// </summary>
+        private static bool ShouldBlockRedownload(JobState st)
+        {
+            return st == JobState.Queued
+                || st == JobState.Downloading
+                || st == JobState.Paused
+                || st == JobState.Cancelling
+                || st == JobState.Completed;
+        }
+
+        /// <summary>
+        /// 这个目标路径是否已经有一条"还在进行"的任务（排队/下载中/暂停/取消中）。
+        ///
+        /// <para>为什么不拦"已完成"的：已完成的同名文件由 <see cref="PathUtil.UniquePath"/>
+        /// 改名为 "xxx (1)" 另存 —— 用户主动重下同一文件是合理需求（比如上次下坏了）。</para>
+        /// </summary>
+        private bool HasActiveTaskForDest(string dest)
+        {
+            if (string.IsNullOrEmpty(dest)) return false;
+            try
+            {
+                foreach (var t in _tasks)
+                {
+                    if (t.Job == null || string.IsNullOrEmpty(t.Job.Dest)) continue;
+                    if (!string.Equals(t.Job.Dest, dest, StringComparison.OrdinalIgnoreCase)) continue;
+                    // 只有"还在进行"的才算重复；已完成/失败/已取消的不拦
+                    if (t.State == JobState.Queued
+                        || t.State == JobState.Downloading
+                        || t.State == JobState.Paused
+                        || t.State == JobState.Cancelling)
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// 给一个文件算出最终目标路径，并在**本批内部**与**已有任务**之间去重。
+        /// </summary>
+        /// <param name="destDir">目标目录。</param>
+        /// <param name="name">文件名（未清洗）。</param>
+        /// <param name="takenInBatch">本批已占用的路径（大小写不敏感），防止同批两个同名文件互撞。</param>
+        /// <returns>可用的目标路径；<c>null</c> 表示这个文件已经在下、应当跳过。</returns>
+        private string ResolveDestOrSkip(string destDir, string name, HashSet<string> takenInBatch)
+        {
+            string basePath = Path.Combine(destDir, PathUtil.SanitizeFileName(name));
+
+            // ① 本批内部撞名（同一个文件夹里真有两个同名文件，或用户重复勾选）：
+            //    这时**不该跳过**，而应像磁盘冲突那样改名 —— 它们是两个不同的文件。
+            //    但如果路径完全相同且我们已在本批登记过，说明是同一次误选，跳过。
+            if (takenInBatch != null && !takenInBatch.Add(basePath))
+            {
+                // 本批里已经处理过同一个路径 → 是同一次选择被重复提交，直接跳过
+                return null;
+            }
+
+            // ② 已有任务正在下这个路径 → 跳过（这才是"误选同一文件"的典型情况）
+            if (HasActiveTaskForDest(basePath))
+                return null;
+
+            // ③ 磁盘上已存在 → 改名为 xxx (1)。这里必须再过一次
+            //    "改名后是否与已有任务撞"，否则改名结果可能正好是另一条在下的任务。
+            string dest = PathUtil.UniquePath(basePath);
+            int guard = 0;
+            while (HasActiveTaskForDest(dest) && guard++ < 50)
+                dest = PathUtil.UniquePath(dest);
+
+            if (takenInBatch != null) takenInBatch.Add(dest);
+            return dest;
+        }
+
         /// <summary>
         /// 用**已取到的链接**直接建任务入队（不再重新取链）。
         /// 给「获取直链」对话框的「下载这些文件」按钮用。
@@ -4047,6 +4502,8 @@ namespace GeZi
         {
             var alloc = AllocateThreads(items.Select(i => i.Size).ToList());
             var jobs = new List<DownloadJob>();
+            var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // 本批已占用路径
+            int skipped = 0;
             for (int i = 0; i < items.Count; i++)
             {
                 var it = items[i];
@@ -4055,7 +4512,8 @@ namespace GeZi
                 try { Directory.CreateDirectory(destDir); }
                 catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
 
-                string dest = PathUtil.UniquePath(Path.Combine(destDir, PathUtil.SanitizeFileName(it.Name)));
+                string dest = ResolveDestOrSkip(destDir, it.Name, taken);
+                if (dest == null) { skipped++; Log("已在下载，跳过：" + it.Name); continue; }
                 var item = it;
                 jobs.Add(new DownloadJob
                 {
@@ -4080,13 +4538,20 @@ namespace GeZi
                     },
                 });
             }
-            if (jobs.Count == 0) { Log("没有可下载的条目。"); return; }
+            if (jobs.Count == 0)
+            {
+                Log(skipped > 0
+                    ? "这些文件都已在下载队列里，没有新增任务。"
+                    : "没有可下载的条目。");
+                return;
+            }
 
             LogAllocation(alloc);
             foreach (var job in jobs)
                 AddTaskItem(new TaskItem(job, job.Name));
             ClearFileSelection();   // 同上：入队即撤掉列表里的高亮
-            Log("已加入下载队列: " + jobs.Count + " 个文件（复用已取链接）");
+            Log("已加入下载队列: " + jobs.Count + " 个文件（复用已取链接）"
+                + (skipped > 0 ? "（另有 " + skipped + " 个已在下载，已跳过）" : ""));
             Tabs.SelectedIndex = 1;
             RunJobs(jobs);
         }
@@ -4158,19 +4623,37 @@ namespace GeZi
                     }
                 }
 
+                // 【2026-10-21】去重要在**取链之前**做（用户反馈"应该在发请求之前就判断"）。
+                // 上一版把判断放在取链之后，白白发了一轮网络请求才发现重复，
+                // 用户看到日志里"正在取直链…"已经跑过了，体验上等于"还是重复下载了"。
+                //
+                // 这里按**文件身份**判断，而不是按目标路径：
+                //   · 同一个 fid 就是同一个文件，无论目标路径是否被 UniquePath 改过名；
+                //   · 上一版按路径判断有个致命漏洞 —— 已完成的任务会让 UniquePath 把新任务
+                //     改名成 "xxx (1)"，路径不同了于是判定"不重复"，结果又下了一份。
+                int preSkipped = FilterAlreadyQueued(files);
+                if (preSkipped > 0 && files.Count == 0)
+                {
+                    Log("这些文件都已经在任务列表里了，没有新增下载。");
+                    return;
+                }
+
                 var items = await GetDownloadItemsAsync(files, forceNoSave);
 
                 // 连接数按文件大小比例分配（大文件多分、小文件少分，各不低于下限）
                 var alloc = AllocateThreads(items.Select(x => x.Size).ToList());
 
                 var jobs = new List<DownloadJob>();
+                var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                int skipped = 0;
                 for (int i = 0; i < items.Count; i++)
                 {
                     var it = items[i];
                     string destDir = Path.Combine(_settings.OutDir, it.RelDir ?? "");
                     try { Directory.CreateDirectory(destDir); }
                     catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
-                    string dest = PathUtil.UniquePath(Path.Combine(destDir, PathUtil.SanitizeFileName(it.Name)));
+                    string dest = ResolveDestOrSkip(destDir, it.Name, taken);
+                    if (dest == null) { skipped++; Log("已在下载，跳过：" + it.Name); continue; }
                     var item = it;   // 闭包捕获：每次循环一个新变量，避免所有回调指向同一个
                     jobs.Add(new DownloadJob
                     {
@@ -4202,7 +4685,9 @@ namespace GeZi
                 }
                 if (jobs.Count == 0)
                 {
-                    Log("没有取得直链（分享者可能关闭直链或游客额度限制）");
+                    Log(skipped > 0
+                        ? "这些文件都已在下载队列里，没有新增任务。"
+                        : "没有取得直链（分享者可能关闭直链或游客额度限制）");
                     return;
                 }
 
@@ -4210,7 +4695,8 @@ namespace GeZi
                 foreach (var job in jobs)
                     AddTaskItem(new TaskItem(job, job.Name));
                 ClearFileSelection();   // 已提交 → 撤掉高亮，避免误触重复入队
-                Log("已加入下载队列: " + jobs.Count + " 个文件");
+                Log("已加入下载队列: " + jobs.Count + " 个文件"
+                    + (skipped > 0 ? "（另有 " + skipped + " 个已在下载，已跳过）" : ""));
                 Tabs.SelectedIndex = 1;
                 RunJobs(jobs);
             }
@@ -10057,5 +10543,6 @@ namespace GeZi
         }
     }
 }
+
 
 
