@@ -215,6 +215,19 @@ namespace GeZi
         ///    正好等于"默认按文件夹分组、展开"。
         /// </summary>
         public TaskViewMode TaskView { get; set; } = TaskViewMode.Grouped;
+
+        /// <summary>
+        /// 任务页「运行日志」输出框的高度（像素，2026-10-21 新增）。
+        ///
+        /// <para>用户反馈日志框占用太多空间，要求「改为可以调整高度，并且记忆」。
+        /// 现在任务页底部有一条可拖拽的分隔条，拖动即改高度，松手落盘。</para>
+        ///
+        /// <para>⚠️ 默认值写 0 而不是具体像素：XmlSerializer 反序列化**不执行字段初始化器**，
+        /// 老配置文件里没有这个节点时就是 0 = "没设过"，
+        /// 由 <c>MainWindow.NormalizeLogPanelHeight()</c> 用它回退到内置默认值。
+        /// 这样既兼容老配置，也不用在这里写死一个会随界面设计变动而失效的数字。</para>
+        /// </summary>
+        public double LogPanelHeight { get; set; }
     }
 
     /// <summary>任务列表展示方式。</summary>

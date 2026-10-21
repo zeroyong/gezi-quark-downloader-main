@@ -220,8 +220,27 @@
                                  两行共用同一套「键帽 + 说明」语言，字号 11、三级色，
                                  比账号卡的昵称弱一档 → 是"提示"而不是"告示"，不抢视线。 -->
                         <StackPanel Grid.Row="2" Margin="15,0,0,7">
-                            <!-- 第一行：按住 Shift 可多选文件（原有，较短句放上面） -->
+                            <!-- 第一行：多选文件的两种方式。
+                                 【2026-10-21】用户反馈「一直需要按 shift 才行 太麻烦」，
+                                 所以补了 Alt 粘滞多选模式；这里把更省事的 Alt 放前面，
+                                 Shift 作为"临时按一下"的补充（两行都保留，各有适用场景）。 -->
                             <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="按" FontSize="11" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                <Border Background="{DynamicResource SurfaceSunkenBrush}"
+                                        BorderBrush="{DynamicResource BorderBrushStrong}"
+                                        BorderThickness="1" CornerRadius="4"
+                                        Padding="5,0" Margin="4,0" MinWidth="26"
+                                        VerticalAlignment="Center">
+                                    <TextBlock Text="Alt" FontSize="10" FontWeight="SemiBold"
+                                               HorizontalAlignment="Center"
+                                               Foreground="{DynamicResource TextSecondaryBrush}"/>
+                                </Border>
+                                <TextBlock Text="多选（再按退出）" FontSize="11" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                <TextBlock Text="·" FontSize="11" Margin="6,0" VerticalAlignment="Center"
+                                           Opacity="0.55"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
                                 <TextBlock Text="按住" FontSize="11" VerticalAlignment="Center"
                                            Foreground="{DynamicResource TextTertiaryBrush}"/>
                                 <Border Background="{DynamicResource SurfaceSunkenBrush}"
@@ -233,7 +252,7 @@
                                                HorizontalAlignment="Center"
                                                Foreground="{DynamicResource TextSecondaryBrush}"/>
                                 </Border>
-                                <TextBlock Text="可多选文件" FontSize="11" VerticalAlignment="Center"
+                                <TextBlock Text="临时多选" FontSize="11" VerticalAlignment="Center"
                                            Foreground="{DynamicResource TextTertiaryBrush}"/>
                             </StackPanel>
 
@@ -702,7 +721,7 @@
                                                        Margin="14,0,0,0" FontSize="11.5" FontWeight="SemiBold"
                                                        Foreground="{DynamicResource PrimaryBrush}"
                                                        VerticalAlignment="Center"/>
-                                            <TextBlock Text="Esc 退出" Margin="12,0,0,0" FontSize="11"
+                                            <TextBlock Text="Esc / Alt 退出" Margin="12,0,0,0" FontSize="11"
                                                        Foreground="{DynamicResource TextTertiaryBrush}"
                                                        VerticalAlignment="Center"/>
                                         </StackPanel>
@@ -906,9 +925,19 @@
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
+                            <!-- Row2 = 任务列表：* 高度，随日志区变高/变矮自动让出/收回空间
+                                 （GridSplitter 拖的就是它和下面 Row4 的边界） -->
                             <RowDefinition Height="*"/>
+                            <!-- Row3 = 日志拖拽条（5px） -->
                             <RowDefinition Height="Auto"/>
-                            <!-- 【2026-10-21】底部状态栏：总进度 / 总速度 / 剩余 / 已下总量
+                            <!-- Row4 = 运行日志区：**像素高度**（初值由代码按设置恢复）。
+                                 ⚠️ 必须是像素而不是 Auto —— GridSplitter 的 PreviousAndNext
+                                 只对"能写死高度"的行生效；Auto 行高度由内容决定，
+                                 拖动时改不动，那正是上一版"拖了没反应"的原因。
+                                 内部再分「标题(Auto) + 日志框(*)」：
+                                 拖大/拖小只改变日志框，标题永远保持自己的高度。 -->
+                            <RowDefinition x:Name="LogRow" Height="120"/>
+                            <!-- Row5 = 底部状态栏：总进度 / 总速度 / 剩余 / 已下总量
                                  （方案 C 选型，原型见 gezi-task-design/Total-C-statusbar.html） -->
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
@@ -1556,35 +1585,79 @@
                         </Grid>
 
                         <!-- 运行日志（从「下载」页迁来：日志讲的是任务跑得怎么样，放任务页更贴）
-                             高度固定 132px，不出内容时也占位，避免切换任务多寡时整页跳动。 -->
-                        <Grid Grid.Row="3" Margin="0,14,0,0">
+                             【2026-10-21】用户反馈「占用太多空间」，改为**可拖拽调高**并记忆。
+
+                             ⚠️ 结构要点（踩过坑）：GridSplitter 必须夹在**任务页外层 Grid** 的
+                             两个相邻行之间才拖得动 —— 即"任务列表（*）"与"日志区（像素）"。
+                             之前把 Splitter 塞进日志区自己的子 Grid 里，那个 Grid 外层是
+                             Auto 高度，内部 * 行会收缩成 0，Splitter 拖的是 Auto 行 → 拖不动。
+                             所以这里把日志区拆成 3 个外层行：
+                               Row2 = 任务列表（*，由 Splitter 让出/收回高度）
+                               Row3 = 5px 分隔条
+                               Row4 = 日志区（Auto，内部再分标题 + 日志框 *）
+                             日志框的实际高度由具名行 LogRow 控制（代码里改 Height）。 -->
+                        <GridSplitter Grid.Row="3" x:Name="LogSplitter"
+                                      Height="5" Margin="0,8,0,0"
+                                      HorizontalAlignment="Stretch"
+                                      VerticalAlignment="Center"
+                                      Background="Transparent"
+                                      ResizeDirection="Rows"
+                                      ResizeBehavior="PreviousAndNext"
+                                      Cursor="SizeNS"
+                                      ToolTip="拖动调整「运行日志」高度（会自动记住）"
+                                      DragCompleted="OnLogSplitterDragCompleted">
+                            <GridSplitter.Template>
+                                <ControlTemplate TargetType="GridSplitter">
+                                    <Border Background="Transparent" Padding="0,1">
+                                        <Border x:Name="Line" Height="2" CornerRadius="1"
+                                                VerticalAlignment="Center"
+                                                Background="{DynamicResource BorderBrushSoft}"/>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter TargetName="Line" Property="Background"
+                                                    Value="{DynamicResource PrimaryBrush}"/>
+                                        </Trigger>
+                                        <Trigger Property="IsDragging" Value="True">
+                                            <Setter TargetName="Line" Property="Background"
+                                                    Value="{DynamicResource PrimaryBrush}"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </GridSplitter.Template>
+                        </GridSplitter>
+
+                        <Grid Grid.Row="4">
                             <Grid.RowDefinitions>
+                                <!-- 标题行：固定高度，不参与拖拽（用户要求"拖动内容不应包括运行日志标题"） -->
                                 <RowDefinition Height="Auto"/>
-                                <RowDefinition Height="132"/>
+                                <!-- 日志框本体：吃掉这一行的剩余高度。
+                                     外层 LogRow 变高/变矮时，增量全部落在它身上。 -->
+                                <RowDefinition Height="*"/>
                             </Grid.RowDefinitions>
                             <Grid Grid.Row="0" Margin="0,0,0,6">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*"/>
-                                    <ColumnDefinition Width="Auto"/>
-                                </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0" Orientation="Horizontal">
-                                    <TextBlock Text="运行日志" Style="{StaticResource SectionLabel}"
-                                               Margin="0"/>
-                                    <TextBlock Text="下载 / 解析 / 报错都会打在这里" Margin="8,0,0,0"
-                                               FontSize="11" VerticalAlignment="Center"
-                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
-                                </StackPanel>
-                                <!-- 两级日志开关（2026-10-20）：默认只看日常信息，
-                                     点开才显示目录加载 / 连接分配 / 缓存命中等过程细节 -->
-                                <Button x:Name="LogDetailBtn" Grid.Column="1"
-                                        Content="详细"
-                                        Click="OnToggleLogVerbose"
-                                        Style="{StaticResource GhostButton}"
-                                        FontSize="11" Padding="8,3"
-                                        ToolTip="切换日志详细程度：默认只显示日常必要信息，&#10;点此显示全部过程细节（目录加载、连接分配等）"/>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0" Orientation="Horizontal">
+                                        <TextBlock Text="运行日志" Style="{StaticResource SectionLabel}"
+                                                   Margin="0"/>
+                                        <TextBlock Text="下载 / 解析 / 报错都会打在这里" Margin="8,0,0,0"
+                                                   FontSize="11" VerticalAlignment="Center"
+                                                   Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                    </StackPanel>
+                                    <!-- 两级日志开关（2026-10-20）：默认只看日常信息，
+                                         点开才显示目录加载 / 连接分配 / 缓存命中等过程细节 -->
+                                    <Button x:Name="LogDetailBtn" Grid.Column="1"
+                                            Content="详细"
+                                            Click="OnToggleLogVerbose"
+                                            Style="{StaticResource GhostButton}"
+                                            FontSize="11" Padding="8,3"
+                                            ToolTip="切换日志详细程度：默认只显示日常必要信息，&#10;点此显示全部过程细节（目录加载、连接分配等）"/>
+                                </Grid>
+                                <TextBox x:Name="LogBox" Grid.Row="1" Style="{StaticResource LogTextBox}"/>
                             </Grid>
-                            <TextBox x:Name="LogBox" Grid.Row="1" Style="{StaticResource LogTextBox}"/>
-                        </Grid>
 
                         <!-- ═══ 底部状态栏（方案 C · 2026-10-21） ═══
                              为什么做成贴底通栏而不是顶部大卡片：
@@ -1593,7 +1666,7 @@
                              这里只吃 32px，列表能多显示一行多。
                              顶边那 1px 光带 = 总进度的可视化，不读数字也能感知。
                              数据由 RefreshTotalStatusBar() 维护，与进度日志同一节拍刷新。 -->
-                        <Border x:Name="TotalStatusBar" Grid.Row="4" Margin="0,10,0,0"
+                        <Border x:Name="TotalStatusBar" Grid.Row="5" Margin="0,10,0,0"
                                 Height="32" CornerRadius="8"
                                 Background="{DynamicResource SurfaceBrush}"
                                 BorderBrush="{DynamicResource BorderBrushSoft}"
@@ -2263,7 +2336,7 @@
                                     </Grid>
 
                                     <TextBlock Style="{StaticResource ProseText}" Margin="0,14,0,0"
-                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史、全屏在任何页面都可用；a / d / x / g / i 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件用 Shift+点击（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
+                                               Text="都是单键，不需要按 Ctrl/Alt（Alt 例外：它是「下载」页的多选开关，见下文）。切页、关于、解析历史、全屏在任何页面都可用；a / d / x / g / i 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件有两种方式：按 Alt 进入粘滞多选（再按一次 Alt 或 Esc 退出，全程不用按键），或按住 Shift 临时多选（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
                                 </StackPanel>
                             </Border>
                         </StackPanel>

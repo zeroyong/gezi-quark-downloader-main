@@ -414,6 +414,12 @@ namespace GeZi
                 // 表现为"加了代码但窗口依然没有圆角"（连日志都没打）。
                 ApplyWindowRoundedCorners();
 
+                // 【2026-10-21】日志高度再应用一次：
+                // LoadSettingsToUi 跑在构造函数阶段，那时 ActualHeight 还是 0，
+                // ClampLogPanelHeight 只能用 700 兜底估上限 —— 大屏上恢复出来的高度
+                // 会被这个估值错误地夹小。到 Loaded 时窗口尺寸已经确定，这里重算一次。
+                ApplyLogPanelHeight();
+
                 // 托盘图标（用户要求加后台功能）。
                 // ⚠️ 也必须在 Loaded 里：NotifyIcon 需要一个窗口句柄来收任务栏消息，
                 //    而 WPF 窗口句柄到 Loaded 才存在。
@@ -1927,9 +1933,38 @@ namespace GeZi
         /// </summary>
         private bool _fileSelectMode;
 
-        private void EnterFileSelectMode()
+        /// <summary>
+        /// 当前文件列表里是否有可选的条目（考虑筛选词）。
+        /// <para>用于决定多选模式能否进入 —— 空列表里进多选模式毫无意义，
+        /// 只会看到一条提示条挂在那里，用户反馈「没有文件按 Alt 也会展示多选提示」。</para>
+        /// </summary>
+        private bool HasSelectableFiles()
         {
-            if (_fileSelectMode) return;
+            try
+            {
+                // 有筛选词时以"视图里的可见条数"为准：列表里显示 0 条就没得选
+                if (!string.IsNullOrEmpty(_fileFilter))
+                    return _filesView != null && _filesView.Cast<object>().Any();
+                return _files != null && _files.Count > 0;
+            }
+            catch { return _files != null && _files.Count > 0; }
+        }
+
+        /// <summary>
+        /// 进入多选模式。<paramref name="silent"/> = true 时不写日志（用于自动重进等场景）。
+        /// </summary>
+        /// <returns>是否真的进入了（列表空时返回 false）。</returns>
+        private bool EnterFileSelectMode(bool silent = false)
+        {
+            if (_fileSelectMode) return true;
+
+            // ⚠️ 空列表不进入：没有任何可选项时提示条只会是噪音
+            if (!HasSelectableFiles())
+            {
+                if (!silent) Log("当前目录没有可选择的文件，多选模式不需要开启。");
+                return false;
+            }
+
             _fileSelectMode = true;
             try
             {
@@ -1937,11 +1972,14 @@ namespace GeZi
             }
             catch { }
             UpdateFileSelectCount();
-            Log("已进入多选模式：点文件即可加选 / 取消（文件夹不再进入目录）；按 Esc 退出。");
+            if (!silent)
+                Log("已进入多选模式：点文件即可加选 / 取消（文件夹不再进入目录）；再按 Alt 或 Esc 退出。");
+            return true;
         }
 
         /// <param name="clearSelection">退出时是否清空已选（Esc 默认清空，与任务页 z 模式一致）。</param>
-        private void ExitFileSelectMode(bool clearSelection = true)
+        /// <param name="silent">true = 不写日志。用于"列表变空自动退出"这类用户没主动操作的场景。</param>
+        private void ExitFileSelectMode(bool clearSelection = true, bool silent = false)
         {
             if (!_fileSelectMode) return;
             _fileSelectMode = false;
@@ -1952,7 +1990,7 @@ namespace GeZi
             catch { }
             if (clearSelection) ClearFileSelection();
             UpdateFileSelectCount();
-            Log("已退出多选模式。");
+            if (!silent) Log("已退出多选模式。");
         }
 
         private void UpdateFileSelectCount()
@@ -2932,18 +2970,20 @@ namespace GeZi
             // 光标在输入框里 → 这些字符是文字，不是快捷键
             if (IsTypingTarget(Keyboard.FocusedElement)) return;
 
-            // ⓪ Alt 多选模式（2026-10-21）：Alt 进入 / Esc 退出。
-            //    ⚠️ 必须排在下面那个"带修饰键就 return"之前 —— 否则按下 Alt 本身
-            //       就被当成修饰键直接放行了（Alt/Shift 这类纯修饰键也会走到这里，
-            //       e.Key 为 Key.System，真正的键在 e.SystemKey）。
+            // ⓪ Alt 多选模式（2026-10-21）：**再按一次 Alt 也能退出**（用户要求），
+            //    与 Esc 等价。⚠️ 必须排在下面那个"带修饰键就 return"之前 ——
+            //    否则按下 Alt 本身就被当成修饰键直接放行了
+            //    （Alt/Shift 这类纯修饰键也会走到这里，e.Key 为 Key.System，
+            //      真正的键在 e.SystemKey）。
             if (e.Key == Key.System && e.SystemKey == Key.LeftAlt
                 || e.Key == Key.LeftAlt || e.Key == Key.RightAlt)
             {
-                // 只在下载页有意义（列表在那一页）
-                if (Tabs.SelectedIndex == 0 && !_fileSelectMode)
+                // 只在下载页有意义（文件列表在那一页）
+                if (Tabs.SelectedIndex == 0)
                 {
                     e.Handled = true;
-                    EnterFileSelectMode();
+                    if (_fileSelectMode) ExitFileSelectMode();
+                    else EnterFileSelectMode();
                 }
                 return;
             }
@@ -4552,6 +4592,91 @@ namespace GeZi
                 return any ? TaskItem.FormatEta(maxSeconds) : "";
             }
             catch { return ""; }
+        }
+
+        // ---------------- 运行日志高度（可拖拽 + 记忆 · 2026-10-21） ----------------
+        //
+        // 【需求】用户反馈日志输出框占用太多空间，要求「改为可以调整高度，并且记忆」，
+        //        并且明确指出「拖动内容不应该包括运行日志标题，需要拖动的是下方的输出区」。
+        // 【结构】任务页外层 Grid 的 Row4 是具名行 LogRow（**像素高度**），
+        //        它内部再分「标题 Auto + LogBox *」——
+        //        所以拖大拖小改的是整块日志区，而增量全部落在 LogBox 上，标题高度恒定。
+        // 【为什么 LogRow 必须是像素】GridSplitter 的 PreviousAndNext 只对能写死高度的行生效；
+        //        Auto 行由内容决定高度，拖动改不动（上一版就是 Auto，实测拖了没反应）。
+        // 【落盘】拖完把像素值存进 AppSettings.LogPanelHeight。这个数值是**整块日志区**的
+        //        高度（含标题），与用户的直观感受一致，也便于换机器时按比例夹取。
+
+        /// <summary>
+        /// 日志区默认总高（含标题行与间距）。用户没拖过时用它。
+        /// <para>从旧的 132 降到 120 —— 同时标题行约 24px，日志框实际约 96px，
+        /// 与"用户嫌原来太大"的诉求一致，又不至于只剩两行看不清。</para>
+        /// </summary>
+        private const double DefaultLogPanelHeight = 120;
+
+        /// <summary>日志区最小总高：再小连标题行都放不下，拖到就夹住。</summary>
+        private const double MinLogPanelHeight = 70;
+
+        /// <summary>
+        /// 日志区最大高度比例（占窗口高度的百分比）。
+        /// <para>为什么不给固定像素：窗口在不同屏幕上大小差别很大，
+        /// 固定 600px 在 768 高的笔记本上会把任务列表挤没。</para>
+        /// </summary>
+        private const double MaxLogPanelHeightRatio = 0.62;
+
+        /// <summary>
+        /// 把设置里的日志高度恢复到界面上（启动时调用一次）。
+        /// 同时做范围校正 —— 上次可能是在大屏幕上拖的，换到小屏就得夹回来。
+        /// </summary>
+        private void ApplyLogPanelHeight()
+        {
+            try
+            {
+                if (LogRow == null) return;
+
+                double h = _settings != null ? _settings.LogPanelHeight : 0;
+                if (h <= 0) h = DefaultLogPanelHeight;   // 0 = 老配置/没设过 → 用默认值
+
+                LogRow.Height = new GridLength(ClampLogPanelHeight(h));
+            }
+            catch { }
+        }
+
+        /// <summary>把日志高度夹进 [MinLogPanelHeight, 可用高度 × MaxLogPanelHeightRatio]。</summary>
+        private double ClampLogPanelHeight(double h)
+        {
+            try
+            {
+                // 任务页整体可用高度大致 = 窗口内容高 - 标题栏/页头等固定开销。
+                // 这里不追求精确：用 ActualHeight 估个上限，只为防止"拖到把列表挤没"。
+                double avail = ActualHeight > 0 ? ActualHeight : 700;
+                double max = Math.Max(MinLogPanelHeight, avail * MaxLogPanelHeightRatio);
+                if (h < MinLogPanelHeight) h = MinLogPanelHeight;
+                if (h > max) h = max;
+            }
+            catch { }
+            return h;
+        }
+
+        /// <summary>
+        /// 用户拖完分隔条：把最终高度落盘。
+        /// <para>为什么绑 DragCompleted 而不是 ValueChanged：拖动过程中每一帧都落盘
+        /// 会把 settings 文件写崩（几百次 IO）；拖完只写一次即可。</para>
+        /// </summary>
+        private void OnLogSplitterDragCompleted(object sender, System.Windows.Controls.Primitives.DragCompletedEventArgs e)
+        {
+            try
+            {
+                if (LogRow == null || _settings == null) return;
+                if (LogRow.Height.IsAbsolute)
+                {
+                    double h = ClampLogPanelHeight(LogRow.Height.Value);
+                    // 夹过范围就回写，避免界面显示 900 而设置里存 435 这种不一致
+                    LogRow.Height = new GridLength(h);
+                    _settings.LogPanelHeight = h;
+                    SettingsStore.Save(_settings);
+                }
+            }
+            catch { }
         }
 
         /// <summary>提示条上的「取消」：关掉完成后关机。</summary>
@@ -7447,6 +7572,8 @@ namespace GeZi
                 // 任务列表展示方式（文件夹分组 / 平铺）→ 应用分组 + 同步按钮
                 ApplyTaskGrouping();
                 UpdateTaskViewButton();
+                // 【2026-10-21】恢复「运行日志」的可拖拽高度（用户要求记忆）
+                ApplyLogPanelHeight();
                 // 【2026-10-21】设置页「关于与更新」：填版本号 + 恢复红点状态。
                 // 此时 UpdateService.Attach 已执行过（见构造函数里的顺序），
                 // HasUpdate 是从上次落盘的版本号算出来的，不会发网络请求。
@@ -9335,6 +9462,12 @@ namespace GeZi
 
                     FileEmptyState.Visibility = (!loading && n == 0)
                         ? Visibility.Visible : Visibility.Collapsed;
+
+                    // 【2026-10-21】列表变空（进空目录 / 筛选无结果）时自动退出多选模式：
+                    // 否则提示条会挂在"没有内容"的界面上方，用户反馈过这种情况。
+                    // 用 silent 语义的退出（不清选择，反正也没得选），避免刷日志。
+                    if (n == 0 && _fileSelectMode)
+                        ExitFileSelectMode(clearSelection: false, silent: true);
 
                     // 空状态的文案按模式区分：分享模式该说"粘贴链接"，
                     // 网盘模式该说"这个目录是空的"。一句通用文案两边都不贴切。
