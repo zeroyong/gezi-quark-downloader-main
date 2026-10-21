@@ -11,11 +11,12 @@
     <RootNamespace>GeZi</RootNamespace>
     <Product>鸽子下载自用版</Product>
     <AssemblyTitle>鸽子下载自用版</AssemblyTitle>
-    <!-- 【2026-10-22】版本号升到 2.8.2。
+    <!-- 【2026-10-22】版本号升到 2.8.3。
          版本号从程序集读（关于页 / 设置页 / 更新检查都用它），不要在别处手写一份。
          2.8.2：数据目录统一到 %LOCALAPPDATA%\鸽子下载\（解决"换目录启动任务不见了"），
-                打包不再携带用户数据。 -->
-    <Version>2.8.2</Version>
+                打包不再携带用户数据。
+         2.8.3：修复「一键更新」覆盖失败（下载成功但重启仍是旧版本）。 -->
+    <Version>2.8.3</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <StartupObject>GeZi.App</StartupObject>
     <!-- 【2026-10-03】应用图标：exe 文件图标 + 任务栏/Alt-Tab 图标。

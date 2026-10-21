@@ -109,7 +109,15 @@ namespace GeZi
                     StatusText.Text = "更新已接管，程序即将重启…";
                     // 给 UI 一点时间把"即将重启"刷出来，再由主进程退出
                     await System.Threading.Tasks.Task.Delay(400);
-                    Environment.Exit(0);
+                    // ⚠️ 【2026-10-22】用 Shutdown() 而不是 Environment.Exit(0)。
+                    //   Environment.Exit 会**跳过 MainWindow.OnClosed** ——
+                    //   托盘图标不释放、文件流不 flushing，映像文件的句柄
+                    //   也可能因此晚几百毫秒才放开，外部脚本覆盖 GeZi.exe
+                    //   就会撞 "Sharing violation"（用户实测：下载成功但版本没变）。
+                    //   Shutdown() 走正常关闭流程（OnClosed 会跑），资源释放干净，
+                    //   脚本那边覆盖成功率也高得多。
+                    try { Application.Current.Shutdown(); }
+                    catch { Environment.Exit(0); }
                 }
                 else
                 {

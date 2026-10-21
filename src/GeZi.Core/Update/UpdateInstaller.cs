@@ -197,10 +197,29 @@ namespace GeZi.Core.Update
         // ---------------- 脚本接力 ----------------
 
         /// <summary>
-        /// 生成并返回接管脚本的路径。脚本做四件事：
-        /// ① 等主进程退出 → ② 覆盖程序目录 → ③ 删掉旧的用户配置?（不删）→ ④ 拉起新版本。
+        /// 生成并返回接管脚本的路径。脚本做五件事：
+        /// ① 等主进程退出 → ② 逐个文件覆盖（被占用的跳过）→ ③ 重试占用项 →
+        /// ④ 删掉临时目录 → ⑤ 拉起新版本。
         /// 用 .cmd 而不是 .ps1：cmd 的启动延迟更低、不受执行策略（ExecutionPolicy）影响。
         /// </summary>
+        /// <remarks>
+        /// <para><b>【2026-10-22 修复的三个真 bug】</b>（用户实测"一键更新失败，
+        /// 进度显示下载成功但重启还是旧版本"）：</para>
+        /// <list type="number">
+        /// <item><b>目标路径末尾反斜杠</b>：原来写成
+        ///   <c>set APP="D:\...\win64\"</c>，cmd 会把结尾的 <c>\"</c> 当转义引号，
+        ///   路径被截断，xcopy 报 <c>Unable to create directory</c> +
+        ///   <c>Cannot create a file when that file already exists</c>，<b>一个文件都拷不进去</b>。
+        ///   现在 APP 变量里<b>不带</b>末尾反斜杠，反斜杠写在使用处（<c>%APP%\</c>）。</item>
+        /// <item><b>"进程没了"不等于"文件锁释放了"</b>：原来只等 tasklist 里查不到 PID，
+        ///   但映像文件的句柄释放要晚几百毫秒；用户若此时手动重开程序，
+        ///   覆盖 <c>GeZi.exe</c> 必然 <c>Sharing violation</c>。
+        ///   现在改成<b>以"能不能覆盖成功"为准</b>：轮询重试，覆盖成功才算完。</item>
+        /// <item><b>失败只有一行日志</b>：原来 <c>if errorlevel 1</c> 只写
+        ///   <c>COPY FAILED</c> 就退出，用户完全看不到原因。现在把 xcopy 的
+        ///   <b>完整输出</b>写进日志，并区分"部分成功"与"完全失败"。</item>
+        /// </list>
+        /// </remarks>
         private string WriteUpdaterScript(string work, string extracted)
         {
             string exe = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
@@ -216,12 +235,14 @@ namespace GeZi.Core.Update
             var sb = new StringBuilder();
             sb.AppendLine("@echo off");
             sb.AppendLine("chcp 65001 >nul");
-            sb.AppendLine("setlocal");
+            sb.AppendLine("setlocal EnableDelayedExpansion");
             sb.Append("echo [").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"))
               .AppendLine("] GeZi updater started");
-            sb.Append("set PID=").AppendLine(pid);
-            sb.Append("set APP=\"").Append(_appDir).AppendLine("\"");
-            sb.Append("set SRC=\"").Append(extracted).AppendLine("\"");
+            // ⚠️ APP **不能带末尾反斜杠**：cmd 里 "C:\dir\" 的 \" 是转义引号，
+            //    会把路径截断掉一截，xcopy 立刻报"目录已存在/无法创建"。
+            //    需要目录分隔符时写在变量外面（%APP%\）。
+            sb.Append("set APP=\"").Append(_appDir.TrimEnd('\\')).AppendLine("\"");
+            sb.Append("set SRC=\"").Append(extracted.TrimEnd('\\')).AppendLine("\"");
             sb.Append("set EXEBASE=\"").Append(exeBase).AppendLine("\"");
             sb.Append("set EXEFILE=\"").Append(exeName).AppendLine("\"");
             sb.Append("set LOG=\"").Append(log).AppendLine("\"");
@@ -232,24 +253,106 @@ namespace GeZi.Core.Update
             sb.AppendLine("echo waiting for main process to exit...");
             sb.AppendLine("set TRIES=120");
             sb.AppendLine(":waitloop");
-            sb.AppendLine("tasklist /fi \"pid eq %PID%\" 2>nul | find /i \"%EXEBASE%\" >nul || goto copied");            sb.AppendLine("set /a TRIES-=1");
-            sb.AppendLine("if %TRIES% LEQ 0 goto copied");
+            sb.AppendLine("tasklist /fi \"pid eq %PID%\" 2>nul | find /i \"%EXEBASE%\" >nul || goto copy_phase");
+            sb.AppendLine("set /a TRIES-=1");
+            sb.AppendLine("if %TRIES% LEQ 0 goto copy_phase");
             sb.AppendLine("ping -n 2 127.0.0.1 >nul");
             sb.AppendLine("goto waitloop");
-            sb.AppendLine(":copied");
+
+            // ② 覆盖阶段。
+            //    关键设计：**先删目标再拷**。del 对"文件不存在"返回 0，
+            //    对"被占用"返回 1 —— 正好用它的退出码区分两种情况。
+            //    覆盖用 xcopy（能递归、能覆盖、退出码明确）。
+            sb.AppendLine(":copy_phase");
             sb.AppendLine("echo copying files...");
-            sb.AppendLine("xcopy /Y /I /Q /K /E %SRC%\\* %APP%");
-            sb.AppendLine("if errorlevel 1 (echo COPY FAILED >> %LOG% & ping -n 3 127.0.0.1 >nul & exit /b 1)");
+            sb.AppendLine("set FAILED=0");
+            sb.AppendLine("set SKIPPED=");
+            // ⚠️ cmd 的 for 循环**不会展开带引号的通配符**：
+            //    for %%F in ("%SRC%\*") 拿到的是字面量 "%SRC%\*"，一个文件都匹配不到；
+            //    而 for %%F in (%SRC%\*)（不加引号）在路径含空格时会拆成多个参数。
+            //    正确做法：先用 dir /b 列出文件名（每行一个），再用 for /f 逐行取。
+            // ⚠️ 这里必须用 Append 拼完整行再 AppendLine —— 如果先
+            //    AppendLine("dir /b \"") 再 Append(path)，AppendLine 会在
+            //    前半段末尾插一个换行，路径被劈成两半，dir 就会去列**当前目录**
+            //    （实测把项目根目录的文件全拷进了程序目录！）。
+            sb.Append("dir /b \"").Append(extracted.TrimEnd('\\')).Append("\\*\" > \"%TEMP%\\gezi_filelist.txt\" 2>nul").AppendLine();
+            // ⚠️ 必须传**全路径**：dir /b 出来的只是文件名。
+            //    call :copyone "%%F" 里 %~1 拿到的是 "GeZi.exe"（相对路径），
+            //    :copyone 里的 if not exist "%SRCF%" 会因为找不到而**整批跳过** ——
+            //    表现为"日志写着 COPY OK，其实一个文件都没拷"。
+            sb.AppendLine("for /f \"usebackq delims=\" %%F in (\"%TEMP%\\gezi_filelist.txt\") do call :copyone \"%SRC%\\%%F\"");
+            sb.AppendLine("if not \"%SKIPPED%\"==\"\" echo SKIPPED-FILES: %SKIPPED% >> %LOG%");
+            sb.AppendLine("if %FAILED% EQU 0 (echo COPY OK >> %LOG%) else (echo COPY PARTIAL-FAILED >> %LOG%)");
+            sb.AppendLine("if %FAILED% EQU 0 goto relaunch");
 
-            // ③ 清理临时目录（解压出来的包 + 本脚本所在的目录）
-            sb.Append("rd /s /q \"").Append(work).AppendLine("\" 2>nul");
+            // ③ 还有文件被占用 → 轮询重试（主进程可能刚退出，句柄还没释放；
+            //    或者用户自己又开了一个实例）。最多 20 轮 × 1 秒。
+            sb.AppendLine("echo some files are locked, retrying...");
+            sb.AppendLine("set RTRIES=20");
+            sb.AppendLine(":retryloop");
+            sb.AppendLine("set FAILED=0");
+            sb.AppendLine("set SKIPPED=");
+            sb.AppendLine("for /f \"usebackq delims=\" %%F in (\"%TEMP%\\gezi_filelist.txt\") do call :copyone \"%SRC%\\%%F\"");
+            sb.AppendLine("if %FAILED% EQU 0 goto relaunch");
+            sb.AppendLine("set /a RTRIES-=1");
+            sb.AppendLine("if %RTRIES% LEQ 0 goto giveup");
+            sb.AppendLine("ping -n 2 127.0.0.1 >nul");
+            sb.AppendLine("goto retryloop");
 
-            // ④ 拉起新版本。start 的第二个参数是窗口标题，不能省
+            // 全部重试都失败：记下细节，把已成功的部分留着（新版 dll 已就位，
+            // 只是 exe 没换），仍然拉起程序 —— 用户至少能用到大部分新版本。
+            sb.AppendLine(":giveup");
+            sb.AppendLine("echo COPY FAILED after retries >> %LOG%");
+            sb.AppendLine("if not \"%SKIPPED%\"==\"\" echo STILL-LOCKED: %SKIPPED% >> %LOG%");
+            sb.AppendLine("echo --- xcopy output --- >> %LOG%");
+            // ⚠️ 这里也不能用 xcopy "%SRC%\*"：cmd 不展开带引号的通配符。
+            //    逐个文件再试一遍，把每个文件的真实报错写进日志。
+            sb.AppendLine("for /f \"usebackq delims=\" %%F in (\"%TEMP%\\gezi_filelist.txt\") do (");
+            sb.AppendLine("    xcopy /Y /I /Q \"%SRC%\\%%F\" \"%APP%\\%%F\" >> %LOG% 2>&1");
+            sb.AppendLine(")");
+            sb.AppendLine("goto relaunch");
+
+            // ④ 清理临时目录（解压出来的包 + 本脚本所在的目录）
+            sb.AppendLine(":relaunch");
+            // ⚠️ 同上：不能先 AppendLine 再 Append 路径，否则路径被换行截断。
+            sb.Append("rd /s /q \"").Append(work).Append("\" 2>nul").AppendLine();
+
+            // ⑤ 拉起新版本。start 的第二个参数是窗口标题，不能省
             //    （省了 cmd 会把第一个带引号的参数当成标题）。
-            sb.Append("start \"GeZi updater\" \"").Append(_appDir).Append("\\").Append(exeName).AppendLine("\"");
+            sb.Append("start \"GeZi updater\" \"").Append(_appDir.TrimEnd('\\'))
+              .Append("\\").Append(exeName).AppendLine("\"");
             sb.AppendLine("echo done >> %LOG%");
             sb.AppendLine("del \"%~f0\" 2>nul");
             sb.AppendLine("exit /b 0");
+
+            // ---- 子过程：拷贝单个文件 ----
+            // %1 = 源文件**全路径**。
+            //
+            // 【判据为什么是"xcopy 退出码 + fc /b 复核"】
+            //   实测（2026-10-22，用户报"下载成功但重启还是旧版本"）：
+            //     · 对**正在运行、被锁住**的 exe 执行 `del /f /q` —— cmd 仍返回 **0**，
+            //       完全不可靠；`xcopy` 返回 **4**（可靠）。
+            //     · `fc /b` 返回 0 = 两文件**完全相同** = 覆盖真的生效；
+            //       返回 1 = 内容不同（它读不到被占用文件时也会返回 1）。
+            //   所以判据是两层：
+            //     ① xcopy 退出码非 0 → 覆盖失败（被占用/无权限）→ 立刻算失败；
+            //     ② xcopy 成功后再 fc /b 复核，返回 0（相同）才算这个文件成功。
+            //   早期版本只判 xcopy 退出码、且用 del 判"文件已删"，
+            //   于是"exe 没换成功"被当成成功，日志写 COPY OK，用户重启发现版本没变。
+            sb.AppendLine();
+            sb.AppendLine(":copyone");
+            sb.AppendLine("set \"SRCF=%~1\"");
+            sb.AppendLine("set \"DSTF=%APP%\\%~nx1\"");
+            sb.AppendLine("if not exist \"%SRCF%\" goto :eof");
+            sb.AppendLine("xcopy /Y /I /Q \"%SRCF%\" \"%DSTF%\" >nul 2>&1");
+            sb.AppendLine("if errorlevel 1 goto :copyfail");
+            sb.AppendLine("fc /b \"%SRCF%\" \"%DSTF%\" >nul 2>&1");
+            sb.AppendLine("if errorlevel 1 goto :copyfail");
+            sb.AppendLine("goto :eof");
+            sb.AppendLine(":copyfail");
+            sb.AppendLine("set /a FAILED+=1");
+            sb.AppendLine("set SKIPPED=!SKIPPED! \"%~nx1\";");
+            sb.AppendLine("goto :eof");
 
             File.WriteAllText(script, sb.ToString(), new UTF8Encoding(false));
             return script;
