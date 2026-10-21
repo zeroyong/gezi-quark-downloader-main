@@ -154,6 +154,139 @@ namespace GeZi
         }
 
         // ============================================================
+        // 倒计时自动确认（2026-10-22 新增）
+        // ============================================================
+
+        /// <summary>倒计时用的计时器（走 UI 线程的 DispatcherTimer）。</summary>
+        private System.Windows.Threading.DispatcherTimer _countdownTimer;
+
+        /// <summary>倒计时剩余秒数。</summary>
+        private int _countdownLeft;
+
+        /// <summary>倒计时走完后要自动按下的按钮。</summary>
+        private System.Windows.Controls.Button _countdownTarget;
+
+        /// <summary>倒计时提示行的模板文案（{0} 会被替换成剩余秒数）。</summary>
+        private string _countdownFormat;
+
+        /// <summary>
+        /// 显示一个**带倒计时**的确认框：倒计时走完后自动按默认按钮。
+        ///
+        /// <para>【场景】2026-10-22 用户要求：「任务页开启了完成任务后自动关机，
+        /// 但是会弹出一个确认框，应该是倒计时 15s，如果用户没有选取消关机，
+        /// 那么结束后自动在 1 分钟内唤起关机」。</para>
+        ///
+        /// <para>【为什么不能直接用普通确认框】普通确认框是**阻塞式**的：
+        /// 用户不点它就一直停在那儿；程序也没法"到点自己继续"。
+        /// 倒计时版本到点后自动等同点了默认按钮，主流程继续往下走
+        /// （关机那边接着就是 <c>shutdown /s /t 60</c>，即 1 分钟内关机）。</para>
+        ///
+        /// <param name="countdownSeconds">倒计时秒数；≤0 表示不启用倒计时。</param>
+        /// <param name="countdownFormat">提示行文案，{0} 为剩余秒数。</param>
+        /// </summary>
+        public static MessageBoxResult ShowWithCountdown(Window owner, string text, string title,
+            string primaryText, string secondaryText, MessageBoxImage icon,
+            int countdownSeconds, string countdownFormat,
+            MessageBoxResult defaultResult = MessageBoxResult.Yes)
+        {
+            var dlg = new AppDialog();
+            if (owner != null && owner.IsVisible)
+            {
+                dlg.Owner = owner;
+                dlg.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            }
+            else
+            {
+                dlg.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            }
+
+            dlg.Configure(text, title, MessageBoxButton.OKCancel, icon, defaultResult);
+
+            // OKCancel 的槽位：Btn2 = 确定(OK) 在左，Btn1 = 取消(Cancel) 在右
+            dlg.Btn2.Content = primaryText;
+            dlg.Btn1.Content = secondaryText;
+            dlg.Btn2.MinWidth = 108;
+            dlg.Btn1.MinWidth = 108;
+
+            // ⚠️ SetupButtons 在 OKCancel 模式下把 Btn2 的 Tag 设成 **OK**，
+            //    而这里调用方要的默认结果是 **Yes**（"确认关机"）。
+            //    不改 Tag 的话：① 倒计时找不到目标按钮（不会自动继续）；
+            //    ② 即使用户手点"确认关机"，返回的也是 OK 而非 Yes，
+            //    调用方的 `ans != Yes` 判断会把"确认"当成"取消" → 永远不关机。
+            //    这里把两个按钮的 Tag 显式改成调用方要的语义。
+            dlg.Btn2.Tag = defaultResult;
+            dlg.Btn1.Tag = MessageBoxResult.No;
+
+            // Tag 改了 → 默认按钮的高亮也要重算（ApplyDefaultHighlight 在 Configure 里
+            // 按当时的 Tag 算过一次，那次 Btn2 还是 OK，认不出现在的 Yes）。
+            dlg.ApplyDefaultHighlight();
+
+            dlg.StartCountdown(countdownSeconds, countdownFormat, defaultResult);
+
+            dlg.ShowDialog();
+            return dlg._result;
+        }
+
+        /// <summary>启动倒计时：到点自动按默认按钮。</summary>
+        private void StartCountdown(int seconds, string format, MessageBoxResult defaultResult)
+        {
+            if (seconds <= 0) return;
+
+            _countdownLeft = seconds;
+            _countdownFormat = string.IsNullOrEmpty(format)
+                ? "将在 {0} 秒后自动继续…"
+                : format;
+
+            // 找到对应默认结果的按钮作为倒计时结束时的自动目标
+            _countdownTarget = null;
+            foreach (var b in new[] { Btn1, Btn2, Btn3 })
+            {
+                if (b.Visibility == Visibility.Visible && b.Tag is MessageBoxResult r
+                    && r == defaultResult)
+                {
+                    _countdownTarget = b;
+                    break;
+                }
+            }
+            if (_countdownTarget == null) return;
+
+            try { CountdownText.Visibility = Visibility.Visible; } catch { }
+            UpdateCountdownText();
+
+            _countdownTimer = new System.Windows.Threading.DispatcherTimer(
+                TimeSpan.FromSeconds(1), System.Windows.Threading.DispatcherPriority.Normal,
+                OnCountdownTick, Dispatcher);
+            _countdownTimer.Start();
+        }
+
+        private void OnCountdownTick(object sender, EventArgs e)
+        {
+            _countdownLeft--;
+            if (_countdownLeft > 0)
+            {
+                UpdateCountdownText();
+                return;
+            }
+
+            // 到点：停表 + 自动按默认按钮
+            try { _countdownTimer?.Stop(); } catch { }
+            try { CountdownText.Visibility = Visibility.Collapsed; } catch { }
+
+            var target = _countdownTarget;
+            _countdownTarget = null;
+            if (target != null) Finish(target);
+        }
+
+        private void UpdateCountdownText()
+        {
+            try
+            {
+                CountdownText.Text = string.Format(_countdownFormat, _countdownLeft);
+            }
+            catch { }
+        }
+
+        // ============================================================
         // 组装
         // ============================================================
 
@@ -290,12 +423,22 @@ namespace GeZi
 
         private void Finish(System.Windows.Controls.Button b)
         {
+            StopCountdown();
             _result = b.Tag is MessageBoxResult r ? r : MessageBoxResult.None;
             Close();
         }
 
+        /// <summary>停掉倒计时计时器（对话框关闭时必须调用，否则会泄漏）。</summary>
+        private void StopCountdown()
+        {
+            try { _countdownTimer?.Stop(); } catch { }
+            _countdownTimer = null;
+            _countdownTarget = null;
+        }
+
         private void OnCancel(object sender, RoutedEventArgs e)
         {
+            StopCountdown();
             // 点右上角 X：行为跟"取消/否"一致
             switch (_result)
             {
@@ -348,6 +491,13 @@ namespace GeZi
                 RootCard.BeginAnimation(OpacityProperty, fade);
             }
             catch { }
+        }
+
+        /// <summary>窗口关闭时兜底停表（按 X / Alt+F4 关闭时也会走到这里）。</summary>
+        protected override void OnClosed(EventArgs e)
+        {
+            StopCountdown();
+            base.OnClosed(e);
         }
     }
 }

@@ -1221,7 +1221,7 @@
                                      PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
                                      PreviewMouseMove="OnTaskListMouseMove"
                                      PreviewMouseLeftButtonUp="OnTaskListMouseUp"
-                                     MouseRightButtonUp="OnTaskListRightClick"
+                                     PreviewMouseRightButtonDown="OnTaskListRightClickDown"
                                      MouseDoubleClick="OnTaskListDoubleClick">
                                 <!-- 文件夹分组（方案 B）：一个文件夹一张卡片。
                                      卡片头 48px（图标块 + 名称 + 文件数胶囊 + 折角箭头），
@@ -1740,6 +1740,14 @@
                                                Foreground="{DynamicResource PrimaryBrush}"
                                                Style="{StaticResource NumericText}"/>
 
+                                    <!-- 【2026-10-22 用户要求】「总进度后面可以添加一个耗时：多少，
+                                         更方便查看」——
+                                         有了「已耗时 + 剩余时间」就能算出大概几点下完。 -->
+                                    <TextBlock x:Name="TotalElapsedText" Text="" Margin="8,0,0,0"
+                                               FontSize="11"
+                                               VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+
                                     <Border Width="1" Height="14" Margin="12,0"
                                             Background="{DynamicResource BorderBrushSoft}"/>
 
@@ -1932,14 +1940,14 @@
                                         </Grid.ColumnDefinitions>
                                         <TextBlock Text="排序" Style="{StaticResource FieldLabel}"/>
                                         <CheckBox x:Name="TaskUnfinishedFirstCheck" Grid.Column="1"
-                                                  Content="优先展示未完成的文件"
+                                                  Content="优先展示需要处理的文件"
                                                   Style="{StaticResource AppCheckBox}"
                                                   Click="OnTaskUnfinishedFirstChanged"
-                                                  ToolTip="开启后：同一个文件夹分组内，正在下载 / 排队 / 已暂停的文件排在前面，已完成 / 失败 / 取消的排在后面。&#10;组内仍按工具栏的「新任务在前 / 在后」排序。默认关闭。"/>
+                                                  ToolTip="开启后：同一个文件夹分组内，&#10;① 失败 / 已取消的排最前（方便直接重试）；&#10;② 正在下载 / 排队 / 已暂停的排中间；&#10;③ 已完成的排最后。&#10;组内仍按工具栏的「新任务在前 / 在后」排序。默认关闭。"/>
                                     </Grid>
                                     <TextBlock Style="{StaticResource TertiaryText}" FontSize="11"
                                                Margin="150,0,0,18" TextWrapping="Wrap"
-                                               Text="文件夹里文件多时，未完成的会排到前面，不用滚到底部去找。"/>
+                                               Text="文件夹里文件多时，失败和未完成的会排到前面，不用滚到底部去找。"/>
 
                                     <!-- 【2026-10-21】下载页「上次浏览位置」恢复（默认开）。 -->
                                     <TextBlock Text="下载页" Style="{StaticResource SectionLabel}"/>

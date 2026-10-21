@@ -98,6 +98,28 @@ namespace GeZi.Core.Api
                 catch (QuarkApiException ex) when (
                     (ex.HttpStatus == 401 || ex.HttpStatus == 412) && authRetry < maxAuthRetry)
                 {
+                    // ⚠️ 【2026-10-22 修复】**只对「真·登录态失效」做重登判定**。
+                    //
+                    //    夸克有些入口（实测 fr=android 打 drive-pc 域）会返回
+                    //    401 + 非 JSON 密文 —— 这**不是**登录态问题。
+                    //    旧代码在这里一律退避 + QuickValidateAsync，
+                    //    校验通过后重试原请求，仍失败就抛「登录态已失效(401)」。
+                    //    结果：用户明明登录正常，却被反复告知"请重新登录"，
+                    //    而真实原因（该入口不适用 / 网关拦截）被彻底掩盖。
+                    //
+                    //    判定方式：带业务错误码的 JSON 401 才是真鉴权失败
+                    //    （code 31001 "require login"）；
+                    //    非 JSON 响应 ⇒ 服务端没按协议应答 ⇒ 直接如实抛出，不重试。
+                    bool genuineAuth = ex.Code != null
+                        || ex.Message.IndexOf("登录态已失效", StringComparison.Ordinal) >= 0
+                        || ex.Message.IndexOf("被拦截(412)", StringComparison.Ordinal) >= 0;
+
+                    if (!genuineAuth)
+                    {
+                        // 不是登录态问题 → 不退避、不重试，如实上抛
+                        throw;
+                    }
+
                     authRetry++;
                     // 鉴权退避：2–4 秒，避免紧接重试撞上风控窗口
                     await Task.Delay(2000 + Rng.Next(0, 2000)).ConfigureAwait(false);
@@ -161,9 +183,42 @@ namespace GeZi.Core.Api
                         }
                         catch (Exception)
                         {
-                            string hint = AuthHint((int)resp.StatusCode);
+                            // ⚠️ 【2026-10-22 修复】这里**不能**把「响应体不是 JSON」
+                            //    一律翻译成「登录态已失效(401)」。
+                            //
+                            //    实测根因：夸克的某些入口（实测 `fr=android` 打
+                            //    drive-pc.quark.cn 的 file/download）会返回
+                            //    **HTTP 401 + 一段 base64 密文**（不是 JSON）。
+                            //    旧代码在这里反序列化失败 → 直接套 AuthHint(401)
+                            //    → 报「登录态已失效，请重新登录」，
+                            //    而**登录态其实完全有效**（同一份 Cookie 下
+                            //    account/info 正常返回昵称）。
+                            //    更糟的是：取链接口会依次试 3 个入口，
+                            //    这个坏入口排在最后，其错误会**覆盖**掉前面
+                            //    「file not found(404)」这种真正有意义的错误，
+                            //    用户于是什么真实原因都看不到，只看到一句误导的
+                            //    「请重新登录」。
+                            //
+                            //    修法：只有当**响应体本身是 JSON**（说明服务端
+                            //    确实在说「你没登录」）时才用鉴权文案；
+                            //    响应体不是 JSON ⇒ 服务端根本没按 JSON 协议应答
+                            //    （多半是网关/风控/坏入口），如实报原始状态码与片段。
+                            bool bodyIsJson = LooksLikeJson(raw);
+                            string hint = bodyIsJson ? AuthHint((int)resp.StatusCode) : null;
+
+                            string detail = "HTTP " + (int)resp.StatusCode + ": " + resp.ReasonPhrase;
+                            if (!bodyIsJson)
+                            {
+                                string snippet = Snippet(raw);
+                                if (!string.IsNullOrEmpty(snippet))
+                                    detail += "（响应非 JSON: " + snippet + "）";
+                                detail += "。该响应不是服务端的标准 JSON 应答，"
+                                        + "通常意味着请求打到了不适用的入口或被网关拦截，"
+                                        + "并非登录态失效。";
+                            }
+
                             throw new QuarkApiException(
-                                hint ?? ("HTTP " + (int)resp.StatusCode + ": " + resp.ReasonPhrase),
+                                hint ?? detail,
                                 null, null, (int)resp.StatusCode);
                         }
                     }
@@ -181,6 +236,37 @@ namespace GeZi.Core.Api
                     throw new QuarkApiException("网络请求失败: " + ex.Message);
                 }
             }
+        }
+
+        /// <summary>
+        /// 响应体看起来是不是 JSON（对象或数组）。
+        ///
+        /// <para>用于区分「服务端按 JSON 协议回了鉴权错误」与
+        /// 「服务端回了非 JSON 的东西（密文/HTML/空）」——
+        /// 后者绝不能翻译成"登录态失效"，否则会误导用户去重新登录。</para>
+        /// </summary>
+        private static bool LooksLikeJson(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return false;
+            int i = 0;
+            while (i < raw.Length && char.IsWhiteSpace(raw[i])) i++;
+            if (i >= raw.Length) return false;
+            char c = raw[i];
+            return c == '{' || c == '[';
+        }
+
+        /// <summary>取响应体的可打印片段（给日志/错误文案用），过长截断。</summary>
+        private static string Snippet(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            var sb = new StringBuilder();
+            foreach (char ch in raw)
+            {
+                if (sb.Length >= 60) break;
+                sb.Append(ch < 32 || ch > 126 ? '.' : ch);
+            }
+            string s = sb.ToString();
+            return raw.Length > sb.Length ? s + "…" : s;
         }
 
         /// <summary>把鉴权类状态码翻译成用户看得懂的提示，避免笼统报"请求失败"。</summary>
@@ -459,6 +545,60 @@ namespace GeZi.Core.Api
             return merged;
         }
 
+        /// <summary>
+        /// 在分享里**按文件名**定位一个源文件（拿它的 fid + share_fid_token）。
+        ///
+        /// <para>【为什么需要】2026-10-22 用户实测反馈：转存路径下载的文件，
+        /// 一旦把网盘里的**中转副本**删掉，续传就再也拿不到直链
+        /// （"file not found"），而分享里的**源文件明明还在**。
+        /// 根因是转存路径记下的是副本 fid，副本一删就死路一条。</para>
+        ///
+        /// <para>本方法用于兜底：源 fid 也拿不到时，按**文件名**在分享里找，
+        /// 找到后用它的 share_fid_token 走**免转存**取链 —— 副本没了照样能下。</para>
+        ///
+        /// <para>⚠️ 深度上限 <paramref name="maxDirs"/>：大分享（几千文件）全量遍历
+        /// 会打很多接口请求，因此限制遍历的目录数；超限返回 null（视为找不到）。</para>
+        /// </summary>
+        /// <returns>找到则返回条目（<see cref="QuarkFileEntry.Fid"/> / <see cref="QuarkFileEntry.Token"/>），
+        /// 找不到返回 null。</returns>
+        public async Task<QuarkFileEntry> FindShareFileByNameAsync(
+            string pwdId, string stoken, string fileName, int maxDirs = 200)
+        {
+            if (string.IsNullOrEmpty(pwdId) || string.IsNullOrEmpty(stoken)
+                || string.IsNullOrEmpty(fileName))
+                return null;
+
+            var queue = new Queue<string>();
+            queue.Enqueue("0");
+            int visited = 0;
+
+            while (queue.Count > 0 && visited < maxDirs)
+            {
+                string dir = queue.Dequeue();
+                visited++;
+
+                List<QuarkFileEntry> list;
+                try
+                {
+                    list = await ShareDetailAsync(pwdId, stoken, dir).ConfigureAwait(false);
+                }
+                catch
+                {
+                    continue;   // 某个目录读不到就跳过，不影响其它分支
+                }
+                if (list == null) continue;
+
+                foreach (var e in list)
+                {
+                    if (e.IsDir) { queue.Enqueue(e.Fid); continue; }
+                    if (!string.IsNullOrEmpty(e.Token)
+                        && string.Equals(e.Name, fileName, StringComparison.Ordinal))
+                        return e;
+                }
+            }
+            return null;
+        }
+
         /// <summary>目录的**一页**：条目 + 接口那边还有没有下一页。</summary>
         public sealed class DirPage
         {
@@ -690,18 +830,10 @@ namespace GeZi.Core.Api
         /// </summary>
         public async Task<List<DownloadLink>> GetDownloadAsync(IList<string> fids)
         {
-            var attempts = new[]
-            {
-                // 入口 1：PC 客户端入口（常规最优）
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" } },
-                // 入口 2：网页端入口（CDN 选择策略可能不同）
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" }, { "entry", "ft" } },
-                // 入口 3：移动端入口（部分网络下反而更稳）
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "android" }, { "uc_param_str", "" } },
-            };
+            var attempts = DownloadAttempts;
 
             object lastRes = null;
-            string lastErr = null;
+            QuarkApiException lastErr = null;
             List<DownloadLink> best = null;
 
             foreach (var q in attempts)
@@ -726,7 +858,12 @@ namespace GeZi.Core.Api
                 }
                 catch (QuarkApiException ex)
                 {
-                    lastErr = ex.Message;
+                    // ⚠️ 【2026-10-22 修复】不要用"最后一个入口的错误"覆盖前面的。
+                    //    旧代码 lastErr = ex.Message 会让**最后**那个入口的失败
+                    //    盖掉前面更有信息量的失败（例如「文件不存在(404)」）。
+                    //    现在保留**最有信息量的**那条：优先带业务错误码的、
+                    //    其次 HTTP 状态码里语义最明确的（404/403/401）。
+                    lastErr = PickBetterError(lastErr, ex);
                 }
             }
 
@@ -734,21 +871,68 @@ namespace GeZi.Core.Api
                 return best;
             if (lastRes != null)
                 return ParseDownloadData(Get(AsDict(lastRes), "data"));
-            throw new QuarkApiException(lastErr ?? "获取直链失败");
+            throw new QuarkApiException(lastErr?.Message ?? "获取直链失败",
+                lastErr?.Code, lastErr?.Status, lastErr?.HttpStatus);
+        }
+
+        /// <summary>
+        /// 取直链要试的入口。
+        ///
+        /// <para>⚠️ 【2026-10-22 修复】**移除了 `fr=android` 这个入口**。
+        /// 实测（2026-10-21，用真实账号 + 真实 fid）：打
+        /// <c>drive-pc.quark.cn/1/clouddrive/file/download</c> 且带
+        /// <c>fr=android</c> 时，服务端返回 **HTTP 401 + 一段 base64 密文**
+        /// （不是 JSON）。这个入口对 PC 域根本不适用，却是"假登录态失效"的
+        /// 头号来源：它排在尝试列表最后，失败信息会覆盖掉前面真正的错误。</para>
+        ///
+        /// <para>保留两个 PC 入口即可 —— 实测两者都能正常出链，
+        /// 且 CDN 节点/签名不同，择优的价值不受影响。</para>
+        /// </summary>
+        private static readonly Dictionary<string, string>[] DownloadAttempts =
+        {
+            // 入口 1：PC 客户端入口（常规最优）
+            new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" } },
+            // 入口 2：网页端入口（CDN 选择策略可能不同）
+            new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" }, { "entry", "ft" } },
+        };
+
+        /// <summary>
+        /// 两个候选错误里挑**更有信息量的**那个。
+        ///
+        /// <para>排序依据（越靠前越优先）：
+        /// ① 带业务错误码的（说明服务端明确告诉了我们原因，如"文件不存在"）；
+        /// ② HTTP 404（对象不存在）；
+        /// ③ HTTP 403（权限/签名问题）；
+        /// ④ HTTP 401（登录态 —— 放最后，因为夸克有"非 JSON 假 401"的坏入口，
+        ///    它出现在这里往往只是噪声，真因在别处）。</para>
+        /// </summary>
+        private static QuarkApiException PickBetterError(QuarkApiException current, QuarkApiException candidate)
+        {
+            if (candidate == null) return current;
+            if (current == null) return candidate;
+            return ErrorPriority(candidate) > ErrorPriority(current) ? candidate : current;
+        }
+
+        private static int ErrorPriority(QuarkApiException ex)
+        {
+            if (ex == null) return 0;
+            // 带业务错误码 = 服务端明确给了原因，最具体
+            if (ex.Code != null) return 100;
+            string m = ex.Message ?? "";
+            if (m.Contains("不存在") || m.Contains("not found")) return 90;
+            if (m.Contains("403")) return 80;
+            if (m.Contains("401")) return 70;
+            if (m.Contains("412")) return 60;
+            return 50;
         }
 
         public async Task<List<DownloadLink>> GetShareDownloadAsync(IList<string> fids, IList<string> tokens,
             string pwdId, string stoken)
         {
-            var attempts = new[]
-            {
-                new Dictionary<string, string> { { "entry", "ft" }, { "fr", "pc" }, { "pr", "ucpro" } },
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" } },
-                new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "android" }, { "uc_param_str", "" } },
-            };
+            var attempts = ShareDownloadAttempts;
 
             object lastRes = null;
-            string lastErr = null;
+            QuarkApiException lastErr = null;
             List<DownloadLink> best = null;
 
             foreach (var q in attempts)
@@ -773,7 +957,8 @@ namespace GeZi.Core.Api
                 }
                 catch (QuarkApiException ex)
                 {
-                    lastErr = ex.Message;
+                    // 同 GetDownloadAsync：保留最有信息量的错误，不被最后一个入口覆盖
+                    lastErr = PickBetterError(lastErr, ex);
                 }
             }
 
@@ -781,8 +966,21 @@ namespace GeZi.Core.Api
                 return best;
             if (lastRes != null)
                 return ParseDownloadData(Get(AsDict(lastRes), "data"));
-            throw new QuarkApiException(lastErr ?? "获取分享直链失败");
+            throw new QuarkApiException(lastErr?.Message ?? "获取分享直链失败",
+                lastErr?.Code, lastErr?.Status, lastErr?.HttpStatus);
         }
+
+        /// <summary>
+        /// 取分享直链要试的入口。
+        ///
+        /// <para>⚠️ 与 <see cref="DownloadAttempts"/> 一样，**移除了 `fr=android`**：
+        /// 实测它对 drive-pc 域返回 401 + 非 JSON 密文，是"假登录态失效"的来源。</para>
+        /// </summary>
+        private static readonly Dictionary<string, string>[] ShareDownloadAttempts =
+        {
+            new Dictionary<string, string> { { "entry", "ft" }, { "fr", "pc" }, { "pr", "ucpro" } },
+            new Dictionary<string, string> { { "pr", "ucpro" }, { "fr", "pc" }, { "uc_param_str", "" } },
+        };
 
         /// <summary>一组直链的总质量分（各条之和），用于在多个入口结果间择优。</summary>
         private static long TotalScore(List<DownloadLink> list)

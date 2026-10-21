@@ -3056,6 +3056,36 @@ namespace GeZi.Core.Download
             });
         }
 
+        /// <summary>
+        /// 从磁盘上的续传元数据（<c>.qmeta</c>）读回**已下载字节数**。
+        ///
+        /// <para>【为什么需要】2026-10-22：任务快照里记的 <c>Done</c> 可能不准
+        /// （例如"失败当暂停"重试时新建的行，进度没继承 → 快照写回 0）。
+        /// 用户看到的就是"明明已经下了 10MB，任务页却显示 0.0%"，
+        /// 还会以为分片丢了、想重新下。</para>
+        ///
+        /// <para>续传的**真实**进度只存在磁盘的 .qmeta 里（每个分片写了多少字节），
+        /// 所以界面层恢复任务时应该以它为准。</para>
+        ///
+        /// <returns>已下载字节数；读不到（没 meta / 解析失败）返回 -1。</returns>
+        public static long ReadDownloadedBytes(string dest, string partsRoot = null)
+        {
+            try
+            {
+                ResolvePaths(dest, partsRoot, out _, out string metaPath);
+                var plan = LoadPlan(metaPath);
+                if (plan == null || plan.Parts == null) return -1;
+                long sum = 0;
+                foreach (var p in plan.Parts)
+                    sum += p.W > 0 ? p.W : 0;
+                return sum;
+            }
+            catch
+            {
+                return -1;
+            }
+        }
+
         // ---------------- sidecar 续传元数据（简单文本格式，无 JSON 依赖） ----------------
 
         private static DownloadPlan LoadPlan(string metaPath)

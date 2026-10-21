@@ -395,7 +395,11 @@ namespace GeZi
         ///
         /// <para>【算法】剩余字节 ÷ 当前速度。速度来自核心层的 EWMA 平滑值，
         /// 已经滤掉了瞬时抖动，所以算出来不会乱跳。速度 ≤ 0（刚启动 / 暂停）时返回空串，
-        /// 不显示"—"这种噪音。超过 24 小时显示「> 1 天」，避免出现"37 小时"这种怪数字。</para>
+        /// 不显示"—"这种噪音。</para>
+        ///
+        /// <para>【2026-10-22】速度很低（&lt;1KB/s）时原来直接不显示，
+        /// 但"只剩几秒"恰恰是速度低的时候最常出现 —— 现在按 1KB/s 给一个保守上界，
+        /// 至少让用户看到"剩 8 秒"这种有用信息。</para>
         /// </summary>
         public string EtaText
         {
@@ -407,39 +411,57 @@ namespace GeZi
                 if (State != JobState.Downloading) return "";
 
                 if (_total <= 0 || _done >= _total) return "";
-                if (_speed <= 1024) return "";      // 速度太低（<1KB/s）时估算没有意义
+                if (_speed <= 0) return "";          // 完全没速度（刚启动）→ 没有可估的数字
 
                 double remainBytes = _total - _done;
-                double seconds = remainBytes / _speed;
+                double speed = _speed > 1024 ? _speed : 1024;   // 太慢时按 1KB/s 兜底
+                double seconds = remainBytes / speed;
                 if (seconds < 0) return "";
 
                 return "剩 " + FormatEta(seconds);
             }
         }
 
-        /// <summary>把秒数格式化成人类可读的「15 分」/「1 小时 38 分」/「> 1 天」。</summary>
+        /// <summary>
+        /// 把秒数格式化成人类可读的剩余时间。
+        ///
+        /// <para>【2026-10-22 用户要求】「格式 几分几秒 如果只剩秒，就显示几秒，
+        /// 不要显示不超过 1 分钟之类的」——
+        /// 原来的「不到 1 分」既看不懂也丢掉了精度：明明只剩 12 秒，说成"不到 1 分"
+        /// 毫无信息量。</para>
+        ///
+        /// <para>现在的规则：</para>
+        /// <list type="bullet">
+        /// <item>&lt; 60 秒 → 「12 秒」</item>
+        /// <item>&lt; 1 小时 → 「5 分 30 秒」/ 整分时「5 分」</item>
+        /// <item>&lt; 1 天 → 「2 小时 5 分」/ 整时「2 小时」</item>
+        /// <item>≥ 1 天 → 「3 天」</item>
+        /// </list>
+        /// </summary>
         internal static string FormatEta(double seconds)
         {
-            if (seconds < 60) return "不到 1 分";
+            if (seconds < 0) return "";
+            if (seconds < 1) return "0 秒";
 
-            double minutes = seconds / 60.0;
-            if (minutes < 60)
-                return (int)Math.Round(minutes) + " 分";
+            // 不足 1 分钟：直接报秒数（用户明确要求）
+            if (seconds < 60)
+                return (int)Math.Round(seconds) + " 秒";
 
-            double hours = minutes / 60.0;
-            if (hours < 24)
-            {
-                int h = (int)hours;
-                int m = (int)Math.Round(minutes - h * 60);
-                // 四舍五入到 60 分时进位，避免出现「1 小时 60 分」
-                if (m >= 60) { h++; m = 0; }
-                return m == 0 ? h + " 小时" : h + " 小时 " + m + " 分";
-            }
+            long totalSec = (long)Math.Round(seconds);
 
-            double days = hours / 24.0;
-            if (days < 99)
-                return (int)Math.Round(days) + " 天";
-            return "> 99 天";
+            long days = totalSec / 86400;
+            long hours = (totalSec % 86400) / 3600;
+            long minutes = (totalSec % 3600) / 60;
+            long secs = totalSec % 60;
+
+            if (days > 0)
+                return days + " 天" + (hours > 0 ? " " + hours + " 小时" : "");
+
+            if (hours > 0)
+                return hours + " 小时" + (minutes > 0 ? " " + minutes + " 分" : "");
+
+            // 分钟级：带秒（「5 分 30 秒」），整分则只显示分
+            return minutes + " 分" + (secs > 0 ? " " + secs + " 秒" : "");
         }
 
         public event PropertyChangedEventHandler PropertyChanged;

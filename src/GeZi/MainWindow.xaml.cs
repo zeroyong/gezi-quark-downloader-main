@@ -1261,13 +1261,9 @@ namespace GeZi
         /// <summary>恢复「我的网盘」模式的上次目录。</summary>
         private async Task RestoreDrivePositionAsync(string fid)
         {
-            // 【2026-10-21】有本地缓存时不需要登录态：缓存里就是列表内容，
-            // 铺出来即可。只有缓存缺失（需要真发请求）才要求 _client。
-            var cached = _settings.LastBrowseCache;
-            bool haveUsableCache = cached != null && cached.Items != null && cached.Items.Count > 0
-                && !cached.FromShare && string.Equals(cached.Fid, fid, StringComparison.Ordinal);
-
-            if (_client == null && !haveUsableCache)
+            // 【2026-10-22】恢复浏览位置改成**直接请求最新数据**（不再用本地快照铺列表），
+            // 所以必须真的有客户端（要发请求）—— 快照里没有列表内容可用了。
+            if (_client == null)
             {
                 Log("未登录，跳过「我的网盘」浏览位置恢复。");
                 return;
@@ -1314,9 +1310,8 @@ namespace GeZi
                 }
                 catch { }
 
-                // 【2026-10-21 用户要求】优先走本地缓存，**不发任何请求**。
-                // 缓存能对上就直接铺，只有缓存缺失/不匹配才去取 stoken + 请求目录。
-                // 想检查服务端有没有更新，点界面上的「刷新」（绕开缓存走正常加载）。
+                // 【2026-10-22】恢复浏览位置改成**直接请求最新数据**（不再用本地快照铺列表），
+                // 所以 stoken 一定要重新申请 —— 快照里的旧 stoken 早就过期了。
                 _pwdId = pwdId;
                 _sharePasscode = _settings.LastSharePasscode ?? "";
                 _shareStartFid = string.IsNullOrEmpty(_settings.LastShareStartFid) ? "0" : _settings.LastShareStartFid;
@@ -1332,29 +1327,21 @@ namespace GeZi
                 }
                 catch { }
 
-                // 只有缓存用不上时才需要 stoken（它只对"真正发请求"有用）
-                var cached = _settings.LastBrowseCache;
-                bool haveUsableCache = cached != null && cached.Items != null && cached.Items.Count > 0
-                    && cached.FromShare && string.Equals(cached.Fid, fid, StringComparison.Ordinal);
+                // 拿 stoken 后才能真正拉目录（分享过期 / 提取码变了会在这里失败）
+                _client?.Dispose();
+                _client = new QuarkClient(_settings.Cookie);
 
-                if (!haveUsableCache)
+                var shareInfo = await _client.GetShareInfoAsync(pwdId, _sharePasscode);
+                if (shareInfo == null || string.IsNullOrEmpty(shareInfo.Stoken))
                 {
-                    // 拿 stoken 后才能真正拉目录（分享过期 / 提取码变了会在这里失败）
-                    _client?.Dispose();
-                    _client = new QuarkClient(_settings.Cookie);
-
-                    var shareInfo = await _client.GetShareInfoAsync(pwdId, _sharePasscode);
-                    if (shareInfo == null || string.IsNullOrEmpty(shareInfo.Stoken))
-                    {
-                        Log("上次的分享已失效（可能过期或需要提取码），已回到根目录。");
-                        ResetNav();
-                        return;
-                    }
-                    _stoken = shareInfo.Stoken;
-                    _linkCache.Clear();
-                    _dirCache.Clear();
-                    _dirSizeCache.Clear();
+                    Log("上次的分享已失效（可能过期或需要提取码），已回到根目录。");
+                    ResetNav();
+                    return;
                 }
+                _stoken = shareInfo.Stoken;
+                _linkCache.Clear();
+                _dirCache.Clear();
+                _dirSizeCache.Clear();
 
                 await RestoreChainThenLoadAsync(fid, "分享");
             }
@@ -1366,13 +1353,18 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 把当前目录的文件列表存成快照（2026-10-21 新增）。
+        /// 把当前目录的**浏览位置**（滚动位置）存成快照（2026-10-21 新增，2026-10-22 精简）。
         ///
-        /// <para>【为什么只存前 <see cref="BrowseCacheMaxItems"/> 条】用户要求"存在本地，
-        /// 不然每次打开都重复请求"。但几千项的分享全存进 config.xml 会让设置文件膨胀到几 MB，
-        /// 每次读写都变慢。存前若干条足够"接着上次继续看"，其余滚到底部时再按需请求。</para>
+        /// <para>【2026-10-22 变化】原来这里还存**列表内容**（前
+        /// <see cref="BrowseCacheMaxItems"/> 条），启动时直接铺出来、一个请求都不发。
+        /// 用户实测发现两个问题，于是改成"**直接请求最新数据 + 滚到上次位置**"：</para>
+        /// <list type="number">
+        /// <item>快照只存了前若干条 → 列表只显示 10 条，后面全是空的；</item>
+        /// <item>快照铺出来的行**不能选中** → 没法勾文件、没法「免转存发送」。</item>
+        /// </list>
         ///
-        /// <para>【只存"列表内容"不存下载进度】进度属于任务页的事，与浏览快照无关。</para>
+        /// <para>所以现在快照**只用于记"我看到哪儿了"**（目录 fid + 滚动位置），
+        /// 不再当数据源 —— 列表一律来自服务端最新数据，完整且可选中。</para>
         /// </summary>
         private void CaptureBrowseCache()
         {
@@ -1380,7 +1372,7 @@ namespace GeZi
             {
                 if (_settings == null) return;
                 // 目录是空的就不覆盖旧快照 —— 多半是加载失败/切页清空，
-                // 用空列表覆盖会让用户的"上次内容"白丢。
+                // 用空值覆盖会让用户的"上次位置"白丢。
                 if (_files == null || _files.Count == 0) return;
 
                 var snap = new BrowseSnapshotCache
@@ -1392,101 +1384,17 @@ namespace GeZi
                     ScrollOffset = _fileScroller != null ? _fileScroller.VerticalOffset : 0,
                     RevealCount = _files.Count,
                     HasMore = _curDir != null && _curDir.HasMore,
+                    // 【2026-10-22】不再存列表内容（恢复时一律请求最新数据）。
                     Items = new List<BrowseCacheItem>(),
                 };
-
-                int take = Math.Min(_files.Count, BrowseCacheMaxItems);
-                for (int i = 0; i < take; i++)
-                {
-                    var f = _files[i];
-                    if (f == null) continue;
-                    snap.Items.Add(new BrowseCacheItem
-                    {
-                        Fid = f.Fid, Token = f.Token, Name = f.Name,
-                        Size = f.Size, IsDir = f.IsDir,
-                    });
-                }
 
                 _settings.LastBrowseCache = snap;
             }
             catch { }
         }
 
-        /// <summary>快照最多存多少条（见 CaptureBrowseCache 的注释）。</summary>
+        /// <summary>快照最多存多少条（保留字段兼容老配置；2026-10-22 起不再存列表内容）。</summary>
         private const int BrowseCacheMaxItems = 200;
-
-        /// <summary>
-        /// 用本地快照**直接铺出上次的列表**，一个网络请求都不发（用户要求）。
-        ///
-        /// <para>返回 true = 快照可用且已铺好；false = 没有快照/快照不匹配，
-        /// 调用方应退回"正常加载"。</para>
-        ///
-        /// <para>要点：
-        /// ① 快照必须与目标目录（fid）和模式都对得上，否则宁可不铺 ——
-        ///    拿另一个目录的列表冒充当前目录会让人以为数据错了；
-        /// ② 铺完后把滚动位置还原；
-        /// ③ 界面上给一句"缓存内容，点刷新可更新"的提示，避免用户误以为是实时数据。</para>
-        /// </summary>
-        private bool TryApplyBrowseCacheFromSettings(string fid, string modeName)
-        {
-            try
-            {
-                var snap = _settings?.LastBrowseCache;
-                if (snap == null || snap.Items == null || snap.Items.Count == 0) return false;
-
-                // 校验归属：fid 与模式都要对得上
-                if (!string.IsNullOrEmpty(snap.Fid)
-                    && !string.Equals(snap.Fid, fid, StringComparison.Ordinal))
-                    return false;
-                if (snap.FromShare != ShareMode) return false;
-
-                // 铺列表
-                _files.Clear();
-                var entry = new DirCacheEntry
-                {
-                    NextPage = 2,
-                    HasMore = snap.HasMore,
-                    RevealCount = snap.RevealCount > 0 ? snap.RevealCount : snap.Items.Count,
-                    ScrollOffset = snap.ScrollOffset,
-                };
-                foreach (var c in snap.Items)
-                {
-                    if (c == null) continue;
-                    entry.Items.Add(new ShareFileItem
-                    {
-                        Fid = c.Fid, Token = c.Token, Name = c.Name,
-                        Size = c.Size, IsDir = c.IsDir,
-                    });
-                }
-
-                // 放进内存缓存：后续"上级/再进来"都走缓存，不再请求
-                _dirCache[DirCacheKey(fid)] = entry;
-                _curDir = entry;
-                _curDirFromCache = true;   // 见字段注释：这种状态下不自动续页
-
-                // restore: true → 同时还原已露条数与滚动位置
-                ApplyDirView(entry, restore: true);
-
-                string when = "";
-                try
-                {
-                    if (snap.SavedTicks > 0)
-                        when = "（" + new DateTime(snap.SavedTicks).ToString("MM-dd HH:mm") + " 的数据）";
-                }
-                catch { }
-
-                Log("已用本地缓存恢复上次的" + modeName + "目录"
-                    + (_pathList.Count > 0 ? "：" + string.Join(" / ", _pathList) : "：根目录")
-                    + "，共 " + entry.Items.Count + " 项" + when + "。"
-                    + "要检查有没有更新，点「刷新」。");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Log("应用本地浏览缓存失败：" + ex.Message);
-                return false;
-            }
-        }
 
         /// <summary>
         /// 用设置里存的 fid 链重建 <c>_fidStack</c> / <c>_pathList</c>，然后加载目标目录。
@@ -1517,12 +1425,31 @@ namespace GeZi
 
                 UpdatePathText();
 
-                // 【2026-10-21 用户要求】优先用**本地缓存**恢复，一个请求都不发。
-                // 原先是重新请求目录，用户反馈"每次打开都在重复请求"。
-                // 现在：缓存能对上就直接铺；只有缓存缺失/不匹配才去请求。
-                // 想检查服务端有没有更新，点界面上的「刷新」按钮（走正常加载，绕开缓存）。
-                if (TryApplyBrowseCacheFromSettings(_curFid, modeName))
-                    return;
+                // 【2026-10-22 用户要求】恢复浏览位置时**直接请求最新数据**，
+                // 然后滚动到上次记住的位置。
+                //
+                // 【为什么不再用本地快照铺列表】原来优先走本地缓存（一个请求都不发），
+                // 但用户实测发现两个问题：
+                //   ① 缓存里只存了前若干条 → 列表只显示 10 条，后面全是空的；
+                //   ② 缓存铺出来的行**不能选中** → 没法勾文件、没法"免转存发送"。
+                // 快照只适合"记得我看到哪儿了"，不适合当数据源。
+                //
+                // 【现在的做法】请求最新数据（列表完整、可正常选中），
+                // 再把滚动位置还原到上次离开的地方。滚动位置由
+                // <see cref="CaptureBrowseCache"/> 单独存，不依赖列表内容。
+
+                // 上次在这个目录的滚动位置（可能为 0 = 顶部）
+                double wantOffset = 0;
+                try
+                {
+                    var snap = _settings?.LastBrowseCache;
+                    if (snap != null && !string.IsNullOrEmpty(snap.Fid)
+                        && string.Equals(snap.Fid, _curFid, StringComparison.Ordinal))
+                    {
+                        wantOffset = snap.ScrollOffset;
+                    }
+                }
+                catch { }
 
                 bool loadFailed = false;
                 await LoadDirAsync(_curFid, () => loadFailed = true);
@@ -1552,6 +1479,9 @@ namespace GeZi
                     await LoadDirAsync("0");
                     return;
                 }
+
+                // 【2026-10-22】滚回上次的位置（在最新数据铺好之后）。
+                if (wantOffset > 0) RestoreScrollOffset(wantOffset);
 
                 if (_files.Count == 0)
                 {
@@ -1970,8 +1900,8 @@ namespace GeZi
 
                 ApplyTaskOrder();
                 Log(on
-                    ? "任务列表已切换：未完成的文件排在前面（同组内仍按时间偏好排序）"
-                    : "任务列表已切换：不再把未完成的排前面（恢复纯时间序）");
+                    ? "任务列表已切换：需要处理的文件排在前面（失败/取消 → 未完成 → 已完成，同组内仍按时间偏好排序）"
+                    : "任务列表已切换：不再把需要处理的文件排前面（恢复纯时间序）");
             }
             catch (Exception ex)
             {
@@ -2579,13 +2509,33 @@ namespace GeZi
             if (!silent) Log("已退出多选模式。");
         }
 
+        /// <summary>
+        /// 多选提示条上的「已选 N 项（共 X MB）」。
+        ///
+        /// <para>【2026-10-22 用户要求】「在提示：已选多少项后面加上共：多少MB/G」。
+        /// 只说"选了几项"用户没有体积概念，加了总大小才能判断"这一批大概多大"、
+        /// 值不值得开下载。</para>
+        /// </summary>
         private void UpdateFileSelectCount()
         {
             try
             {
                 if (FileSelectCountText == null) return;
-                int n = FileList != null ? FileList.SelectedItems.Count : 0;
-                FileSelectCountText.Text = "已选 " + n + " 项";
+                int n = 0;
+                long bytes = 0;
+                if (FileList != null)
+                {
+                    foreach (var it in FileList.SelectedItems)
+                    {
+                        var f = it as ShareFileItem;
+                        if (f == null) continue;
+                        n++;
+                        if (f.Size > 0) bytes += f.Size;
+                    }
+                }
+                FileSelectCountText.Text = bytes > 0
+                    ? "已选 " + n + " 项（共 " + Util.FormatSize(bytes) + "）"
+                    : "已选 " + n + " 项";
             }
             catch { }
         }
@@ -4739,6 +4689,9 @@ namespace GeZi
                         // 文件就在当前打开的目录里（RelDir 为空）→ 用该目录名做分组
                         GroupName = item.RelDir == null || item.RelDir.Length == 0
                             ? CurrentFolderGroupName() : null,
+                        // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
+                        SourceFid = item.SourceFid,
+                        SourceName = item.SourceName,
                     },
                 });
             }
@@ -4917,6 +4870,9 @@ namespace GeZi
                             Dest = dest, Size = item.Size,
                             GroupName = item.RelDir == null || item.RelDir.Length == 0
                                 ? CurrentFolderGroupName() : null,
+                            // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
+                            SourceFid = item.SourceFid,
+                            SourceName = item.SourceName,
                         },
                     });
                 }
@@ -5053,6 +5009,9 @@ namespace GeZi
                         Passcode = _sharePasscode,
                         StartFid = _shareStartFid,
                         ShareRelDir = f.RelDir,
+                        // 【2026-10-22】免转存路径下源文件就是自己
+                        SourceFid = f.Fid,
+                        SourceName = f.Name,
                     });
                 else
                     Log("跳过（无直链）: " + f.Name);
@@ -5138,6 +5097,10 @@ namespace GeZi
                                 Fid = newFids[j], FromShare = false,
                                 // 这份新 fid 就是用户在网盘里的中转文件，下载完应立即清理
                                 TransferredFid = newFids[j],
+                                // 【2026-10-22】同时记下**分享里的源文件**定位信息：
+                                // 中转副本被用户删掉后，续传可据此回退到免转存（源文件还在）。
+                                SourceFid = batch[j].Fid,
+                                SourceName = batch[j].Name,
                             });
                         else
                             Log("无直链: " + batch[j].Name);
@@ -5554,6 +5517,17 @@ namespace GeZi
             // 抓成局部引用后，本批任务从头到尾只用同一个 scheduler，清晰且安全。
             var scheduler = _scheduler;
             _batchRunning = true;
+
+            // 【2026-10-22】本批任务的起点：状态栏要显示"已耗时"。
+            // 口径 = **这一批从推送到全部完成**的用时（用户明确要求，不是累加）。
+            // 每推一批重新计时；批次结束停表并把结果留在状态栏上。
+            _batchStartTime = DateTime.UtcNow;
+            _lastBatchElapsed = null;
+
+            // 记下"本批开始时"的累计字节 —— 之后算平均速度时用**增量**，
+            // 免得把之前几批已下完的体积也算进去（曾因此显示 200MB/s 的假速度）。
+            _batchDoneAtStart = _tasks.Sum(t => t.Done);
+
             // 新任务已入队 → 合并按钮立刻切成「暂停全部」（不用等第一次进度上报）
             UpdatePauseAllButton(force: true);
             // 立刻开启保活，别等 30 秒的定时器 —— 用户可能点完就去睡觉了
@@ -5575,6 +5549,16 @@ namespace GeZi
             finally
             {
                 _batchRunning = false;
+
+                // 【2026-10-22】本批结束 → 停表，把用时留在状态栏上。
+                // 用户要的是"这一批从推送到完成用了多久"，所以到点就定格，
+                // 不再继续累加（下一批推送时会重新计时）。
+                if (_batchStartTime != null)
+                {
+                    _lastBatchElapsed = DateTime.UtcNow - _batchStartTime.Value;
+                    _batchStartTime = null;
+                }
+                RefreshTotalStatusBar();
             }
             Log("本批下载结束");
 
@@ -5737,11 +5721,16 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 汇总当前所有"下载中"任务的合计剩余时间（用于关机提示条的「预计 X 后」）。
+        /// 汇总当前所有"下载中"任务的合计剩余时间（用于关机提示条的「预计 X 后」与状态栏的「剩余」）。
         ///
         /// <para>【为什么是"最大剩余"而不是"求和"】多个任务并发下载时它们同时结束，
         /// 总耗时取决于**最慢的那个**，不是各自相加。求和会给出一个虚高的数字。</para>
         /// <para>没有在跑的任务时返回空串（调用方会退化成不带预计时间的文案）。</para>
+        ///
+        /// <para>【2026-10-22】速度很低时（≤1KB/s）原来直接跳过这个任务，
+        /// 于是"只剩 8 秒但此刻速度很慢"会显示成"计算中"—— 秒级的信息恰恰最该给出来。
+        /// 现在改成：只要**还有剩余字节**就给出估算，速度低时按最低速算一个上界；
+        /// 真的算不出来（速度为 0）才跳过。</para>
         /// </summary>
         private string FormatRemainingTotalEta()
         {
@@ -5753,8 +5742,20 @@ namespace GeZi
                 {
                     if (t.State != JobState.Downloading) continue;
                     if (t.Total <= 0 || t.Done >= t.Total) continue;
-                    if (t.Speed <= 1024) continue;
-                    double s = (t.Total - t.Done) / t.Speed;
+
+                    double remain = t.Total - t.Done;
+                    if (remain <= 0) continue;
+
+                    double s;
+                    if (t.Speed > 1024)
+                    {
+                        s = remain / t.Speed;
+                    }
+                    else
+                    {
+                        // 速度太低：按 1KB/s 算一个保守上界，至少给个数字
+                        s = remain / 1024.0;
+                    }
                     if (s <= 0) continue;
                     if (s > maxSeconds) maxSeconds = s;
                     any = true;
@@ -5915,6 +5916,16 @@ namespace GeZi
                 long doneBytes = pending.Sum(t => t.Done);
                 double speed = _tasks.Where(t => t.State == JobState.Downloading).Sum(t => t.Speed);
 
+                // 【2026-10-22 用户要求】「总速度之类的可以一直保留，
+                // 没必要过几秒就消失了」——
+                // 没有未完成任务时（全部完成/取消），改用**全部任务**的累计统计，
+                // 这样总进度/体积不会退化成"—"。
+                if (totalBytes == 0 && _tasks.Count > 0)
+                {
+                    totalBytes = _tasks.Sum(t => t.Total);
+                    doneBytes = _tasks.Sum(t => t.Done);
+                }
+
                 // ---- 总进度 ----
                 double pct = totalBytes > 0
                     ? Math.Max(0, Math.Min(100, doneBytes * 100.0 / totalBytes))
@@ -5922,6 +5933,10 @@ namespace GeZi
 
                 if (TotalPctText != null)
                     TotalPctText.Text = totalBytes > 0 ? pct.ToString("F1") + "%" : "—";
+
+                // 【2026-10-22 用户要求】总进度后面跟一个"已耗时"。
+                if (TotalElapsedText != null)
+                    TotalElapsedText.Text = FormatElapsedTotal();
 
                 // 光带与进度条：按百分比设宽度。
                 // ⚠️ 光带的父级宽度在首次刷新时可能还没测量出来（ActualWidth=0），
@@ -5953,9 +5968,22 @@ namespace GeZi
                 // ---- 总速度 ----
                 if (TotalSpeedText != null)
                 {
-                    TotalSpeedText.Text = speed > 1024
-                        ? Util.FormatSize((long)speed) + "/s"
-                        : (pending.Count > 0 ? "0 B/s" : "—");
+                    if (speed > 1024)
+                    {
+                        TotalSpeedText.Text = Util.FormatSize((long)speed) + "/s";
+                    }
+                    else if (pending.Count > 0)
+                    {
+                        TotalSpeedText.Text = "0 B/s";
+                    }
+                    else
+                    {
+                        // 【2026-10-22 用户要求】「总速度之类的可以一直保留，
+                        // 没必要过几秒就消失了」——
+                        // 全部完成时不再显示"—"，而是把**本批的平均速度**定格留着
+                        // （总字节 ÷ 本批耗时），这样还能看出"这批平均有多快"。
+                        TotalSpeedText.Text = FormatAverageSpeed();
+                    }
                 }
 
                 // ---- 剩余时间 ----
@@ -5965,7 +5993,7 @@ namespace GeZi
                     // 三种形态说清当前状态，避免一直挂着"计算中"这种假忙碌：
                     //   · 有下载中任务且速度够 → 「约 9 分」
                     //   · 有下载中任务但速度太低 → 「计算中」（速度回来就会给出数字）
-                    //   · 没有在下的任务（全暂停/全完成） → 「—」
+                    //   · 没有在下的任务 → 「已完成」/「已暂停」（保留信息，不显示"—"）
                     string eta = FormatRemainingTotalEta();
                     if (!string.IsNullOrEmpty(eta))
                     {
@@ -5974,13 +6002,18 @@ namespace GeZi
                     else
                     {
                         bool anyRunning = _tasks.Any(t => t.State == JobState.Downloading);
-                        TotalEtaText.Text = anyRunning ? "计算中" : "—";
+                        if (anyRunning) TotalEtaText.Text = "计算中";
+                        else if (pending.Count > 0) TotalEtaText.Text = "已暂停";
+                        else TotalEtaText.Text = "已完成";
                     }
                 }
 
                 // ---- 已下 / 总量 ----
                 if (TotalSizeText != null)
                 {
+                    // totalBytes/doneBytes 上面已经统一口径
+                    // （有未完成任务时算未完成的，没有时算全部任务），
+                    // 所以这里直接用，不再分叉。
                     TotalSizeText.Text = totalBytes > 0
                         ? Util.FormatSize(doneBytes) + " / " + Util.FormatSize(totalBytes)
                         : "—";
@@ -6063,11 +6096,18 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 执行关机：先给用户一个可取消的确认，再调用系统 shutdown。
+        /// 执行关机：先给用户一个**带 15 秒倒计时**的确认框，再调用系统 shutdown。
         ///
         /// <para>【为什么要确认】关机会打断用户正在做的其它事情，而且是不可逆的。
         /// 即便他刚才主动开了开关，真到执行那一刻也应该有一次"临门一脚"的机会 ——
         /// 何况他可能早就忘了自己开过。</para>
+        ///
+        /// <para>【2026-10-22 用户要求】「应该是倒计时 15s，如果用户没有选取消关机，
+        /// 那么结束后自动在 1 分钟内唤起关机」——
+        /// 所以这里用<b>倒计时确认框</b>而不是普通 Yes/No：
+        /// 用户不操作，15 秒后自动等同点了"确认关机"，接着走
+        /// <c>shutdown.exe /s /t 60</c>（系统自己的 60 秒倒计时），
+        /// 于是"下载完成 → 15s 倒计时 → 1 分钟内关机"全程无需人工干预。</para>
         ///
         /// <para>【为什么用 shutdown.exe 而不是 WMI】shutdown.exe /s /t 60 让系统自己
         /// 提供倒计时与"取消"入口（shutdown /a），比程序自己 Sleep 60 秒更可靠
@@ -6077,18 +6117,20 @@ namespace GeZi
         {
             try
             {
-                var ans = AppDialog.Show(this,
+                var ans = AppDialog.ShowWithCountdown(this,
                     "全部任务已下载完成。\n\n"
                     + "你之前开启了「完成后关机」，现在要关机吗？\n"
-                    + "（点「否」则本次不关机，开关保持开启）",
+                    + "（不操作则自动继续；点「取消关机」则本次不关机，开关保持开启）",
                     "完成后关机",
-                    System.Windows.MessageBoxButton.YesNo,
+                    "确认关机", "取消关机",
                     System.Windows.MessageBoxImage.Question,
+                    ShutdownConfirmSeconds,
+                    "将在 {0} 秒后自动关机（想取消请点「取消关机」）…",
                     System.Windows.MessageBoxResult.Yes);
 
                 if (ans != System.Windows.MessageBoxResult.Yes)
                 {
-                    Log("已跳过关机（任务已完成）。");
+                    Log("已取消本次关机（开关保持开启，下次全部完成后仍会再问一次）。");
                     return;
                 }
 
@@ -6111,6 +6153,11 @@ namespace GeZi
                     "关机失败");
             }
         }
+
+        /// <summary>
+        /// 关机确认框的倒计时秒数（2026-10-22 用户要求 15 秒）。
+        /// </summary>
+        private const int ShutdownConfirmSeconds = 15;
 
         /// <summary>
         /// 清理「一个」转存来源的中转文件：删文件 + 清回收站。
@@ -6181,17 +6228,39 @@ namespace GeZi
             // 【2026-10-21】开启「优先展示未完成」时，任务从"未完成"变成"已完成/失败/取消"
             // （或反过来，比如点 ▶ 续传一个暂停的任务）就需要重排一次 ——
             // 否则它不会自动挪到后面/前面，用户还得手动切一下排序按钮才生效。
-            // 只在这个"已结束"标志真正翻转时才重排：进度更新每 500ms 一次，
+            //
+            // 【2026-10-22】改成按**关注度分层**（见 TaskAttentionRank）判定是否要重排：
+            // 原来的 IsFinished 只有"结束/未结束"两档，而现在是三档
+            // （失败/取消 → 未完成 → 已完成）。用两档判定会漏掉
+            // 「失败 → 取消」「未完成 → 失败」这类跨层变化 ——
+            // 那样任务就会停在一个已经不符合新排序的位置上。
+            //
+            // 只在分层真正翻转时才重排：进度更新每 500ms 一次，
             // 每次都全表 Move 会让列表抖动且白耗性能。
-            bool wasFinished = IsFinished(item);
+            int wasRank = TaskAttentionRank(item);
             if (!keepPaused)
             {
+                // 【2026-10-22 用户建议】「其实也可以把失败，当做暂停，
+                //  这样就可以用全部恢复来恢复失败的文件了」。
+                //
+                // 【为什么采纳】原来失败任务是终态（JobState.Failed）：
+                //   · 只能**逐个**点「重试」，没有批量入口；
+                //   · 「全部恢复」只管已暂停的，失败的不在其中 ——
+                //     一堆文件失败后要一个个点重试，非常低效。
+                // 把它并入「已暂停」这一档后：
+                //   · 「全部恢复」能一次把失败的任务全部捞回来重试；
+                //   · 失败原因仍保留在 Error 里（界面照常显示「失败: xxx」）；
+                //   · 单独点行内 ▶ 也能重试（走 ResumeTask 的重试分支）。
+                //
+                // ⚠️ 状态仍记为 Failed（不是 Paused）—— 因为"失败"要进历史记录、
+                //    也要在任务页显示错误原因；只是把它**同时**纳入「可恢复」这一档。
+                //    真正的"可恢复"判定由 CanResumeAfterFailure 负责。
                 item.State = u.State;
                 // 走到终态/被恢复时清掉暂停标志，避免它一直挂着影响后续状态显示
                 if (u.State != JobState.Paused)
                     item.PauseRequested = false;
             }
-            if (_settings.TaskUnfinishedFirst && wasFinished != IsFinished(item))
+            if (_settings.TaskUnfinishedFirst && wasRank != TaskAttentionRank(item))
                 ApplyTaskOrder();
             item.Error = u.Error ?? "";
             if ((u.State == JobState.Failed || u.State == JobState.Cancelled) && !string.IsNullOrEmpty(u.Error))
@@ -6215,6 +6284,15 @@ namespace GeZi
                 // 阶段说明（如「正在合并分片」）。非下载态一律清空，
                 // 免得完成/失败后还挂着「正在合并分片」这种残留文案。
                 item.Phase = u.State == JobState.Downloading ? u.Progress.Phase : null;
+
+                // 【2026-10-22 用户要求】「任务页的总进度和总速度更新太慢，
+                // 要确保和任务在下载同步」。
+                //
+                // 【原来】底部状态栏只由 10 秒一次的定时器刷新 → 总速度/总进度
+                // 比单个任务的进度条慢 20 倍，看着像"卡住了不动"。
+                // 【现在】进度每次上报（核心层 500ms 一报）就顺手刷一次状态栏 ——
+                // 数据源本来就是最新的，只是刷新时机被定时器拖慢了。
+                RefreshTotalStatusBar();
             }
 
             // ---- 历史记录：终态各记一条（只记一次）----
@@ -6305,6 +6383,9 @@ namespace GeZi
                         Passcode = pi == null ? null : pi.Passcode,
                         RelDir = pi == null ? null : pi.RelDir,
                         GroupName = pi == null ? null : pi.GroupName,
+                        // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
+                        SourceFid = pi == null ? null : pi.SourceFid,
+                        SourceName = pi == null ? null : pi.SourceName,
                         Segmented = true,   // 落盘方式唯一化：恒为独立分片
                         Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                     });
@@ -6349,9 +6430,23 @@ namespace GeZi
                             Fid = s.Fid, Token = s.Token, FromShare = s.FromShare,
                             RelDir = s.RelDir ?? "", Dest = s.Dest, Size = s.Size,
                             GroupName = s.GroupName ?? "",
+                            // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
+                            SourceFid = s.SourceFid,
+                            SourceName = s.SourceName,
                         },
                     };
                     job.LinkRefresher = ct => RefreshLinkAsyncForPending(job, ct);
+
+                    // ⚠️ 【2026-10-22】同一 Dest 只保留**一行**。
+                    //    快照里可能出现重复行（早先的"重试"会新建一行、
+                    //    老行没被清掉 —— 用户实测：任务列表里同一个文件出现两次，
+                    //    删掉一行另一行还在，看着像"删不掉"）。
+                    //    这里按 Dest 去重：已存在同 Dest 的行就跳过这条快照。
+                    if (_tasks.Any(x => x.Job != null && !string.IsNullOrEmpty(s.Dest)
+                        && string.Equals(x.Job.Dest, s.Dest, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        continue;
+                    }
 
                     var t = new TaskItem(job,
                         string.IsNullOrEmpty(s.Name) ? Path.GetFileName(s.Dest) : s.Name)
@@ -6366,19 +6461,35 @@ namespace GeZi
                     if (!Enum.TryParse(s.State, out st))
                         st = JobState.Paused;
 
+                    // 【2026-10-22】进度以**磁盘上的 .qmeta** 为准。
+                    // 快照里记的 Done 可能不准（例如"失败当暂停"重试时新建的行
+                    // 没继承进度 → 写回 0），用户会看到"明明下了 10MB 却显示 0.0%"，
+                    // 还会以为分片丢了。续传的真实进度只存在 .qmeta 里。
+                    if (!string.IsNullOrEmpty(s.Dest) && st != JobState.Completed)
+                    {
+                        long onDisk = SegmentedDownloader.ReadDownloadedBytes(
+                            s.Dest, string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot);
+                        if (onDisk > 0)
+                        {
+                            t.Done = onDisk;
+                            if (s.Size > 0)
+                                t.Percent = Math.Min(99.9, onDisk * 100.0 / s.Size);
+                        }
+                    }
+
                     if (st == JobState.Completed)
                     {
                         t.Percent = 100;
                     }
                     else if (st == JobState.Failed || st == JobState.Cancelled)
                     {
-                        t.Percent = s.Size > 0 ? Math.Min(100.0, s.Done * 100.0 / s.Size) : 0;
+                        t.Percent = s.Size > 0 ? Math.Min(100.0, t.Done * 100.0 / s.Size) : 0;
                     }
                     else
                     {
                         // 上次是 排队/下载中/暂停/取消中 → 统一回到「已暂停」
                         st = JobState.Paused;
-                        t.Percent = s.Size > 0 ? Math.Min(99.9, s.Done * 100.0 / s.Size) : 0;
+                        t.Percent = s.Size > 0 ? Math.Min(99.9, t.Done * 100.0 / s.Size) : 0;
                         unfinished++;
                     }
                     t.State = st;
@@ -6437,6 +6548,9 @@ namespace GeZi
                             Passcode = pi?.Passcode,
                             RelDir = pi?.RelDir,
                             GroupName = pi?.GroupName,
+                            // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
+                            SourceFid = pi?.SourceFid,
+                            SourceName = pi?.SourceName,
                         });
                     }
                 }
@@ -6497,40 +6611,89 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 「全部恢复」：只恢复已暂停的（分段胶囊右半）。
+        /// 「全部恢复」：恢复已暂停的**以及失败/已取消的**（分段胶囊右半）。
         /// Dormant（上次运行恢复出来的占位行）单独走**一次批量续传**，
         /// 避免 N 个任务各自并发取链、把请求量放大 N 倍。
+        ///
+        /// <para>【2026-10-22 用户建议】「其实也可以把失败，当做暂停，
+        /// 这样就可以用全部恢复来恢复失败的文件了」——
+        /// 所以这里把 Failed / Cancelled 也纳入恢复范围：</para>
+        /// <list type="bullet">
+        /// <item>本次会话内的失败/取消 → <b>重置令牌后重新入队</b>（分片还在，续传）。</item>
+        /// <item>Dormant 的失败/取消 → 走**批量重新取链续传**（与暂停行同一路径）。</item>
+        /// </list>
         /// </summary>
         private void OnResumeAll(object sender, RoutedEventArgs e)
         {
             int n = 0;
+            int retryFailed = 0;
+
             foreach (var t in _tasks)
             {
-                if (t.State != JobState.Paused || t.Dormant) continue;
-                t.PauseRequested = false;
-                t.Job.ResumeJob();
-                t.State = JobState.Downloading;
-                n++;
+                if (t.Dormant) continue;   // Dormant 单独处理（见下）
+
+                if (t.State == JobState.Paused)
+                {
+                    t.PauseRequested = false;
+                    t.Job.ResumeJob();
+                    t.State = JobState.Downloading;
+                    n++;
+                }
+                else if (t.State == JobState.Failed || t.State == JobState.Cancelled)
+                {
+                    // 【2026-10-22】失败/取消 → 当作暂停来恢复：重置令牌后重新入队。
+                    // 旧的 Cancel 令牌已触发且不可复用，必须换新的才能再跑。
+                    t.Job.ResetForRetry();
+                    t.Error = "";
+                    t.HistoryRecorded = false;   // 允许重试成功后再记一条历史
+                    t.PauseRequested = false;
+                    t.Speed = 0;
+                    t.State = JobState.Queued;   // 先挂牌「排队中」，RunJobs 会改为「下载中」
+                    retryFailed++;
+                }
+            }
+
+            // 【2026-10-22】失败/取消的任务统一走「重新取链 → 续传」路径，
+            // 而不是直接重跑旧 job。
+            //
+            // 【为什么不直接重跑旧 job】旧 job 的直链**带时效签名**，早就过期了；
+            // 而重新取链时能顺带触发「中转副本没了 → 回退到分享源文件」的自愈
+            // （见 TryFallbackToShareSourceAsync）。分片在磁盘上，新 job 用同一个
+            // Dest，自然续传，不用重下。
+            var retryPending = new List<PendingTask>();
+            foreach (var t in _tasks)
+            {
+                if (t.Dormant) continue;
+                if (t.State != JobState.Queued) continue;   // 只处理刚被置为 Queued 的
+                var pend = BuildPendingTask(t);
+                if (pend != null) retryPending.Add(pend);
             }
 
             var dormantPending = new List<PendingTask>();
             foreach (var t in _tasks)
             {
-                if (t.State != JobState.Paused || !t.Dormant) continue;
+                bool dormantHit = t.Dormant
+                    && (t.State == JobState.Paused || t.State == JobState.Failed || t.State == JobState.Cancelled);
+                if (!dormantHit) continue;
                 var pend = BuildPendingTask(t);
                 if (pend != null) dormantPending.Add(pend);
             }
 
-            if (n == 0 && dormantPending.Count == 0)
+            if (n == 0 && retryFailed == 0 && dormantPending.Count == 0)
             {
-                Log("没有已暂停的任务。");
+                Log("没有可恢复的任务。");
                 return;
             }
             if (n > 0) Log("已恢复 " + n + " 个任务。");
+            if (retryFailed > 0) Log("正在重试 " + retryFailed + " 个失败/取消的任务（已下载部分会续传）…");
             if (dormantPending.Count > 0)
             {
                 Log("正在为 " + dormantPending.Count + " 个未完成任务重新取链…");
                 _ = ResumePendingBatchAsync(dormantPending);
+            }
+            if (retryPending.Count > 0)
+            {
+                _ = ResumePendingBatchAsync(retryPending);
             }
             SyncPending();
             UpdatePauseAllButton(force: true);
@@ -6546,7 +6709,10 @@ namespace GeZi
         /// <param name="force">true = 忽略签名缓存强制重建（按钮刚被点击时用）。</param>
         /// <summary>
         /// 刷新分段胶囊上的两个数量与可用状态（2026-10-20 改为方案 B）。
-        /// 左半「全部暂停」只统计 下载中/排队；右半「全部恢复」只统计 已暂停。
+        /// 左半「全部暂停」只统计 下载中/排队；右半「全部恢复」统计 已暂停 + **失败/已取消**。
+        ///
+        /// <para>【2026-10-22】右半把 Failed / Cancelled 也算进去 ——
+        /// 按用户建议「把失败当做暂停」，这样「全部恢复」能一次重试所有失败任务。</para>
         /// </summary>
         /// <param name="force">true = 忽略签名缓存强制刷新（按钮刚被点击时用）。</param>
         private void UpdatePauseAllButton(bool force = false)
@@ -6555,7 +6721,9 @@ namespace GeZi
 
             int running = _tasks.Count(t => t.State == JobState.Downloading || t.State == JobState.Queued);
             int paused = _tasks.Count(t => t.State == JobState.Paused);
-            string sig = running + "/" + paused;
+            int failed = _tasks.Count(t => t.State == JobState.Failed || t.State == JobState.Cancelled);
+            int resumable = paused + failed;   // 「全部恢复」能救回的数量
+            string sig = running + "/" + resumable + "/" + failed;
             if (!force && sig == _pauseAllSig) return;
             _pauseAllSig = sig;
 
@@ -6566,21 +6734,22 @@ namespace GeZi
             }
             if (ResumeAllCount != null)
             {
-                ResumeAllCount.Text = paused.ToString();
-                ResumeAllCount.Opacity = paused > 0 ? 1.0 : 0.55;
+                ResumeAllCount.Text = resumable.ToString();
+                ResumeAllCount.Opacity = resumable > 0 ? 1.0 : 0.55;
             }
 
             PauseAllBtn.IsEnabled = running > 0;
-            if (ResumeAllBtn != null) ResumeAllBtn.IsEnabled = paused > 0;
+            if (ResumeAllBtn != null) ResumeAllBtn.IsEnabled = resumable > 0;
 
             PauseAllBtn.ToolTip = running > 0
                 ? "暂停所有正在下载 / 排队的任务（" + running + " 个）"
                 : "当前没有正在下载 / 排队的任务";
             if (ResumeAllBtn != null)
             {
-                ResumeAllBtn.ToolTip = paused > 0
+                ResumeAllBtn.ToolTip = resumable > 0
                     ? "恢复所有已暂停的任务（" + paused + " 个）"
-                    : "当前没有已暂停的任务";
+                      + (failed > 0 ? "，并重试失败/取消的任务（" + failed + " 个）" : "")
+                    : "当前没有已暂停或失败的任务";
             }
         }
 
@@ -6674,7 +6843,7 @@ namespace GeZi
         /// <para>实现要点：这里排的是 <c>_tasks</c> 这个**唯一真源**的顺序，
         /// 分组视图的分组内顺序就是跟着它来的，所以只要在这里把"未完成"提到前面，
         /// 每个文件夹卡片内部的顺序也就跟着变了 —— 不需要另写一套分组内排序。</para>
-        /// <para>为什么用稳定排序（OrderBy 本身就是稳定的）：先按"是否未完成"分组，
+        /// <para>为什么用稳定排序（OrderBy 本身就是稳定的）：先按"关注度分层"分组，
         /// 再在组内按时间偏好排，等于给原有顺序加了一个主键；
         /// 用户原来的"新任务在前 / 在后"偏好依然在组内生效，不会被打乱。</para>
         /// </summary>
@@ -6684,9 +6853,9 @@ namespace GeZi
                 ? _tasks.OrderByDescending(t => t.Seq)
                 : _tasks.OrderBy(t => t.Seq);
 
-            // 未完成优先：等于是加在时间序**之上**的第一排序键
+            // 关注度优先：等于是加在时间序**之上**的第一排序键
             if (_settings.TaskUnfinishedFirst)
-                seq = seq.OrderBy(t => IsFinished(t) ? 1 : 0);
+                seq = seq.OrderBy(t => TaskAttentionRank(t));
 
             var ordered = seq.ToList();
 
@@ -6698,9 +6867,52 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 「这个任务算不算已经结束」—— 供「优先展示未完成」排序用。
-        /// <para>已结束：完成 / 失败 / 已取消。其余（下载中、排队、暂停、取消中）都算未完成，
-        /// 因为它们都还需要用户关注（暂停的要点继续、取消中的还在收尾）。</para>
+        /// 任务的"关注度分层"——「优先展示未完成、失败的任务」用的第一排序键。
+        ///
+        /// <para>【为什么分三层而不是两层】用户反馈（2026-10-22）：
+        /// 「任务页同样应该优先展示未完成、**失败**的任务，方便重试
+        /// （不然每次要滚动半天）」。原来的两层分法把"失败"和"已完成"归为一类
+        /// （见 <see cref="IsFinished"/>），于是**失败任务会沉到最底下** ——
+        /// 恰恰是最需要用户点重试的那些。</para>
+        ///
+        /// <para>三层：</para>
+        /// <list type="bullet">
+        /// <item><b>0 = 失败 / 已取消</b>：需要用户处理（重试 / 排查），最该被看到。
+        ///       已取消也算 —— 它同样处于"没下完、可以重来"的状态。</item>
+        /// <item><b>1 = 未完成</b>：下载中 / 排队 / 暂停 / 取消中 —— 正在进行或可继续。</item>
+        /// <item><b>2 = 已完成</b>：只剩记录价值，垫底。</item>
+        /// </list>
+        ///
+        /// <para>组内仍按用户原有的"新任务在前 / 在后"偏好排（OrderBy 稳定）。</para>
+        /// </summary>
+        private static int TaskAttentionRank(TaskItem t)
+        {
+            if (t == null) return 2;
+            switch (t.State)
+            {
+                // 失败 / 已取消：需要用户重试或排查 —— 排最前
+                case JobState.Failed:
+                case JobState.Cancelled:
+                    return 0;
+                // 未完成：下载中 / 排队 / 暂停 / 取消中
+                case JobState.Queued:
+                case JobState.Downloading:
+                case JobState.Paused:
+                case JobState.Cancelling:
+                    return 1;
+                // 已完成
+                default:
+                    return 2;
+            }
+        }
+
+        /// <summary>
+        /// 「这个任务算不算已经结束」—— 供「这个任务还需要用户关注吗」这类判定用。
+        /// <para>已结束：完成 / 失败 / 已取消。其余（下载中、排队、暂停、取消中）都算未完成。</para>
+        ///
+        /// <para>⚠️ 【2026-10-22】**排序位置**不再由这个二分判定决定 ——
+        /// 位置改由 <see cref="TaskAttentionRank"/> 的三层负责（失败要单独排最前）。
+        /// 本方法保留给"是否还需要用户关注"这类语义使用。</para>
         /// </summary>
         private static bool IsFinished(TaskItem t)
         {
@@ -7121,11 +7333,20 @@ namespace GeZi
         /// <summary>
         /// 右键按下时把光标下的任务选中，这样菜单动作能对准用户真正点的那一行。
         /// 若该处没有任务（点到空白），保持原选中不变。
+        ///
+        /// <para>⚠️ 【2026-10-22 修】原来挂在 <c>MouseRightButtonUp</c> 上，
+        /// 那个事件在右键菜单场景下**不可靠**：右键按下时 <c>ContextMenu</c> 就会弹出，
+        /// ListBox 往往收不到 RightButtonUp → "右键点某一行，删除却没反应"。
+        /// 改挂 <c>PreviewMouseRightButtonDown</c>（隧道阶段，先于菜单弹出）。</para>
         /// </summary>
-        private void OnTaskListRightClick(object sender, MouseButtonEventArgs e)
+        private void OnTaskListRightClickDown(object sender, MouseButtonEventArgs e)
         {
             var lbi = FindListBoxItem(e.OriginalSource as DependencyObject);
             if (lbi == null) return;
+
+            // 记住这次右键命中的行：菜单动作优先用它（见 TasksFromMenu），
+            // 这样即便选中态没跟上，删除/重试也一定作用在用户点的这一行。
+            _taskRightClickTarget = lbi.DataContext as TaskItem;
 
             // ⚠️ 【2026-10-03 修】原来无条件 `TaskList.SelectedItem = ...` ——
             //    这句会**把整个选择替换成这一个**，于是"Shift 离散多选之后再右键"
@@ -7136,6 +7357,14 @@ namespace GeZi
             if (lbi.IsSelected) return;
             TaskList.SelectedItems.Clear();
             lbi.IsSelected = true;
+        }
+
+        /// <summary>
+        /// 任务列表的右键（保留旧入口，供键盘/其它调用路径使用）。
+        /// </summary>
+        private void OnTaskListRightClick(object sender, MouseButtonEventArgs e)
+        {
+            OnTaskListRightClickDown(sender, e);
         }
 
         /// <summary>双击任务行 = 打开文件（与「打开」按钮同义）。</summary>
@@ -7152,14 +7381,31 @@ namespace GeZi
         /// 【2026-10-03】原来只取 `SelectedItem`（一个）—— 于是"Shift 离散多选之后
         /// 右键暂停/删除"只会作用于其中一个（用户反馈）。现在把选中的全取出来；
         /// 没选中任何行时回退到菜单项自己的 Tag（行内按钮那条路径）。
+        ///
+        /// <para>【2026-10-22】新增一层兜底：**右键命中的那一行**
+        /// （<see cref="_taskRightClickTarget"/>）。</para>
+        /// <para>为什么需要：右键时"选中态"可能没跟上（分组视图 / 已删本地文件的任务），
+        /// 此时若只认 SelectedItems，菜单动作会拿到**空集合** → 点了"删除"毫无反应
+        /// （用户实测：「右键删除和选择都没用」）。用右键命中的行兜底，
+        /// 保证"点哪一行就作用于哪一行"。</para>
         /// </summary>
         private List<TaskItem> TasksFromMenu(object sender)
         {
             var list = TaskList.SelectedItems.OfType<TaskItem>().ToList();
             if (list.Count > 0) return list;
+
+            // 选中态没跟上 → 用右键命中的那一行兜底
+            if (_taskRightClickTarget != null) return new List<TaskItem> { _taskRightClickTarget };
+
             var one = (sender as System.Windows.Controls.MenuItem)?.Tag as TaskItem;
             return one != null ? new List<TaskItem> { one } : new List<TaskItem>();
         }
+
+        /// <summary>
+        /// 最近一次**右键命中的任务行**（见 <see cref="OnTaskListRightClickDown"/>）。
+        /// 用作菜单动作的兜底目标。
+        /// </summary>
+        private TaskItem _taskRightClickTarget;
 
         /// <summary>从右键菜单的动作里取出目标任务：优先用选中的，回退按钮 Tag。</summary>
         private TaskItem TaskFromMenu(object sender)
@@ -7364,6 +7610,9 @@ namespace GeZi
                 Passcode = p.Passcode,
                 RelDir = p.RelDir,
                 GroupName = p.GroupName,
+                // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
+                SourceFid = p.SourceFid,
+                SourceName = p.SourceName,
             };
         }
 
@@ -8385,12 +8634,37 @@ namespace GeZi
                                 {
                                     p.Stoken = freshStoken;   // 回填到续传记录，后续 job.Pending 用的就是新值
                                     p.Token = freshToken;
-                                }, CancellationToken.None);
+                                }, CancellationToken.None).ConfigureAwait(false);
+
+                            // 【2026-10-22】还是拿不到 → 走「转存副本没了就回免转存」的兜底。
+                            // 场景：转存路径下 p.Fid 是**中转副本**的 fid，用户把副本删了，
+                            // 而分享里的源文件还好好的 —— 原来这里直接跳过，任务永远续不上。
+                            if (string.IsNullOrEmpty(url))
+                            {
+                                url = await TryFallbackToShareSourceAsync(client, p, CancellationToken.None)
+                                    .ConfigureAwait(false);
+                            }
                         }
                         else
                         {
-                            var links = await client.GetDownloadAsync(new List<string> { p.Fid });
-                            url = links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                            // 我的网盘：fid 失效（文件被删）时，同样回退到分享源文件。
+                            string myUrl = null;
+                            try
+                            {
+                                var links = await client.GetDownloadAsync(new List<string> { p.Fid });
+                                myUrl = links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                            }
+                            catch (Exception ex)
+                            {
+                                Log("[" + p.Name + "] 按网盘 fid 取链失败: " + ex.Message);
+                            }
+                            url = myUrl;
+
+                            if (string.IsNullOrEmpty(url))
+                            {
+                                url = await TryFallbackToShareSourceAsync(client, p, CancellationToken.None)
+                                    .ConfigureAwait(false);
+                            }
                         }
 
                         if (string.IsNullOrEmpty(url))
@@ -8418,6 +8692,9 @@ namespace GeZi
                                 RelDir = p.RelDir ?? "", Dest = dest, Size = p.Size,
                                 GroupName = p.GroupName ?? "",
                                 StartFid = p.StartFid, ShareRelDir = p.ShareRelDir,
+                                // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
+                                SourceFid = p.SourceFid,
+                                SourceName = p.SourceName,
                             },
                         };
                         var captured = job;
@@ -8440,10 +8717,22 @@ namespace GeZi
 
                 foreach (var job in jobs)
                 {
-                    // 去重：任务页里可能已经有一条"上次恢复出来的占位行"（Dormant），
-                    // 续传成功后要把它换掉，不能并存两行。
-                    var stale = _tasks.FirstOrDefault(x => x.Dormant && x.Job != null
-                        && string.Equals(x.Job.Dest, job.Dest, StringComparison.OrdinalIgnoreCase));
+                    // 去重：任务页里可能已经有一条同路径的行 ——
+                    //   · "上次恢复出来的占位行"（Dormant）：续传成功后要把它换掉；
+                    //   · "失败/取消的老行"（【2026-10-22】按「失败当暂停」重试时）：
+                    //     也会被新的续传行取代，不能并存两行（否则一个文件显示两次）。
+                    //   · "刚被置为 Queued 等着重试的老行"：【2026-10-22】修。
+                    //     「全部恢复」会把失败任务置成 Queued 再走这条续传路径，
+                    //     如果不把老行清掉，同一个文件会出现**两行**（用户实测：
+                    //     任务列表里同一个文件出现两次，删掉一行另一行还在）。
+                    // 判据：同一 Dest，且那一行**没有在真正下载**。
+                    var stale = _tasks.FirstOrDefault(x => x.Job != null
+                        && string.Equals(x.Job.Dest, job.Dest, StringComparison.OrdinalIgnoreCase)
+                        && (x.Dormant
+                            || x.State == JobState.Failed
+                            || x.State == JobState.Cancelled
+                            || x.State == JobState.Paused
+                            || x.State == JobState.Queued));
                     if (stale != null)
                         _tasks.Remove(stale);
                     AddTaskItem(new TaskItem(job, job.Name));
@@ -8477,9 +8766,133 @@ namespace GeZi
                 {
                     links = await _client.GetDownloadAsync(new List<string> { p.Fid });
                 }
-                return links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                var url = links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                if (!string.IsNullOrEmpty(url)) return url;
+
+                // 【2026-10-22】原路径取不到链 → 回退到分享源文件（免转存）
+                return await TryFallbackToShareSourceAsync(_client, p, ct).ConfigureAwait(false);
             }
-            catch { return null; }
+            catch
+            {
+                // 原路径失败 → 也回退一次（转存副本可能已被删）
+                try { return await TryFallbackToShareSourceAsync(_client, p, ct).ConfigureAwait(false); }
+                catch { return null; }
+            }
+        }
+
+        /// <summary>
+        /// 兜底取链：**转存副本没了，就回分享里找源文件，走免转存下载**。
+        ///
+        /// <para>【场景】2026-10-22 用户实测：转存路径下下载的文件，用户把网盘里的
+        /// **中转副本**删了 → 续传时按副本 fid 取链报 "file not found"，
+        /// 任务再也续不上。但**分享里的源文件明明还在** —— 白白下不去。</para>
+        ///
+        /// <para>【做法】依次尝试：
+        /// ① 用现有的 stoken 按**源文件 fid**（<see cref="PendingInfo.SourceFid"/>）走免转存取链；
+        /// ② stoken 可能已过期 → 重新申请一份；
+        /// ③ 再按**文件名**（<see cref="PendingInfo.SourceName"/>）在分享里定位源文件，
+        ///    拿到新的 share_fid_token 取链。</para>
+        ///
+        /// <para>【为什么必须有分享上下文】免转存取链需要 pwd_id + stoken，
+        /// 没有这些就无从回退（返回 null）。</para>
+        /// </summary>
+        /// <returns>取到的直链；失败返回 null。</returns>
+        private async Task<string> TryFallbackToShareSourceAsync(
+            QuarkClient client, PendingInfo p, CancellationToken ct)
+        {
+            if (client == null || p == null) return null;
+            if (string.IsNullOrEmpty(p.PwdId)) return null;   // 没有分享上下文 → 无从回退
+
+            string stoken = p.Stoken;
+            string sourceFid = p.SourceFid;
+            string sourceName = p.SourceName;
+
+            // 旧任务的快照里没有 SourceFid/SourceName（2026-10-22 之前创建的），
+            // 但**转存路径**的 Fid 一定是中转副本、分享上下文又还在 ——
+            // 这时至少还能按文件名去找源文件。
+            if (string.IsNullOrEmpty(sourceName)) sourceName = p.Dest;
+
+            try
+            {
+                // ① 用现有 stoken 按源 fid 走免转存取链
+                if (!string.IsNullOrEmpty(sourceFid) && !string.IsNullOrEmpty(stoken))
+                {
+                    string u = await TryShareDownloadAsync(
+                        client, sourceFid, "", p.PwdId, stoken).ConfigureAwait(false);
+                    if (!string.IsNullOrEmpty(u))
+                    {
+                        Log("中转副本已不可用，已自动改用分享源文件继续下载。");
+                        p.Fid = sourceFid;
+                        p.FromShare = true;
+                        return u;
+                    }
+                }
+
+                // ② stoken 可能已过期 → 重新申请一份（分享还在的话）
+                try
+                {
+                    var fresh = await client.GetStokenAsync(p.PwdId, p.Passcode ?? "").ConfigureAwait(false);
+                    if (!string.IsNullOrEmpty(fresh))
+                    {
+                        stoken = fresh;
+                        p.Stoken = fresh;
+                    }
+                }
+                catch { }
+                if (string.IsNullOrEmpty(stoken)) return null;
+
+                // ③ 按**文件名**在分享里定位源文件，拿它的 share_fid_token 取链
+                if (!string.IsNullOrEmpty(sourceName))
+                {
+                    var fileName = Path.GetFileName(sourceName);
+                    var entry = await client.FindShareFileByNameAsync(
+                        p.PwdId, stoken, fileName).ConfigureAwait(false);
+                    if (entry != null && !string.IsNullOrEmpty(entry.Fid))
+                    {
+                        string u = await TryShareDownloadAsync(
+                            client, entry.Fid, entry.Token, p.PwdId, stoken).ConfigureAwait(false);
+                        if (!string.IsNullOrEmpty(u))
+                        {
+                            Log("中转副本已不可用，已在分享中重新定位源文件并继续下载。");
+                            // 回填上下文，后续重试/续传都用新的
+                            p.Fid = entry.Fid;
+                            p.Token = entry.Token;
+                            p.FromShare = true;
+                            return u;
+                        }
+                    }
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Log("回退到分享源文件失败: " + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// <see cref="TryFallbackToShareSourceAsync(QuarkClient, PendingInfo, CancellationToken)"/>
+        /// 的 <see cref="PendingTask"/> 入口（续传批处理用的是 PendingTask）。
+        /// </summary>
+        private async Task<string> TryFallbackToShareSourceAsync(
+            QuarkClient client, PendingTask p, CancellationToken ct)
+        {
+            if (p == null) return null;
+            var info = new PendingInfo
+            {
+                PwdId = p.PwdId, Stoken = p.Stoken, Passcode = p.Passcode,
+                Fid = p.Fid, Token = p.Token, FromShare = p.FromShare,
+                Dest = p.Dest, Size = p.Size,
+                SourceFid = p.SourceFid, SourceName = p.SourceName,
+                StartFid = p.StartFid, ShareRelDir = p.ShareRelDir,
+            };
+            string url = await TryFallbackToShareSourceAsync(client, info, ct).ConfigureAwait(false);
+            // 把回填结果同步回 PendingTask，调用方后续用得到
+            p.Fid = info.Fid; p.Token = info.Token; p.Stoken = info.Stoken;
+            p.FromShare = info.FromShare;
+            return url;
         }
 
 
@@ -9255,6 +9668,84 @@ namespace GeZi
 
         /// <summary>当前是否有下载批次在跑。用于阻止"运行中重建 scheduler"这类危险操作。</summary>
         private volatile bool _batchRunning;
+
+        /// <summary>
+        /// 本次下载批次的起点（UTC）。用于状态栏显示"已耗时"。
+        ///
+        /// <para>【2026-10-22 用户要求】「耗时是每次推送任务到下载完成用时多少，
+        /// 不是累加的」——
+        /// 所以口径是**一批任务从推送到全部完成**的用时：
+        /// 每推一批就重新计时，批次结束（全部完成/取消）后停表并把结果留住。</para>
+        ///
+        /// <para>【为什么不是"会话累加"】累加的话，续传/重试/追加新文件都会把时间越滚越长，
+        /// 完全看不出"这批到底下了多久"。</para>
+        /// </summary>
+        private DateTime? _batchStartTime;
+
+        /// <summary>上一批完成时的用时（保留显示，直到下一批开始）。</summary>
+        private TimeSpan? _lastBatchElapsed;
+
+        /// <summary>
+        /// 本批任务在**开始时**已经下载的字节数（用来算本批实际新增了多少）。
+        ///
+        /// <para>⚠️ 【2026-10-22 修】平均速度算错（显示 200MB/s，实际只有 1MB/s）：
+        /// 分子原来用 <c>_tasks.Sum(t =&gt; t.Done)</c> —— 那是**所有任务的历史累计**
+        /// （含之前几批早已下完的文件），分母却只有本批耗时 → 分子远大于分母对应的量。
+        /// 现在改成"本批的**增量**"：本批结束时的累计值减去本批开始时的累计值。</para>
+        /// </summary>
+        private long _batchDoneAtStart;
+
+        /// <summary>已耗时文本（如「耗时 12 分 30 秒」）。</summary>
+        private string FormatElapsedTotal()
+        {
+            try
+            {
+                if (_batchStartTime != null)
+                {
+                    var span = DateTime.UtcNow - _batchStartTime.Value;
+                    return "耗时 " + TaskItem.FormatEta(span.TotalSeconds);
+                }
+                if (_lastBatchElapsed != null)
+                {
+                    return "耗时 " + TaskItem.FormatEta(_lastBatchElapsed.Value.TotalSeconds);
+                }
+                return "";
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// 本批的**平均速度**（本批新增字节 ÷ 本批耗时）。
+        ///
+        /// <para>【2026-10-22 用户要求】「总速度之类的可以一直保留，
+        /// 没必要过几秒就消失了」—— 全部下载完、实时速度归零之后，
+        /// 用这个平均值顶上，状态栏就一直有信息可看。</para>
+        ///
+        /// <para>⚠️ 分子必须是**本批新增**的字节数，不能用全部任务的累计 Done ——
+        /// 否则会把之前几批早已下完的体积也算进来，算出几百 MB/s 的假速度。</para>
+        /// </summary>
+        private string FormatAverageSpeed()
+        {
+            try
+            {
+                TimeSpan? span = _batchStartTime != null
+                    ? (TimeSpan?)(DateTime.UtcNow - _batchStartTime.Value)
+                    : _lastBatchElapsed;
+                if (span == null || span.Value.TotalSeconds < 0.5) return "—";
+
+                // ⚠️ 分子必须是**本批新增**的字节数。
+                // 用全部任务的累计 Done 会把之前几批早已下完的体积算进来
+                // （用户实测：显示 200MB/s，实际平均只有 1MB/s）。
+                long nowDone = _tasks.Sum(t => t.Done);
+                long bytes = nowDone - _batchDoneAtStart;
+                if (bytes <= 0) return "—";
+
+                double avg = (double)bytes / span.Value.TotalSeconds;
+                if (avg < 1) return "—";
+                return Util.FormatSize((long)avg) + "/s";
+            }
+            catch { return "—"; }
+        }
 
         private void OnBrowseOutDir(object sender, RoutedEventArgs e)
         {

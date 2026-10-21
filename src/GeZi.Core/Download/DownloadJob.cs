@@ -162,6 +162,33 @@ namespace GeZi.Core.Download
         /// </summary>
         public string GroupName { get; set; }
 
+        // ==================== 转存副本失效 → 回退免转存（2026-10-22 新增） ====================
+        //
+        // 【问题背景】用户实测反馈：某个转存下载的文件，因为把网盘里的中转副本删了，
+        // 续传就再也拿不到直链（"file not found"），而**分享里的源文件明明还在**。
+        //
+        // 【根因】「转存」路径下 <see cref="Fid"/> 记的是**转存副本**的 fid
+        // （用户网盘里的那份），不是分享里的源文件 fid。副本被删 → fid 失效 → 死路一条。
+        //
+        // 【修法】额外记下**源文件**的定位信息：
+        //   · <see cref="SourceFid"/>  —— 分享内源文件的 fid（免转存路径下 == <see cref="Fid"/>）；
+        //   · <see cref="SourceName"/> —— 源文件名（源 fid 也找不到时按名字兜底定位）。
+        // 续传取链失败时，先试源 fid；再不行就在分享里**按文件名**找源文件，
+        // 拿到新的 share_fid_token 后走免转存取链 —— 这样"副本被删"也能继续下。
+
+        /// <summary>
+        /// 分享内**源文件**的 fid（不是转存副本的 fid）。
+        /// 免转存路径下与 <see cref="Fid"/> 相同；转存路径下是分享里的原始 fid。
+        /// 为空表示没有额外信息（旧版任务没有这个字段）。
+        /// </summary>
+        public string SourceFid { get; set; }
+
+        /// <summary>
+        /// 分享内源文件的**文件名**（转存路径下用；源 fid 也找不到时按名字定位）。
+        /// 为空表示没有额外信息。
+        /// </summary>
+        public string SourceName { get; set; }
+
         /// <summary>目标文件完整路径。</summary>
         public string Dest { get; set; }
         /// <summary>文件总大小（0 = 未知）。</summary>

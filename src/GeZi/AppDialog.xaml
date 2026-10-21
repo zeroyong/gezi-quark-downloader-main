@@ -90,6 +90,16 @@
                       HorizontalAlignment="Right" Margin="20,16,20,0"
                       Style="{StaticResource AppCheckBox}"/>
 
+            <!-- 倒计时提示行（2026-10-22 新增）
+                 用于「完成后关机」这类需要"等一会儿就自动继续"的确认：
+                 倒计时走完后自动点默认按钮，用户什么都不做也会继续。
+                 默认折叠，只有调用方要求倒计时时才出现。 -->
+            <TextBlock x:Name="CountdownText" Grid.Row="2"
+                       Visibility="Collapsed" TextWrapping="Wrap"
+                       Margin="20,14,20,0" FontSize="12"
+                       Foreground="{DynamicResource TextTertiaryBrush}"
+                       VerticalAlignment="Center"/>
+
             <!-- 按钮区 -->
             <StackPanel x:Name="ButtonRow" Grid.Row="3" Orientation="Horizontal"
                         HorizontalAlignment="Right" Margin="20,20,20,18">

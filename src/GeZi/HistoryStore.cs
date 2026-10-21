@@ -392,6 +392,15 @@ namespace GeZi
         /// <summary>文件相对分享根目录的路径（stoken 过期后重新下钻用，2026-10-20 新增）。</summary>
         [DataMember(Order = 19)] public string ShareRelDir { get; set; }
 
+        /// <summary>
+        /// 分享内**源文件**的 fid（不是转存副本的 fid）。2026-10-22 新增。
+        /// <para>转存路径下中转副本被删后，靠它（或 <see cref="SourceName"/>）回退免转存。</para>
+        /// </summary>
+        [DataMember(Order = 20)] public string SourceFid { get; set; }
+
+        /// <summary>分享内源文件的文件名（源 fid 也失效时按名字定位）。2026-10-22 新增。</summary>
+        [DataMember(Order = 21)] public string SourceName { get; set; }
+
         /// <summary>能不能"点一下就续传"——规则与 <see cref="PendingTask.CanResume"/> 一致。</summary>
         public bool CanResume
         {
@@ -426,6 +435,8 @@ namespace GeZi
                 GroupName = GroupName,
                 StartFid = StartFid,
                 ShareRelDir = ShareRelDir,
+                SourceFid = SourceFid,
+                SourceName = SourceName,
             };
         }
     }
@@ -483,6 +494,15 @@ namespace GeZi
 
         /// <summary>文件相对分享根目录的路径（stoken 过期后重新下钻用，2026-10-20 新增）。</summary>
         [DataMember(Order = 17)] public string ShareRelDir { get; set; }
+
+        /// <summary>
+        /// 分享内**源文件**的 fid（不是转存副本的 fid）。2026-10-22 新增。
+        /// <para>转存路径下中转副本被删后，靠它（或 <see cref="SourceName"/>）回退免转存。</para>
+        /// </summary>
+        [DataMember(Order = 18)] public string SourceFid { get; set; }
+
+        /// <summary>分享内源文件的文件名（源 fid 也失效时按名字定位）。2026-10-22 新增。</summary>
+        [DataMember(Order = 19)] public string SourceName { get; set; }
 
         /// <summary>
         /// 是否具备"可自动重取链"的完整信息。

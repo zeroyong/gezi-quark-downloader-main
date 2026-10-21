@@ -34,6 +34,25 @@ namespace GeZi
         /// </summary>
         public string TransferredFid;
 
+        // ==================== 转存副本失效 → 回退免转存（2026-10-22 新增） ====================
+        //
+        // 【问题】转存路径下 <see cref="Fid"/> 记的是**中转副本**的 fid。
+        // 用户把副本删掉后，续传就再也拿不到直链（"file not found"），
+        // 而分享里的**源文件明明还在** —— 白白下不去。
+        //
+        // 【修法】把源文件的定位信息也带下来，续传取链失败时据此回退到免转存。
+
+        /// <summary>
+        /// 分享内**源文件**的 fid。免转存路径下 == <see cref="Fid"/>；
+        /// 转存路径下是分享里的原始 fid（副本没了还能靠它找回来）。
+        /// </summary>
+        public string SourceFid;
+
+        /// <summary>
+        /// 分享内源文件的**文件名**。源 fid 也失效时按名字在分享里定位。
+        /// </summary>
+        public string SourceName;
+
         /// <summary>分享内下载用的 share_fid_token（免转存路径需要）。</summary>
         public string Token;
 
