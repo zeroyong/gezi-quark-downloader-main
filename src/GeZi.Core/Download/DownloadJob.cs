@@ -32,6 +32,14 @@ namespace GeZi.Core.Download
         public int Threads { get; set; } = 0;
 
         /// <summary>
+        /// 「转存」路径写入用户网盘的那份中转文件的 fid。
+        /// 非空时，本任务**下载完成后**由 UI 层立即清理该 fid（删文件 + 清回收站）；
+        /// 「免转存」/「我的网盘」路径为 null/空（它们的 fid 指向源文件，不能删）。
+        /// 由 UI 层在 items → jobs 转换时从 <c>DownloadItem.TransferredFid</c> 填入。
+        /// </summary>
+        public string TransferredFid { get; set; }
+
+        /// <summary>
         /// 分片数据的落盘方式。**已唯一化为 SegmentedFiles**（独立分片 + 边合并）。
         ///
         /// <para>【2026-10-20】共写同一文件（SharedFile）已物理移除：多 worker 各自 seek 写
@@ -84,12 +92,23 @@ namespace GeZi.Core.Download
         /// </summary>
         public PendingInfo Pending { get; set; }
 
-        public CancellationTokenSource Cancel { get; } = new CancellationTokenSource();
+        public CancellationTokenSource Cancel { get; private set; } = new CancellationTokenSource();
         public PauseToken Pause { get; } = new PauseToken();
 
         public void CancelJob() { try { Cancel.Cancel(); } catch { } }
         public void PauseJob() => Pause.Pause();
         public void ResumeJob() => Pause.Resume();
+
+        /// <summary>
+        /// 重试前重置：旧的 <c>Cancel</c> 在被取消/失败后已触发且不可复用，
+        /// 必须换一个新的令牌源，任务才能重新进入调度器跑起来。
+        /// 暂停令牌 <see cref="Pause"/> 是一次性、可重复 Pause/Resume 的，无需重建。
+        /// </summary>
+        public void ResetForRetry()
+        {
+            try { Cancel.Dispose(); } catch { }
+            Cancel = new CancellationTokenSource();
+        }
     }
 
     /// <summary>

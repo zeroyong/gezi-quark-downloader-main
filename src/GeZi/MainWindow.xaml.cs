@@ -123,7 +123,20 @@ namespace GeZi
         /// </summary>
         private bool _applyingSettings;
 
-        private readonly List<string> _pendingCleanupFids = new List<string>();
+        /// <summary>待清理的网盘文件：fid + 是否来自「转存」路径。</summary>
+        /// <remarks>
+        /// 只有「转存→取直链」路径才会在用户网盘里写入一份中转文件，下载完应当清理；
+        /// 「免转存」与「我的网盘」路径的 fid 指向的是分享/原文件，绝不能跟着一起删
+        /// （否则会把别人分享里的源文件、或用户自己的原文件误删）。故清理时按
+        /// <see cref="IsTransferred"/> 过滤，只删真正是我们写进去的中转件。
+        /// </remarks>
+        private sealed class CleanupEntry
+        {
+            public string Fid;
+            public bool IsTransferred;
+        }
+
+        private readonly List<CleanupEntry> _pendingCleanup = new List<CleanupEntry>();
         private readonly object _cleanupLock = new object();
         private QuarkClient _client;
 
@@ -4716,6 +4729,8 @@ namespace GeZi
                     LinkRefresher = ct => RefreshLinkAsync(item, ct),
                     // 免转存（从分享直接取链）→ 续传取不到新链，失败文案别承诺"可续传"
                     ResumeCannotRefresh = item.FromShare,
+                    // 转存路径的中转文件 fid：下载完成后立即清理
+                    TransferredFid = item.TransferredFid,
                     Pending = new PendingInfo
                     {
                         PwdId = _pwdId, Stoken = _stoken, Passcode = PassBox.Text,
@@ -5121,13 +5136,22 @@ namespace GeZi
                                 Name = batch[j].Name, Size = batch[j].Size, Url = url, RelDir = batch[j].RelDir,
                                 // 转存后要按"新 fid"取链，所以这里记的是转存后的 fid，不是分享里的
                                 Fid = newFids[j], FromShare = false,
+                                // 这份新 fid 就是用户在网盘里的中转文件，下载完应立即清理
+                                TransferredFid = newFids[j],
                             });
                         else
                             Log("无直链: " + batch[j].Name);
                     }
                 }
+                // 只有「转存」路径才在用户网盘里写了一份中转文件，下载完应当清理。
+                // 这里先记进兜底队列（批结束再清一次），作为"单文件完成即清"的备份 ——
+                // 万一某个任务的完成回调因异常没跑到，也不至于让中转文件永久残留。
+                // newFids 来自 _client.SaveShareAndGetFidsAsync（转存），天然是中转件。
                 lock (_cleanupLock)
-                    _pendingCleanupFids.AddRange(newFids);
+                {
+                    foreach (var f in newFids)
+                        _pendingCleanup.Add(new CleanupEntry { Fid = f, IsTransferred = true });
+                }
             }
             return items;
         }
@@ -6088,23 +6112,47 @@ namespace GeZi
             }
         }
 
+        /// <summary>
+        /// 清理「一个」转存来源的中转文件：删文件 + 清回收站。
+        /// 供「下载完成即清理单个文件」与「批结束兜底清理」共用。
+        /// </summary>
+        private async Task CleanupOneAsync(string fid)
+        {
+            if (string.IsNullOrEmpty(fid) || _client == null || !_settings.AutoClean)
+                return;
+            var fids = new List<string> { fid };
+            await _client.DeleteAsync(fids);
+            await _client.PurgeRecycleAsync(fids);
+            Log("已清理网盘转存文件 1 个");
+        }
+
         private async Task CleanupTransferredAsync()
         {
-            List<string> fids;
+            List<CleanupEntry> all;
             lock (_cleanupLock)
             {
-                if (_pendingCleanupFids.Count == 0)
+                if (_pendingCleanup.Count == 0)
                     return;
-                fids = new List<string>(_pendingCleanupFids);
-                _pendingCleanupFids.Clear();
+                all = new List<CleanupEntry>(_pendingCleanup);
+                _pendingCleanup.Clear();
             }
+
+            // 只清「转存」路径写进网盘的中转文件；分享源文件/用户原文件绝不碰。
+            var fids = all.Where(e => e.IsTransferred && !string.IsNullOrEmpty(e.Fid))
+                         .Select(e => e.Fid).Distinct().ToList();
+            if (fids.Count == 0)
+                return;
+
             if (!_settings.AutoClean)
             {
                 Log("已保留网盘转存文件 " + fids.Count + " 个（可在设置里关闭自动清理）");
                 return;
             }
             if (_client == null)
+            {
+                Log("未登录（_client 为空），跳过清理 " + fids.Count + " 个转存文件；稍后重新登录会自动清理。");
                 return;
+            }
             try
             {
                 await _client.DeleteAsync(fids);
@@ -6113,7 +6161,9 @@ namespace GeZi
             }
             catch (Exception ex)
             {
-                Log("清理转存文件失败（不影响下载）: " + ex.Message);
+                // 清理失败不能影响下载，但必须如实告诉用户，否则会以为已删其实没删。
+                Log("⚠️ 清理转存文件失败（不影响下载，请稍后到网盘手动删除中转文件夹）："
+                    + ex.Message);
             }
         }
 
@@ -6176,6 +6226,27 @@ namespace GeZi
                     : u.State == JobState.Failed ? "失败" : "已取消";
                 long sizeBytes = item.Total > 0 ? item.Total : item.Done;
                 HistoryStore.AddHistory(item.Name, Util.FormatSize(sizeBytes), item.Job.Dest, status);
+            }
+
+            // ---- 下载完成即清理对应的转存文件 ----
+            // 【用户要求】下载完一个文件就立刻删掉网盘里那份中转文件，而不是等整批结束。
+            // 这样即使中途关程序/崩溃，也已下载完的文件不会残留中转件。
+            // 只清本任务自己的 TransferredFid（转存路径才有；免转存/我的网盘为 null）。
+            if (u.State == JobState.Completed && !string.IsNullOrEmpty(item.Job.TransferredFid))
+            {
+                string fid = item.Job.TransferredFid;
+                item.Job.TransferredFid = null;   // 防重复清理
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await CleanupOneAsync(fid);
+                        // 从兜底队列里摘掉，避免批结束又删一次（其实再删一次也无害，只是省一次请求）
+                        lock (_cleanupLock)
+                            _pendingCleanup.RemoveAll(e => e.Fid == fid);
+                    }
+                    catch { /* 单文件清理失败不阻塞 UI，批结束还有兜底 */ }
+                });
             }
 
             // ---- 未完成任务记录：仅在状态集合发生变化时同步（避免每帧进度都写盘）----
@@ -7117,6 +7188,14 @@ namespace GeZi
 
                 bool isVideo = MediaProbe.IsVideo(dest);
                 TaskOpenMenuItem.Header = isVideo ? "播放文件" : "打开文件";
+
+                // 「重试」只在任务终态（失败/已取消，含网络停滞中止）出现：
+                // 这类任务分片还在，重新入队即可续传，不需要重新解析分享。
+                if (TaskRetryMenuItem != null)
+                    TaskRetryMenuItem.Visibility =
+                        (item != null && (item.State == JobState.Failed || item.State == JobState.Cancelled))
+                            ? System.Windows.Visibility.Visible
+                            : System.Windows.Visibility.Collapsed;
             }
             catch { }
         }
@@ -7129,6 +7208,20 @@ namespace GeZi
         private void OnTaskResume(object sender, RoutedEventArgs e)
         {
             foreach (var t in TasksFromMenu(sender)) ResumeTask(t);
+        }
+
+        /// <summary>
+        /// 任务右键「重试」：针对**失败 / 已取消（含网络停滞中止）**的任务，
+        /// 分片还在本地，重新入队即可续传，不需要重新解析分享。
+        /// 【用户原话】「网络停滞……而且为什么无法重试下载」—— 此前菜单里根本没「重试」入口。
+        /// </summary>
+        private void OnTaskRetry(object sender, RoutedEventArgs e)
+        {
+            foreach (var t in TasksFromMenu(sender))
+            {
+                if (t.State == JobState.Failed || t.State == JobState.Cancelled)
+                    RetryTask(t);
+            }
         }
 
         /// <summary>
@@ -7166,6 +7259,38 @@ namespace GeZi
             {
                 Log("该任务当前状态不可暂停（" + t.StatusText + "）");
             }
+        }
+
+        /// <summary>
+        /// 重试单个失败/取消任务：本地分片还在，重置状态后重新入队续传。
+        /// · Dormant（程序重启后从快照恢复的行）：走与「恢复」相同的重新取链续传流程；
+        /// · 非 Dormant（本次会话内失败/取消）：重置令牌直接重跑同一 job，分片自然续传。
+        /// </summary>
+        private void RetryTask(TaskItem t)
+        {
+            if (t == null) return;
+            if (t.State != JobState.Failed && t.State != JobState.Cancelled)
+            {
+                Log("该任务当前状态不可重试（" + t.StatusText + "）");
+                return;
+            }
+
+            // 重启恢复的占位行：重新取链续传（与 ResumeTask 的 Dormant 分支一致）
+            if (t.Dormant)
+            {
+                ResumeTask(t);
+                return;
+            }
+
+            // 本次会话内失败/取消：旧 CTS 已触发不可复用，重置后才能再跑
+            t.Job.ResetForRetry();
+            t.Error = "";
+            t.HistoryRecorded = false;   // 允许重试成功后再记一条历史
+            t.PauseRequested = false;
+            t.Speed = 0;
+            t.State = JobState.Queued;   // 先挂牌「排队中」，RunJobs 会改为「下载中」
+            Log("正在重试: " + t.Name + "（已下载部分会续传）");
+            RunJobs(new List<DownloadJob> { t.Job });
         }
 
         /// <summary>恢复单个任务（右键菜单与行内按钮共用）。</summary>

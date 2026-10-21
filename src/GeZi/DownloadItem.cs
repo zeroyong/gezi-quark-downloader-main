@@ -27,6 +27,13 @@ namespace GeZi
         /// <summary>文件在网盘/分享里的 fid。直链过期时需要它去重新取链。</summary>
         public string Fid;
 
+        /// <summary>
+        /// 「转存」路径写入用户网盘的那份中转文件的 fid。
+        /// 下载完成后应立即清理的就是它；「免转存」/「我的网盘」路径此字段为 null/空
+        /// （那些 fid 指向分享源文件或用户原文件，绝不能删）。
+        /// </summary>
+        public string TransferredFid;
+
         /// <summary>分享内下载用的 share_fid_token（免转存路径需要）。</summary>
         public string Token;
 

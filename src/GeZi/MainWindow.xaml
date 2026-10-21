@@ -1294,6 +1294,7 @@
                                     <ContextMenu Opened="OnTaskMenuOpened">
                                         <MenuItem Header="暂停" Click="OnTaskPause"/>
                                         <MenuItem Header="恢复" Click="OnTaskResume"/>
+                                        <MenuItem x:Name="TaskRetryMenuItem" Header="重试" Click="OnTaskRetry" Visibility="Collapsed"/>
                                         <MenuItem Header="取消" Click="OnTaskCancel"/>
                                         <Separator Style="{StaticResource MenuSeparator}"/>
                                         <!-- 文案随文件格式变化：「播放文件」（视频，用 VLC）/「打开文件」（其它，系统默认程序）。

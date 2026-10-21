@@ -46,6 +46,16 @@ namespace GeZi.Core.Download
         public const int MinPerFile = 4;
 
         /// <summary>
+        /// 小文件（小于 <see cref="SmallFileThreshold"/>）的连接数封顶。
+        /// 【用户要求】小文件没必要按设置里的单文件并发来开，5 路一般就足够，
+        /// 开太多只会增加建连/握手开销、还可能把账号总连接额度占满拖累大文件。
+        /// </summary>
+        public const int SmallFileCap = 5;
+
+        /// <summary>小于此值的文件视为「小文件」，连接数封顶到 <see cref="SmallFileCap"/>。</summary>
+        public const long SmallFileThreshold = 50L * 1024 * 1024;   // 50MB
+
+        /// <summary>
         /// 按大小比例分配线程数，返回与入参等长的数组。
         /// </summary>
         /// <param name="sizes">每个任务的文件字节数（未知填 0 或负数）。</param>
@@ -82,9 +92,23 @@ namespace GeZi.Core.Download
             var result = new int[n];
             if (n == 0) return result;
 
+            // 小文件特例：无论单文件还是多文件，只要 < SmallFileThreshold，
+            // 连接数封顶到 SmallFileCap（仍不低于 minPerFile）。用户原话：
+            // 「对于小于 50MB 的文件没必要按设置里的来，5 个线程一般就足够了」。
+            // 这样小文件不会被开 512 路连接去抢几片数据（光握手就亏），
+            // 也能把账号总连接额度留给真正需要的大文件。
+            bool SmallFileCapHit(long size) => size > 0 && size < SmallFileThreshold;
+            int CapFor(long size)
+            {
+                int c = SmallFileCapHit(size) ? Math.Min(cap, SmallFileCap) : cap;
+                if (c < minPerFile) c = minPerFile;
+                return c;
+            }
+
             if (n == 1)
             {
-                result[0] = cap;             // 单文件：保持原行为
+                // 单文件：小文件封顶、否则给满 cap
+                result[0] = CapFor(sizes[0]);
                 return result;
             }
 
@@ -112,7 +136,8 @@ namespace GeZi.Core.Download
                 double share = sizes[i] > 0 ? effBudget * ((double)sizes[i] / total) : 0;
                 int t = (int)Math.Round(share);
                 if (t < minPerFile) t = minPerFile;   // 下限：小文件也要下得动
-                if (t > cap) t = cap;                 // 上限：不超过用户设的单文件档位
+                int fileCap = CapFor(sizes[i]);        // 小文件封顶到 SmallFileCap
+                if (t > fileCap) t = fileCap;          // 上限：小文件≤5、大文件≤用户档位
                 result[i] = t;
             }
 
