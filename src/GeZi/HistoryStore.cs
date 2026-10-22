@@ -124,28 +124,60 @@ namespace GeZi
             }
         }
 
+        /// <summary>
+        /// 读不出 state.json 时**不返回空表**，而是返回 null。
+        ///
+        /// <para><b>【2026-10-22 修复的数据丢失】</b>用户实测：打包脚本把程序目录整个
+        /// 删掉重建（连带删掉迁移过来的 state.json），随后程序退出时
+        /// <see cref="MainWindow.SaveTaskListNow"/> 调 <see cref="SetTasks"/> ——
+        /// 而 <see cref="SetTasks"/> 是「Load() → 改 → Save()」：
+        /// Load() 发现文件没了就返回**空表**，Save() 再把这个空表**写回去**。
+        /// 于是原有的 166 条任务快照、189 条下载历史被一次"清空"覆盖，
+        /// 而且**不可恢复**（原文件已经没了）。</para>
+        ///
+        /// <para>现在：读不出来就返回 null，调用方据此**拒绝写入**，
+        /// 保住磁盘上已有的那份（哪怕它此刻也是空的，好过被反复覆盖）。
+        /// 下次启动如果文件能正常读，数据照旧恢复。</para>
+        /// </summary>
         private static State Load()
         {
             try
             {
-                if (File.Exists(StatePath))
+                if (!File.Exists(StatePath))
                 {
-                    using (var fs = File.OpenRead(StatePath))
-                    {
-                        var ser = new DataContractJsonSerializer(typeof(State));
-                        var s = ser.ReadObject(fs) as State;
-                        if (s != null)
-                        {
-                            if (s.Records == null) s.Records = new List<HistoryRecord>();
-                            if (s.Pending == null) s.Pending = new List<PendingTask>();
-                            if (s.Shares == null) s.Shares = new List<ShareHistoryEntry>();
-                            if (s.Tasks == null) s.Tasks = new List<TaskSnapshot>();
-                            return s;
-                        }
-                    }
+                    // 文件不存在 —— 可能是首次运行，也可能是被外部删掉了。
+                    // 两种情况都**不能**返回空表（会被写回去覆盖别处的数据）。
+                    return null;
+                }
+
+                using (var fs = File.OpenRead(StatePath))
+                {
+                    var ser = new DataContractJsonSerializer(typeof(State));
+                    var s = ser.ReadObject(fs) as State;
+                    if (s == null) return null;   // 反序列化出 null 也算读失败
+                    if (s.Records == null) s.Records = new List<HistoryRecord>();
+                    if (s.Pending == null) s.Pending = new List<PendingTask>();
+                    if (s.Shares == null) s.Shares = new List<ShareHistoryEntry>();
+                    if (s.Tasks == null) s.Tasks = new List<TaskSnapshot>();
+                    return s;
                 }
             }
-            catch { }
+            catch
+            {
+                // 读失败（半截 JSON / 被占用 / 权限）→ 同样不返回空表
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 只读场景用：读不到就返回一个空 State。
+        ///
+        /// <para>⚠️ <b>只给"只读"用</b>。写场景（AddHistory / SetTasks / SetPending…）
+        /// 必须自己判 <see cref="Load"/> 的返回值是不是 null ——
+        /// 读不到时<b>不能</b>拿空表去写回（那会把磁盘上已有的数据覆盖掉）。</para>
+        /// </summary>
+        private static State EmptyState()
+        {
             return new State
             {
                 Records = new List<HistoryRecord>(),
@@ -157,6 +189,7 @@ namespace GeZi
 
         private static void Save(State s)
         {
+            if (s == null) return;
             try
             {
                 string path = StatePath;
@@ -167,8 +200,55 @@ namespace GeZi
                     var ser = new DataContractJsonSerializer(typeof(State));
                     ser.WriteObject(fs, s);
                 }
-                if (File.Exists(path)) File.Delete(path);
-                File.Move(tmp, path);
+
+                // ⚠️ 【2026-10-22】原来这里是 File.Delete(path) + File.Move(tmp, path) ——
+                //   Delete 与 Move 之间**目标文件不存在**，这期间：
+                //     · 本进程自己 Load() 会拿到空表；
+                //     · 另一个进程 Load() 同样拿到空表。
+                //   而 Load() 拿到空表后，Save() 又会把空表写回去 —— 数据就没了。
+                //   改用 File.Replace：它内部是原子替换（NTFS 的 ReplaceFile），
+                //   **不存在"文件消失"的窗口期**，任何时刻读到的都是完整的一份
+                //   （旧内容或新内容）。
+                if (File.Exists(path))
+                {
+                    // 先备份旧的（覆盖之前留一份上一版），再用原子替换换上去
+                    BackupExisting(path);
+                    try { File.Replace(tmp, path, null); }
+                    catch
+                    {
+                        // 某些文件系统/权限下 Replace 会失败，退回到两步式
+                        File.Delete(path);
+                        File.Move(tmp, path);
+                    }
+                }
+                else
+                {
+                    File.Move(tmp, path);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 备份当前 state.json 到 .bak。
+        ///
+        /// <para>【2026-10-22】用户实测丢过一次数据（166 条任务 + 189 条历史）。
+        /// 根因是"读失败 → 用空表覆盖"。光靠代码不再写空表还不够 ——
+        /// 万一 state.json 真的被外部破坏（杀软隔离、磁盘错误、误删），
+        /// 至少还有一份**上一版**可以捞回来。</para>
+        ///
+        /// <para>备份用"先写 .bak.tmp 再替换"的方式，避免备份本身也是半截的。</para>
+        /// </summary>
+        private static void BackupExisting(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return;
+                string bak = path + ".bak";
+                string bakTmp = bak + ".tmp";
+                File.Copy(path, bakTmp, true);
+                if (File.Exists(bak)) File.Delete(bak);
+                File.Move(bakTmp, bak);
             }
             catch { }
         }
@@ -177,7 +257,7 @@ namespace GeZi
 
         public static List<HistoryRecord> GetHistory()
         {
-            var s = Load();
+            var s = Load() ?? EmptyState();
             var list = new List<HistoryRecord>(s.Records);
             list.Reverse();   // 新的在前
             return list;
@@ -186,7 +266,9 @@ namespace GeZi
         /// <summary>追加一条历史。超出上限时丢最旧的。</summary>
         public static void AddHistory(string name, string size, string path, string status)
         {
+            // ⚠️ 读不到就**不写** —— 拿空表写回去会覆盖掉磁盘上已有的历史。
             var s = Load();
+            if (s == null) return;
             s.Records.Add(new HistoryRecord
             {
                 Name = name,
@@ -203,6 +285,7 @@ namespace GeZi
         public static void ClearHistory()
         {
             var s = Load();
+            if (s == null) return;
             s.Records.Clear();
             Save(s);
         }
@@ -212,7 +295,7 @@ namespace GeZi
         /// <summary>解析历史：**置顶的在最前**，其余按时间倒序（新的在前）。</summary>
         public static List<ShareHistoryEntry> GetShareHistory()
         {
-            var s = Load();
+            var s = Load() ?? EmptyState();
             var list = new List<ShareHistoryEntry>(s.Shares);
             list.Reverse();   // 存储是"旧的在前"，给 UI 时翻成"新的在前"
             if (list.TrueForAll(x => !x.Pinned))
@@ -240,6 +323,7 @@ namespace GeZi
             try
             {
                 var s = Load();
+                if (s == null) return;      // 读不到就不写，别用空表覆盖
                 bool wasPinned = false;
                 for (int i = s.Shares.Count - 1; i >= 0; i--)
                 {
@@ -273,6 +357,7 @@ namespace GeZi
             try
             {
                 var s = Load();
+                if (s == null) return;
                 foreach (var e in s.Shares)
                 {
                     if (string.Equals(e.PwdId, pwdId, StringComparison.Ordinal))
@@ -290,6 +375,7 @@ namespace GeZi
             try
             {
                 var s = Load();
+                if (s == null) return;
                 for (int i = s.Shares.Count - 1; i >= 0; i--)
                 {
                     if (string.Equals(s.Shares[i].PwdId, pwdId, StringComparison.Ordinal))
@@ -303,6 +389,7 @@ namespace GeZi
         public static void ClearShareHistory()
         {
             var s = Load();
+            if (s == null) return;
             s.Shares.Clear();
             Save(s);
         }
@@ -311,7 +398,8 @@ namespace GeZi
 
         public static List<PendingTask> GetPending()
         {
-            return Load().Pending;
+            var sp = Load();
+            return sp == null ? new List<PendingTask>() : sp.Pending;
         }
 
         /// <summary>整体覆盖未完成任务列表（由 UI 在任务状态变化时调用）。</summary>
@@ -334,7 +422,8 @@ namespace GeZi
         /// <summary>取上次退出时的任务列表（按时间正序存，调用方自己决定显示顺序）。</summary>
         public static List<TaskSnapshot> GetTasks()
         {
-            return Load().Tasks;
+            var st = Load();
+            return st == null ? new List<TaskSnapshot>() : st.Tasks;
         }
 
         /// <summary>整体覆盖任务列表快照。由任务页在集合/状态变化时调用（代码里做了节流）。</summary>
