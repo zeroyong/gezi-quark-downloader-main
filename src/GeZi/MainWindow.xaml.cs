@@ -7100,22 +7100,22 @@ namespace GeZi
         private readonly HashSet<Expander> _expanderWatched = new HashSet<Expander>();
 
         /// <summary>
-        /// 当前任务列表里**所有**分组的 GroupItem 容器。
+        /// 当前任务列表里**已经生成出来**的 GroupItem 容器。
         ///
-        /// <para>🚨 【2026-10-22 血泪史，三次才修对】</para>
+        /// <para>🚨 【2026-10-22 血泪史，四次才修对】</para>
         /// <list type="number">
-        /// <item>第一版：遍历可视树 → 只找到 3 个（虚拟化下屏幕外的容器不存在）；</item>
-        /// <item>第二版：<c>ItemContainerGenerator.ContainerFromIndex(i)</c> →
-        ///       干脆返回 0 个（日志："暂时拿不到分组容器（共有 11 个分组）"），
-        ///       因为分组模式下 <c>Items</c> 里是分组对象，容器生成时序也不保证；</item>
-        /// <item>第三版（现在）：<b>关掉虚拟化 + 遍历可视树</b>。
-        ///       既然 <c>VirtualizingPanel.IsVirtualizing="False"</c>，
-        ///       所有 GroupItem 容器都已经真正实例化并挂在可视树上 ——
-        ///       实测 UI 里确实有 11 个 Expander（UIA 能枚举到），
-        ///       所以可视树遍历现在能拿全。</item>
+        /// <item>遍历可视树 → 只找到 3 个；</item>
+        /// <item><c>ContainerFromIndex</c> → 返回 0 个（日志"共有 11 个分组"）；</item>
+        /// <item>关闭虚拟化（<c>IsVirtualizing="False"</c>）→ 容器确实全生成了，
+        ///       但**布局崩了**：202 个任务只渲染 67 个、展开的分组后半段空白、
+        ///       63 个文件的文件夹只显示前几个（用户实测）。原因是
+        ///       <c>PlainListBox</c> 的 <c>CanContentScroll="True"</c>（逻辑滚动）
+        ///       跟非虚拟化面板组合会测量异常；</item>
+        /// <item>【定稿】虚拟化照旧，本方法**只返回当前已生成的容器**（可能不全），
+        ///       而"全部分组"的正确性**不依赖它** ——
+        ///       由 <see cref="OnTaskGroupItemLoaded"/> 保证（每个容器生成时自己读配置）。
+        ///       本方法只用于"批量操作后立刻同步屏幕上那几个"，拿不全也没关系。</item>
         /// </list>
-        ///
-        /// <para>⚠️ 这个方法的"拿全"依赖于 XAML 里关闭虚拟化，两者必须一起改。</para>
         /// </summary>
         private List<GroupItem> EnumerateGroupItems()
         {
@@ -7209,7 +7209,46 @@ namespace GeZi
         {
             var gi = sender as GroupItem;
             if (gi == null) return;
+            WatchGroupItemRecycling(gi);
             ApplyExpandedStateToGroup(gi);
+        }
+
+        /// <summary>
+        /// 盯住分组容器的 DataContext 变化，处理**回收复用**场景。
+        ///
+        /// <para>【为什么必须有】<c>VirtualizationMode="Recycling"</c> 下，滚动会把同一个
+        /// GroupItem 容器复用到另一个分组上 —— 此时 <c>Loaded</c> <b>不会再次触发</b>，
+        /// 新分组会白白继承上一个分组的展开状态（实测：滚动后分组状态错乱）。</para>
+        ///
+        /// <para>⚠️ <c>DataContextChanged</c> 是普通 .NET 事件、**不是** RoutedEvent，
+        /// 所以不能写在 XAML 的 EventSetter 里（会报 MC6006），
+        /// 必须用 <see cref="System.ComponentModel.DependencyPropertyDescriptor"/> 挂。</para>
+        /// </summary>
+        private void WatchGroupItemRecycling(GroupItem gi)
+        {
+            if (gi == null || !_groupItemWatched.Add(gi)) return;
+            try
+            {
+                var dpd = System.ComponentModel.DependencyPropertyDescriptor
+                    .FromProperty(FrameworkElement.DataContextProperty, typeof(GroupItem));
+                dpd.AddValueChanged(gi, OnGroupItemDataContextChanged);
+            }
+            catch { }
+        }
+
+        /// <summary>已经挂上 DataContext 监听的分组容器（避免重复挂）。</summary>
+        private readonly HashSet<GroupItem> _groupItemWatched = new HashSet<GroupItem>();
+
+        /// <summary>分组容器换了分组（回收复用）→ 重新按配置摆正展开状态。</summary>
+        private void OnGroupItemDataContextChanged(object sender, EventArgs e)
+        {
+            var gi = sender as GroupItem;
+            if (gi == null) return;
+            // 推到布局之后：此刻模板里的 Expander 才真正对上新的分组
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                try { ApplyExpandedStateToGroup(gi); } catch { }
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
         }
 
         /// <summary>
@@ -7965,7 +8004,16 @@ namespace GeZi
             // 重启恢复的占位行：重新取链续传（与 ResumeTask 的 Dormant 分支一致）
             if (t.Dormant)
             {
-                ResumeTask(t);
+                // ⚠️ 注意别再回到 ResumeTask：ResumeTask 的失败分支现在会调用本方法，
+                //   两边互相调用会无限递归。这里直接走 Dormant 的续传逻辑。
+                var pend = BuildPendingTask(t);
+                if (pend == null)
+                {
+                    Log("这个任务缺少续传信息，无法继续；请重新解析分享后再下载（分片在，会自然续传）。");
+                    return;
+                }
+                Log("正在为「" + t.Name + "」重新取链……");
+                _ = ResumePendingBatchAsync(new List<PendingTask> { pend });
                 return;
             }
 
@@ -8012,6 +8060,28 @@ namespace GeZi
                 t.Job.ResumeJob();
                 t.State = JobState.Downloading;
                 Log("已恢复: " + t.Name);
+            }
+            else if (t.State == JobState.Failed || t.State == JobState.Cancelled)
+            {
+                // 🚨 【2026-10-22 修】失败/已取消也要能用 ▶ 恢复。
+                //
+                // 【缺陷】原先这里只有上面 Paused 一个分支，失败任务落进下面的 else，
+                //   只打一句「该任务当前状态不可恢复（失败）」就结束 ——
+                //   用户看到行内明明有个 ▶ 按钮，点了却什么都没发生。
+                //   实测截图里四个「网络停滞已中止」的任务就卡在这里：
+                //   它们的 Message 明确写着「已保留断点，降低线程数后重试可续传」，
+                //   也就是**本来就能续传**，只是这个入口没实现。
+                //
+                // 【为什么之前没被发现】「全部恢复」走的是 OnResumeAll，那边
+                //   已经正确处理了 Failed/Cancelled（转 Queued 再重新取链），
+                //   所以只有**单个任务的 ▶** 是坏的 —— 不点全部恢复就永远撞不上。
+                //
+                // 【做法】与 OnResumeAll 完全一致，走「重新取链 → 续传」：
+                //   旧直链带时效签名早已过期，直接重跑旧 job 必然立刻再失败；
+                //   重新取链还能顺带触发「中转副本没了 → 回退到分享源文件」的自愈。
+                //   分片还在磁盘上，新 job 用同一个 Dest，自然续传不重下。
+                RetryTask(t);
+                Log("重新开始: " + t.Name);
             }
             else
             {

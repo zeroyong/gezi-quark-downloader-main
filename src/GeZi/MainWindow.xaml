@@ -1233,21 +1233,31 @@
                         <Grid Grid.Row="2">
                             <!-- 任务列表原来是默认的 SelectionMode=Single（根本多选不了），
                                  改成 Extended + 同一套 Shift 处理，和文件列表行为一致。 -->
-                            <!-- 【2026-10-22 修】分组时**彻底关闭**虚拟化。
-                                 ⚠️ 只写 IsVirtualizingWhenGrouping="False" 是**不够的**：
-                                    那个属性只表示"分组时不要走分组虚拟化特例"，
-                                    列表本体照样虚拟化 → 屏幕外的分组容器**根本不生成**
-                                    → 「全部收起」拿不到容器，用户实测点了没反应
-                                    （日志："暂时拿不到分组容器（共有 11 个分组）"）。
-                                    真正关掉虚拟化必须显式写 IsVirtualizing="False"。
-                                 成本可以接受：分组数量有限（一个下载目录顶多几十个文件夹），
-                                 而"每个分组都能被统一控制、状态能记忆"是明确需求。
-                                 组内的任务行数量也一样有限，不会因为容器全生成而卡。 -->
+                            <!-- 【2026-10-22 定稿，别动这两个属性】
+                                 这里曾经为了"让『全部收起』拿到所有分组容器"而改过两次，
+                                 两次都把渲染改坏了，务必记住结论：
+
+                                 ❌ VirtualizingPanel.IsVirtualizing="False"
+                                    后果：布局崩。202 个任务只渲染 67 个、
+                                          展开的分组后半段空白、
+                                          63 个文件的文件夹只显示前几个。
+                                    原因：PlainListBox 里 CanContentScroll="True"
+                                          （逻辑滚动）与非虚拟化面板组合测量异常。
+
+                                 ❌ IsVirtualizingWhenGrouping="False"
+                                    后果：同为 WPF 分组虚拟化的测量缺陷，
+                                          收起的文件夹会凭空消失。
+
+                                 ✅ 保持 IsVirtualizingWhenGrouping="True"
+                                    （= 原来的行为，渲染一直是好的）。
+                                    "全部收起/展开"**不靠**枚举容器来实现：
+                                    它把结果写进配置，容器生成/复用时会自己读配置摆正
+                                    （见 MainWindow.OnTaskGroupItemLoaded）。
+                                    所以拿不到屏幕外的容器**不影响正确性**。 -->
                             <ListBox x:Name="TaskList" SelectionMode="Extended"
                                      Style="{StaticResource PlainListBox}"
                                      ItemContainerStyle="{StaticResource TaskListItem}"
-                                     VirtualizingPanel.IsVirtualizing="False"
-                                     VirtualizingPanel.IsVirtualizingWhenGrouping="False"
+                                     VirtualizingPanel.IsVirtualizingWhenGrouping="True"
                                      SelectionChanged="OnTaskSelectionChanged"
                                      PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
                                      PreviewMouseMove="OnTaskListMouseMove"
@@ -1264,13 +1274,12 @@
                                         <GroupStyle.ContainerStyle>
                                             <Style TargetType="{x:Type GroupItem}">
                                                 <Setter Property="Margin" Value="0,0,0,10"/>
-                                                <!-- 【2026-10-22】分组容器一生成就按配置里的
-                                                     "已收起列表"设置展开状态。
-                                                     ⚠️ 必须挂在 GroupItem 的 Loaded 上，而不是靠
-                                                     "启动时一次性遍历所有容器" —— 虚拟化下屏幕外的
-                                                     容器是滚动时才生成的，遍历必然漏（曾经 11 个只找到 3 个）。
-                                                     挂 Loaded 之后，**任何一个**分组无论何时生成，
-                                                     都会立刻读到正确的展开状态。 -->
+                                                <!-- 【2026-10-22】分组容器生成时按配置摆正展开状态。
+                                                     ⚠️ 容器**回收复用**的情况（VirtualizationMode=Recycling
+                                                    下 Loaded 不再触发）由代码里的 DataContext 监听补上，
+                                                    见 MainWindow.WatchGroupItemRecycling。
+                                                     两者都**不能**换成"启动时一次性遍历所有容器" ——
+                                                     虚拟化下屏幕外的容器根本没生成，遍历必漏。 -->
                                                 <EventSetter Event="Loaded" Handler="OnTaskGroupItemLoaded"/>
                                                 <Setter Property="Template">
                                                     <Setter.Value>

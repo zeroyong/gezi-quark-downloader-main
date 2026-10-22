@@ -1260,6 +1260,60 @@
     </Style>
 
     <!-- ============================================================
+         悬浮提示（ToolTip）—— 全局隐式样式
+         ============================================================
+         【2026-10-22】用户反馈：「把应用所有悬浮文字展示自定义一下，
+         比如暗黑主题就用对应颜色，现在白色比较刺眼」。
+
+         🚨 根因：全局**从来没有**定义 ToolTip 样式，于是所有 63 处
+            ToolTip（XAML 49 处 + 代码 14 处）都落到 WPF 的**系统默认外观**：
+            亮白色底 + 纯黑字，且**完全不跟随主题**。暗色界面上弹出纯白方块，
+            在暗环境里非常刺眼。
+
+         ✅ 解法：定义一个**隐式样式**（TargetType 带类型、不带 x:Key）——
+            它会自动作用于全应用每一个 ToolTip，**不需要**去改那 63 处调用点。
+            这与上面 ContextMenu / MenuItem / Separator 的做法一致。
+
+         ⚠️ 颜色必须全部用 DynamicResource 引用主题令牌：
+            主题切换（ThemeManager 只替换 Colors 字典）时才能跟着变。
+            若写成 StaticResource 或硬编码色值，切主题后提示框会停在旧配色 ——
+            这正是本次要修的问题本身。
+
+         ⚠️ 不能加 DropShadowEffect：原因见下面「右键菜单」注释 ——
+            Popup 会裁掉阴影，只留下四角灰印。这里用 1px 描边表达层次。
+    -->
+    <Style TargetType="ToolTip">
+        <!-- 深色主题下 SurfaceAlt(#282D36) 比卡片 Surface(#22262E) 略亮 →
+             浮层"浮"在卡片之上，符合深色界面靠明度分层的原则。
+             亮色主题下同理（比白卡片略灰），两套主题都自然。 -->
+        <Setter Property="Background" Value="{DynamicResource SurfaceAltBrush}"/>
+        <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrushStrong}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="Padding" Value="9,6"/>
+        <Setter Property="FontFamily" Value="{StaticResource AppFontFamily}"/>
+        <Setter Property="FontSize" Value="12.5"/>
+        <Setter Property="FontWeight" Value="Normal"/>
+        <Setter Property="HasDropShadow" Value="False"/>
+        <!-- 允许换行：部分提示带 App 名/快捷键等较长文本，不应被拉成一行超长条 -->
+        <Setter Property="MaxWidth" Value="420"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ToolTip">
+                    <Border Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="8"
+                            Padding="{TemplateBinding Padding}"
+                            SnapsToDevicePixels="True">
+                        <ContentPresenter VerticalAlignment="Center"/>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ============================================================
          右键菜单。
         🚫 **这里刻意不加 DropShadowEffect。**
         曾经在模板的最外层 Border 上加过 BlurRadius=16 / Opacity=0.16 的阴影，
