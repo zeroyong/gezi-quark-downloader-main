@@ -6417,10 +6417,129 @@ namespace GeZi
         /// 未完成的一律先显示成「已暂停」并**标记为 Dormant**：它们没有挂到调度器上，
         /// 点 ▶ 才走"重新取链 → 续传"（见 ResumeTask 的 Dormant 分支）。
         /// </summary>
+        /// <summary>
+        /// 用旧版的「下载历史」（<see cref="HistoryRecord"/>）反推任务快照。
+        ///
+        /// <para>【为什么需要】任务快照 <c>Tasks</c> 是 2.6 才引入的字段。
+        /// v2.3.1 之类的老版本 <c>state.json</c> 里只有
+        /// <c>Records</c> / <c>Pending</c> / <c>Shares</c>，没有 <c>Tasks</c> ——
+        /// 直接升级会看到「暂无下载任务」，用户以为历史丢了。</para>
+        ///
+        /// <para>【能补出什么】<c>Records</c> 字段有限（名称 / 路径 / 大小 /
+        /// 状态 / 时间），没有 fid 与直链，所以补出来的行：
+        /// <list type="bullet">
+        /// <item>一律标 <c>Completed</c>：这些文件本来就已经下完躺在磁盘上，
+        ///       用户要的是「看得见、能打开、能删除」；</item>
+        /// <item>不带 Url / Fid / Token —— 直链早就过期，带着反而会误导
+        ///       （点了恢复会拿一条死链去取）；</item>
+        /// <item>跳过路径已经不存在的条目：历史里可能有用户早已删掉的文件，
+        ///       补成任务行只会让人以为"下了一半"。</item>
+        /// </list></para>
+        /// </summary>
+        private List<TaskSnapshot> BuildTaskSnapshotsFromRecords()
+        {
+            var list = new List<TaskSnapshot>();
+            List<HistoryRecord> records;
+            try { records = HistoryStore.GetHistory(); }
+            catch { return list; }
+            if (records == null || records.Count == 0) return list;
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in records)
+            {
+                if (r == null) continue;
+                // 没有本地路径就无法对应到任务行（任务行必须有 Dest）
+                if (string.IsNullOrWhiteSpace(r.Path)) continue;
+                if (!seen.Add(r.Path)) continue;          // 同一路径只补一条
+
+                long size = ParseSizeText(r.Size);
+                // 文件已经不在磁盘上的历史，补成任务行没有意义（点了也打不开），
+                // 但它仍留在「下载历史」里，不丢信息。
+                bool exists = false;
+                try { exists = File.Exists(r.Path); } catch { }
+                if (!exists) continue;
+
+                list.Add(new TaskSnapshot
+                {
+                    Name = r.Name ?? Path.GetFileName(r.Path),
+                    Dest = r.Path,
+                    Size = size,
+                    Done = size,                  // 已下完，进度 100%
+                    State = "Completed",
+                    Error = "",
+                    FromShare = false,
+                    Segmented = true,
+                    Time = r.Time,
+                    GroupName = "",               // 让界面按"未知文件夹"归组
+                    RelDir = "",
+                    ShareRelDir = "",
+                });
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// 把历史记录里的显示文本（"586.60 KB" / "1.23 GB"）解析成字节数。
+        ///
+        /// <para>⚠️ 必须按 <b>1000 进制</b> 解析 —— 与 <see cref="Util.FormatSize"/>
+        /// 的输出保持一致（那里用的是 1000 而非 1024，见其注释：
+        /// 夸克分享页与本地显示必须同口径，否则用户以为少下了）。</para>
+        /// </summary>
+        private static long ParseSizeText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return 0;
+            var m = System.Text.RegularExpressions.Regex.Match(
+                text.Trim(), @"^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGTP]?)B?\s*$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!m.Success) return 0;
+
+            double v;
+            if (!double.TryParse(m.Groups[1].Value,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out v))
+                return 0;
+
+            switch (m.Groups[2].Value.ToUpperInvariant())
+            {
+                case "K": v *= 1000L; break;
+                case "M": v *= 1000L * 1000L; break;
+                case "G": v *= 1000L * 1000L * 1000L; break;
+                case "T": v *= 1000L * 1000L * 1000L * 1000L; break;
+                case "P": v *= 1000L * 1000L * 1000L * 1000L * 1000L; break;
+            }
+            if (v < 0 || v > long.MaxValue) return 0;
+            return (long)v;
+        }
+
         private void RestoreTaskList()
         {
             List<TaskSnapshot> saved;
             try { saved = HistoryStore.GetTasks(); } catch { return; }
+
+            // 🚨 【2026-10-22 向下兼容】任务快照（Tasks）是 2.6 才有的字段。
+            //    老版本（如 v2.3.1）的 state.json 里**只有 Records / Pending / Shares**，
+            //    没有 Tasks —— 于是升级后任务页直接显示「暂无下载任务」，
+            //    用户以为历史全丢了（实测：16 条记录明明在 state.json 里）。
+            //
+            //    这里做一次一次性回填：Tasks 为空时，用 Records 反推快照。
+            //    Records 是「下载历史」，字段比 TaskSnapshot 少（只有名称/路径/大小/
+            //    状态/时间），所以补出来的是**只有完成态的行**：
+            //      · 已完成 → 直接标 Completed，界面上能看到、能打开、能删除；
+            //      · 其它状态 → 没有 fid/直链信息，无法续传，按 Completed 处理更诚实
+            //        （它们的文件本来就在磁盘上，用户要的是"看得见"）。
+            //    回填后**立刻落盘**，下次启动就走正常路径，不会重复回填。
+            if (saved == null || saved.Count == 0)
+            {
+                saved = BuildTaskSnapshotsFromRecords();
+                if (saved != null && saved.Count > 0)
+                {
+                    try { HistoryStore.SetTasks(saved); } catch { }
+                    Log(string.Format(
+                        "已从旧版下载历史（{0} 条）恢复任务列表 —— 这些是 v2.8.4 之前版本记录的文件。",
+                        saved.Count));
+                }
+            }
+
             if (saved == null || saved.Count == 0) return;
 
             int restored = 0, unfinished = 0;
