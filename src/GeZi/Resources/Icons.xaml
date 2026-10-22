@@ -163,6 +163,11 @@
     <!-- 「平铺」视图图标（三条横线） -->
     <Geometry x:Key="IconList">M4,7 H20 M4,12 H20 M4,17 H20</Geometry>
 
+    <!-- 【2026-10-22】「全部收起 / 全部展开」图标：上下两个尖角指向中间，
+         表示"把所有分组折叠起来"；展开时同一个按钮翻转成相反方向。 -->
+    <Geometry x:Key="IconCollapseAll">M4,6 H20 M8,10 L12,14 L16,10 M8,14 L12,18 L16,14</Geometry>
+    <Geometry x:Key="IconExpandAll">M4,18 H20 M8,14 L12,10 L16,14 M8,10 L12,6 L16,10</Geometry>
+
     <!-- 【2026-10-20】「完成后关机」图标：经典电源符号（竖线 + 缺口圆弧） -->
     <Geometry x:Key="IconShutdown">M12,3 V12 M7.5,6.5 A7,7 0 1 0 16.5,6.5</Geometry>
 

@@ -245,6 +245,24 @@ namespace GeZi
         /// </summary>
         public bool TaskUnfinishedFirst { get; set; }
 
+        /// <summary>
+        /// 任务页里**被收起**的文件夹分组名（逗号分隔，2026-10-22 新增）。
+        ///
+        /// <para>用户要求「记忆文件夹的展开和收起」—— 收起某个文件夹后重启程序，
+        /// 它应该还是收起的；下次再打开那个文件夹下载，也不该被自动展开。</para>
+        ///
+        /// <para><b>为什么存"收起的"而不是"展开的"</b>：新出现的文件夹默认应该是
+        /// **展开**的（用户刚下载完一个文件夹，理应马上看到内容）；
+        /// 存"收起的"意味着只有用户明确收过的那几个才保持收起。</para>
+        ///
+        /// <para>🚨 <b>分隔符只能用 XML 合法字符</b>。曾经用 <c>'\u0001'</c>「更安全」，
+        /// 结果 XmlSerializer 把它写成 <c>&amp;#x1;</c>，而 XML 1.0 连字符引用都禁止
+        /// C0 控制字符（U+0000–U+001F，除 \t \n \r）—— 整份 config.xml 变成非法 XML，
+        /// 下次启动读取失败，用户表现为「Cookie 没了、主题变回亮色」。
+        /// 现在改用换行符 <c>\n</c>：XML 合法，且 Windows 文件夹名里不可能出现。</para>
+        /// </summary>
+        public string TaskCollapsedGroups { get; set; }
+
         // ---------------- 下载页「上次浏览位置」（2026-10-21 新增） ----------------
         //
         // 【需求】用户反馈「每次重启启动应用，下载页都会重置，能否保留上次的浏览文件位置，
@@ -436,9 +454,30 @@ namespace GeZi
         /// <summary>上一次 Load/Save 是否踩到了异常（供 UI 提示用户设置未能持久化）。</summary>
         public static string LastError { get; private set; }
 
+        /// <summary>
+        /// 本次 Load 是否**没能读到已有配置**（文件不存在 / 读失败）。
+        ///
+        /// <para><b>【2026-10-22 修复的配置丢失】</b>用户实测：Cookie 没了、主题变回亮色、
+        /// 下载目录被改回默认值 —— 整个 config.xml 变成一份 1461 字节的**空模板**。
+        /// 根因与 <c>HistoryStore</c> 是同一个 bug 模式：
+        /// <c>Load()</c> 读不到时返回**新建的空 AppSettings</c>，
+        /// 随后任何一次 <c>Save(_settings)</c> 就把这个空对象**写回去**，
+        /// 于是登录 Cookie、主题、下载目录、线程数全被默认值覆盖。</para>
+        ///
+        /// <para>为什么这次触发：<c>package.ps1</c> 重新打包时删掉了程序目录
+        /// （连带删掉迁移过来的 config），程序退出时 <c>OnClosed</c> 走
+        /// <c>SettingsStore.Save(_settings)</c> —— 内存里那份是空对象，一写就毁。</para>
+        ///
+        /// <para>现在：读不到时<b>仍然返回可用的对象</b>（否则程序没法启动），
+        /// 但用 <see cref="LoadedExistingConfig"/> 标记出来，
+        /// 由调用方决定要不要落盘 —— <b>读不到就不写</b>，保住磁盘上已有的那份。</para>
+        /// </summary>
+        public static bool LoadedExistingConfig { get; private set; }
+
         public static AppSettings Load()
         {
             LastError = null;
+            LoadedExistingConfig = false;
             var s = new AppSettings();
             try
             {
@@ -448,7 +487,10 @@ namespace GeZi
                     {
                         var loaded = Ser.Deserialize(fs) as AppSettings;
                         if (loaded != null)
+                        {
                             s = loaded;
+                            LoadedExistingConfig = true;
+                        }
                     }
                 }
                 else
@@ -467,7 +509,10 @@ namespace GeZi
                         {
                             var loaded = Ser.Deserialize(fs) as AppSettings;
                             if (loaded != null)
+                            {
                                 s = loaded;
+                                LoadedExistingConfig = true;
+                            }
                         }
                     }
                 }
@@ -475,6 +520,7 @@ namespace GeZi
             catch (Exception ex)
             {
                 LastError = ex.Message;
+                // 读失败：LoadedExistingConfig 保持 false → 调用方不会把它写回去
             }
 
             // 兼容旧版明文 Cookie：解出来是明文就原样用，下次 Save 时会被自动加密
@@ -494,11 +540,62 @@ namespace GeZi
             return s;
         }
 
+        /// <summary>
+        /// 磁盘上的配置文件现在**能不能正常读出来**。
+        ///
+        /// <para>【2026-10-22】Save() 用它做保护：文件存在却读不出内容时，
+        /// 说明它正在被外部破坏（被杀软隔离、被截断）或者损坏 ——
+        /// 此时写回空配置会把仅存的好数据也毁掉，所以宁可这次不写。</para>
+        /// </summary>
+        private static bool CanReadConfig()
+        {
+            return CanReadFile(FilePath);
+        }
+
+        /// <summary>
+        /// 指定文件现在能不能被 <see cref="Ser"/> 正常反序列化出来。
+        ///
+        /// <para>用于两处：① 写盘前判断磁盘上那份是否已损坏；
+        /// ② 写盘后回读验证新文件是否合法 XML（见 Save 里的自检）。</para>
+        /// </summary>
+        private static bool CanReadFile(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return true;   // 本来就没有 → 视为可用
+                using (var fs = File.OpenRead(path))
+                {
+                    if (fs.Length == 0) return false;  // 空文件 = 损坏
+                    var loaded = Ser.Deserialize(fs) as AppSettings;
+                    return loaded != null;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public static void Save(AppSettings s)
         {
             LastError = null;
             if (s == null)
                 return;
+
+            // ⚠️ 【2026-10-22】**磁盘上已有配置、但这次没读出来**时，不写。
+            //   Load() 读失败（文件被外部删掉 / 半截 / 被占用）会返回一个空对象，
+            //   此时若无脑写回，就等于用空模板覆盖掉磁盘上那份好配置 ——
+            //   用户实测就是这样丢了登录 Cookie、主题和下载目录。
+            //
+            //   判据不能只看 LoadedExistingConfig（那是 Load() 时刻的状态，
+            //   Save 可能发生在别的时刻、文件状态可能已变）——
+            //   所以在这里**再看一眼磁盘**：文件存在却读不出内容 → 拒绝写。
+            //   文件本来就不存在（首次运行）→ 正常写。
+            if (File.Exists(FilePath) && !CanReadConfig())
+            {
+                LastError = "配置文件读取失败，为避免覆盖已有设置，本次未写入。";
+                return;
+            }
 
             string rawCookie = s.Cookie;   // 内存中始终明文，落盘前临时加密
             var tmpPath = FilePath + ".tmp";
@@ -518,6 +615,29 @@ namespace GeZi
                 // 下次启动 Load 直接抛异常、用户设置全丢。
                 using (var fs = File.Create(tmpPath))
                     Ser.Serialize(fs, s);
+
+                // 🚨 【2026-10-22 加了这道自检】序列化**成功**不等于写出来的 XML **合法**：
+                //   XmlSerializer 会把非法控制字符写成 &#x1; 这种字符引用，
+                //   而 XML 1.0 连字符引用都禁止 C0 控制字符 —— 文件当场变成非法 XML，
+                //   下次 Load 直接 ParseError，整份配置（Cookie / 主题 / 下载目录）全丢。
+                //   教训：曾经因为「已收起分组名」用 '\u0001' 做分隔符而整份配置报废。
+                //
+                //   所以：**写完立刻回读验证**，读不回来就中止，绝不覆盖磁盘上那份好配置。
+                if (!CanReadFile(tmpPath))
+                {
+                    try { File.Delete(tmpPath); } catch { }
+                    LastError = "序列化结果无法回读（含 XML 非法字符），本次未写入，已保留原配置。";
+                    try
+                    {
+                        if (File.Exists(FilePath))
+                        {
+                            var bak = FilePath + ".invalid-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".bak";
+                            File.Copy(FilePath, bak, true);
+                        }
+                    }
+                    catch { }
+                    return;
+                }
 
                 if (File.Exists(FilePath))
                     File.Delete(FilePath);

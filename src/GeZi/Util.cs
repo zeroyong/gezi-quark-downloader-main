@@ -38,6 +38,37 @@ namespace GeZi
             return i == 0 ? n + " B" : v.ToString("F2") + " " + units[i];
         }
 
+        /// <summary>
+        /// 去掉 XML 1.0 不允许出现的字符。
+        ///
+        /// <para>🚨 【2026-10-22 事故】<c>XmlSerializer</c> 把非法控制字符写成字符引用
+        /// <c>&amp;#x1;</c>，但 <b>XML 1.0 连字符引用都不允许出现 C0 控制字符</b>
+        /// （只有 \t \n \r 例外）。写出来的是**非法 XML**，下次读取直接 ParseError，
+        /// 于是整份配置读不出来 —— 用户看到「Cookie 没了、主题变回亮色」。</para>
+        ///
+        /// <para>之后凡是要把**用户可控字符串**（文件夹名、文件名、路径）写进
+        /// XML 序列化的配置，都要先过这里。</para>
+        /// </summary>
+        public static string StripXmlInvalid(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return s;
+            var sb = new System.Text.StringBuilder(s.Length);
+            foreach (var c in s)
+            {
+                // 合法：TAB(9) / LF(10) / CR(13) / 0x20-0xD7FF / 0xE000-0xFFFD / 0x10000-0x10FFFF
+                if (c == '\t' || c == '\n' || c == '\r')
+                {
+                    sb.Append(c);
+                    continue;
+                }
+                if (c < 0x20) continue;                 // 其余 C0 控制字符：丢弃
+                if (c >= 0xD800 && c <= 0xDFFF) continue; // 孤立代理项：丢弃
+                if (c == 0xFFFE || c == 0xFFFF) continue;
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern int SHGetKnownFolderPath(ref Guid rfid, uint dwFlags, IntPtr hToken, out string ppszPath);
 
@@ -143,12 +174,17 @@ namespace GeZi
                 Directory.CreateDirectory(destDir);
 
                 string destCfg = Path.Combine(destDir, "GeZi.config.xml");
-                if (File.Exists(destCfg))
+                // 目标已存在**且看起来是好的** → 已经迁过了，不动它。
+                // ⚠️ 【2026-10-22】判断条件不能只是 File.Exists ——
+                //   实测统一目录里的 config 曾被写成一份 1461 字节的**空模板**
+                //   （Cookie 空、主题回默认、下载目录回默认）。
+                //   那种情况下旧位置的好配置反而该搬过来。
+                if (File.Exists(destCfg) && FileLength(destCfg) > 0)
                     return;   // 已经迁过了
 
                 // ---- 配置 ----
                 string legacyCfg = Path.Combine(baseDir, "GeZi.config.xml");
-                if (File.Exists(legacyCfg))
+                if (File.Exists(legacyCfg) && FileLength(legacyCfg) > 0)
                 {
                     File.Copy(legacyCfg, destCfg, true);
                     TryMarkMigrated(legacyCfg);
@@ -187,6 +223,17 @@ namespace GeZi
             {
                 // 迁移失败不拦启动：配置会新建一份，用户重新登录即可
             }
+        }
+
+        /// <summary>文件长度（读不出来返回 0）。</summary>
+        private static long FileLength(string path)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                return fi.Exists ? fi.Length : 0;
+            }
+            catch { return 0; }
         }
 
         /// <summary>给已迁移的旧文件/目录改名（加 .migrated 后缀），便于用户确认与回退。</summary>

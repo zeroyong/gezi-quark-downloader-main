@@ -1133,6 +1133,26 @@
                                               StrokeLineJoin="Round"/>
                                     </StackPanel>
                                 </Button>
+                                <!-- 【2026-10-22】全部收起 / 全部展开。
+                                     按钮文案与图标随当前状态切换：
+                                     展开时显示「全部收起」（IconCollapseAll），
+                                     收起时显示「全部展开」（IconExpandAll）。
+                                     展开/收起状态按文件夹分组**记忆**（见
+                                     Settings.TaskCollapsedGroups）。 -->
+                                <Button x:Name="TaskCollapseAllBtn" Click="OnToggleCollapseAllGroups"
+                                        Style="{StaticResource ToolButton}" Margin="0,0,8,0"
+                                        AutomationProperties.Name="全部收起或展开">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock x:Name="TaskCollapseAllText" Text="全部收起"
+                                                   VerticalAlignment="Center"/>
+                                        <Path x:Name="TaskCollapseAllIcon" Data="{StaticResource IconCollapseAll}"
+                                              Stretch="Uniform" Width="13" Height="13" Margin="6,0,0,0"
+                                              VerticalAlignment="Center"
+                                              Stroke="{DynamicResource TextSecondaryBrush}" StrokeThickness="1.6"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                              StrokeLineJoin="Round"/>
+                                    </StackPanel>
+                                </Button>
                                 <Button x:Name="TaskSortBtn" Click="OnToggleTaskSort"
                                         Style="{StaticResource ToolButton}" Margin="0"
                                         AutomationProperties.Name="任务排序">
@@ -1213,10 +1233,21 @@
                         <Grid Grid.Row="2">
                             <!-- 任务列表原来是默认的 SelectionMode=Single（根本多选不了），
                                  改成 Extended + 同一套 Shift 处理，和文件列表行为一致。 -->
+                            <!-- 【2026-10-22 修】分组时**彻底关闭**虚拟化。
+                                 ⚠️ 只写 IsVirtualizingWhenGrouping="False" 是**不够的**：
+                                    那个属性只表示"分组时不要走分组虚拟化特例"，
+                                    列表本体照样虚拟化 → 屏幕外的分组容器**根本不生成**
+                                    → 「全部收起」拿不到容器，用户实测点了没反应
+                                    （日志："暂时拿不到分组容器（共有 11 个分组）"）。
+                                    真正关掉虚拟化必须显式写 IsVirtualizing="False"。
+                                 成本可以接受：分组数量有限（一个下载目录顶多几十个文件夹），
+                                 而"每个分组都能被统一控制、状态能记忆"是明确需求。
+                                 组内的任务行数量也一样有限，不会因为容器全生成而卡。 -->
                             <ListBox x:Name="TaskList" SelectionMode="Extended"
                                      Style="{StaticResource PlainListBox}"
                                      ItemContainerStyle="{StaticResource TaskListItem}"
-                                     VirtualizingPanel.IsVirtualizingWhenGrouping="True"
+                                     VirtualizingPanel.IsVirtualizing="False"
+                                     VirtualizingPanel.IsVirtualizingWhenGrouping="False"
                                      SelectionChanged="OnTaskSelectionChanged"
                                      PreviewMouseLeftButtonDown="OnListPreviewMouseDown"
                                      PreviewMouseMove="OnTaskListMouseMove"
@@ -1233,6 +1264,14 @@
                                         <GroupStyle.ContainerStyle>
                                             <Style TargetType="{x:Type GroupItem}">
                                                 <Setter Property="Margin" Value="0,0,0,10"/>
+                                                <!-- 【2026-10-22】分组容器一生成就按配置里的
+                                                     "已收起列表"设置展开状态。
+                                                     ⚠️ 必须挂在 GroupItem 的 Loaded 上，而不是靠
+                                                     "启动时一次性遍历所有容器" —— 虚拟化下屏幕外的
+                                                     容器是滚动时才生成的，遍历必然漏（曾经 11 个只找到 3 个）。
+                                                     挂 Loaded 之后，**任何一个**分组无论何时生成，
+                                                     都会立刻读到正确的展开状态。 -->
+                                                <EventSetter Event="Loaded" Handler="OnTaskGroupItemLoaded"/>
                                                 <Setter Property="Template">
                                                     <Setter.Value>
                                                         <ControlTemplate TargetType="{x:Type GroupItem}">
@@ -1240,7 +1279,8 @@
                                                                     BorderBrush="{DynamicResource BorderBrushSoft}"
                                                                     BorderThickness="1" CornerRadius="12"
                                                                     SnapsToDevicePixels="True">
-                                                                <Expander Style="{StaticResource TaskGroupExpander}"
+                                                                <Expander x:Name="GroupExpander"
+                                                                          Style="{StaticResource TaskGroupExpander}"
                                                                           IsExpanded="True">
                                                                     <Expander.Header>
                                                                         <Grid>

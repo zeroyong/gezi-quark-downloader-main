@@ -286,6 +286,18 @@ namespace GeZi
             // 筛选视图变化也要刷新（筛选后可能一条都不剩）
             _filesView.CollectionChanged += (s, e) => UpdateEmptyStates();
 
+            // 【2026-10-22】分组展开状态的恢复。
+            // 分组容器（GroupItem）是**虚拟化**生成的 —— 启动时列表还没布局完，
+            // 那一刻拿不到任何 GroupItem，更别说里面的 Expander。
+            // 所以用一个小定时器反复试：拿到容器就按记忆恢复，恢复了就停。
+            // 用定时器而不是 LayoutUpdated：后者每次布局都触发，太频繁。
+            _groupStateTimer = new System.Windows.Threading.DispatcherTimer(
+                TimeSpan.FromMilliseconds(400),
+                System.Windows.Threading.DispatcherPriority.Background,
+                (s3, e3) => TryRestoreGroupExpandedStates(),
+                Dispatcher);
+            _groupStateTimer.Start();
+
             // 日志攒批刷新器：把高频日志合并成一次 UI 写入（见 Log 的注释）。
             // 用 Background 优先级 —— 让进度条等更要紧的 UI 更新先跑。
             _logFlushTimer = new System.Windows.Threading.DispatcherTimer(
@@ -522,6 +534,8 @@ namespace GeZi
         {
             try { _logFlushTimer?.Stop(); } catch { }
             try { _sleepGuardTimer?.Stop(); } catch { }
+            // 【2026-10-22】分组展开状态恢复用的节流定时器
+            try { _groupStateTimer?.Stop(); } catch { }
             // 关窗前把任务页的最终状态落盘（节流定时器可能还没到点）。
             try { _taskSaveTimer?.Stop(); } catch { }
             SaveTaskListNow();
@@ -6974,6 +6988,12 @@ namespace GeZi
             var styleKey = _settings.TaskView == TaskViewMode.Grouped ? "TaskRowItem" : "TaskListItem";
             if (TryFindResource(styleKey) is Style rowStyle)
                 TaskList.ItemContainerStyle = rowStyle;
+
+            // 【2026-10-22】分组结构变了（切视图 / 重新分组）→ 容器会重新生成。
+            // 展开状态**不需要**在这里补救：每个新容器生成时都会在
+            // OnTaskGroupItemLoaded 里自己读配置摆正（见该方法的注释）。
+            // 这里只同步一次"已经存在的"容器，作为快速路径。
+            RestoreGroupExpandedStates();
         }
 
         /// <summary>同步「展示方式」按钮的文案 / 图标（图标在文字右边）。</summary>
@@ -6998,6 +7018,427 @@ namespace GeZi
             Log(_settings.TaskView == TaskViewMode.Grouped
                 ? "任务列表已切换：按文件夹分组（点分组头可收起）"
                 : "任务列表已切换：平铺显示一个个文件");
+        }
+
+        // ---------------- 任务列表：全部收起 / 全部展开 + 展开状态记忆（2026-10-22） ----------------
+        //
+        // 用户要求：
+        //   ① 任务页加一个「全部收起 / 全部展开」按钮；
+        //   ② 记忆每个文件夹分组的展开 / 收起状态（重启后保持）。
+        //
+        // 实现要点：
+        //   · 分组头里的 Expander 名字是 GroupExpander（在 GroupItem 模板里），
+        //     通过 GroupItem.Template.FindName 拿到；
+        //   · Expander.IsExpanded 变化时把分组名记进「已收起」列表并落盘；
+        //   · 新出现的分组默认展开 —— 所以存的是「收起的」而不是「展开的」。
+
+        /// <summary>
+        /// 分组名之间的分隔符：**换行符**（书名里可能有逗号/竖线，用它们会冲突）。
+        ///
+        /// <para>🚨 <b>【2026-10-22 严重事故】原来的分隔符是 <c>'\u0001'</c>，导致整份配置报废。</b>
+        /// XmlSerializer 把控制字符写成字符引用 <c>&amp;#x1;</c>，而
+        /// <b>XML 1.0 明确规定 C0 控制字符（U+0000–U+001F，除 \t \n \r）不得以任何形式出现</b>
+        /// —— 连字符引用也被禁止。于是写出来的 config.xml 直接变成非法 XML：</para>
+        /// <code>
+        /// &lt;TaskCollapsedGroups&gt;读书小站…（2000册）&amp;#x1;科学休息…&lt;/TaskCollapsedGroups&gt;
+        /// </code>
+        /// <para>后果：下次启动 <c>SettingsStore.Load()</c> 反序列化抛 ParseError →
+        /// <c>LoadedExistingConfig = false</c> → 程序拿到一份空 AppSettings →
+        /// 表现为「登录 Cookie 没了（未登录）、主题变回亮色（Theme 退回 System）、
+        /// 下载目录回到默认值」。用户看到的正是这个现象。</para>
+        ///
+        /// <para>所以分隔符只能用 <b>XML 合法</b>的字符。换行符（U+000A）合法，
+        /// 且不可能出现在 Windows 文件夹名里 —— 既有天然唯一性，又不会损坏配置。</para>
+        /// </summary>
+        private const char GroupSep = '\n';
+
+        /// <summary>「全部收起 / 全部展开」按钮的当前模式：true = 全部收起。</summary>
+        private bool _collapseAllMode = true;
+
+        /// <summary>正在恢复展开状态（恢复期间不记录，避免把默认值写进配置）。</summary>
+        private bool _restoringGroupState;
+
+        /// <summary>
+        /// 【已废弃】分组容器生成后用于恢复展开状态的节流定时器。
+        /// 现在改由 GroupItem 的 Loaded 事件驱动（见 OnTaskGroupItemLoaded），
+        /// 不再需要"等容器出现"的轮询。字段保留只为不惊动其余引用点。
+        /// </summary>
+        private System.Windows.Threading.DispatcherTimer _groupStateTimer;
+
+        /// <summary>
+        /// 拿到某个 GroupItem 里的 Expander（分组头那个）。
+        /// 模板里给它起了名字 GroupExpander，FindName 走的是模板的 namescope。
+        /// </summary>
+        private Expander FindGroupExpander(GroupItem gi)
+        {
+            try
+            {
+                if (gi == null) return null;
+                var tpl = gi.Template;
+                if (tpl == null) return null;
+                var exp = tpl.FindName("GroupExpander", gi) as Expander;
+                if (exp != null && !_expanderWatched.Contains(exp))
+                {
+                    // ⚠️ Expander 没有 IsExpandedChanged 事件（那是 Selector 的），
+                    //    但 IsExpanded 是依赖属性 —— 用 DependencyPropertyDescriptor
+                    //    监听它的值变化。
+                    try
+                    {
+                        var dpd = System.ComponentModel.DependencyPropertyDescriptor
+                            .FromProperty(Expander.IsExpandedProperty, typeof(Expander));
+                        dpd.AddValueChanged(exp, OnGroupExpanderIsExpandedChanged);
+                        _expanderWatched.Add(exp);
+                    }
+                    catch { }
+                }
+                return exp;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>已经挂上 IsExpanded 监听的 Expander（避免重复挂）。</summary>
+        private readonly HashSet<Expander> _expanderWatched = new HashSet<Expander>();
+
+        /// <summary>
+        /// 当前任务列表里**所有**分组的 GroupItem 容器。
+        ///
+        /// <para>🚨 【2026-10-22 血泪史，三次才修对】</para>
+        /// <list type="number">
+        /// <item>第一版：遍历可视树 → 只找到 3 个（虚拟化下屏幕外的容器不存在）；</item>
+        /// <item>第二版：<c>ItemContainerGenerator.ContainerFromIndex(i)</c> →
+        ///       干脆返回 0 个（日志："暂时拿不到分组容器（共有 11 个分组）"），
+        ///       因为分组模式下 <c>Items</c> 里是分组对象，容器生成时序也不保证；</item>
+        /// <item>第三版（现在）：<b>关掉虚拟化 + 遍历可视树</b>。
+        ///       既然 <c>VirtualizingPanel.IsVirtualizing="False"</c>，
+        ///       所有 GroupItem 容器都已经真正实例化并挂在可视树上 ——
+        ///       实测 UI 里确实有 11 个 Expander（UIA 能枚举到），
+        ///       所以可视树遍历现在能拿全。</item>
+        /// </list>
+        ///
+        /// <para>⚠️ 这个方法的"拿全"依赖于 XAML 里关闭虚拟化，两者必须一起改。</para>
+        /// </summary>
+        private List<GroupItem> EnumerateGroupItems()
+        {
+            var list = new List<GroupItem>();
+            try
+            {
+                if (TaskList == null) return list;
+                CollectVisualChildren(TaskList, list);
+            }
+            catch { }
+            return list;
+        }
+
+        /// <summary>深度遍历可视树，收集所有 <see cref="GroupItem"/>。</summary>
+        private static void CollectVisualChildren(DependencyObject root, List<GroupItem> found)
+        {
+            if (root == null) return;
+            int n;
+            try { n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(root); }
+            catch { return; }
+
+            for (int i = 0; i < n; i++)
+            {
+                DependencyObject child;
+                try { child = System.Windows.Media.VisualTreeHelper.GetChild(root, i); }
+                catch { continue; }
+                if (child == null) continue;
+
+                var gi = child as GroupItem;
+                if (gi != null && !found.Contains(gi)) found.Add(gi);
+                CollectVisualChildren(child, found);
+            }
+        }
+
+        /// <summary>分组头是否处于收起状态（Expander.IsExpanded == false）。</summary>
+        private bool IsGroupCollapsed(GroupItem gi)
+        {
+            var exp = FindGroupExpander(gi);
+            return exp != null && !exp.IsExpanded;
+        }
+
+        /// <summary>分组名（CollectionViewGroup.Name 是 object，转成字符串）。</summary>
+        private static string GroupNameOf(GroupItem gi)
+        {
+            var grp = gi?.DataContext as CollectionViewGroup;
+            if (grp == null) return null;
+            var n = grp.Name;
+            return n == null ? null : n.ToString();
+        }
+
+        /// <summary>
+        /// 展开状态变化时的回调（Expander.IsExpanded 依赖属性的值变化）。
+        /// 把该分组的"收起/展开"状态记进 <see cref="AppSettings.TaskCollapsedGroups"/> 并落盘。
+        /// </summary>
+        private void OnGroupExpanderIsExpandedChanged(object sender, EventArgs e)
+        {
+            if (_restoringGroupState) return;
+            var exp = sender as Expander;
+            if (exp == null) return;
+            var gi = FindAncestor<GroupItem>(exp);
+            if (gi == null) return;
+            var name = GroupNameOf(gi);
+            if (string.IsNullOrEmpty(name)) return;
+
+            var collapsed = GetCollapsedGroups();
+            bool wasCollapsed = collapsed.Contains(name);
+            if (!exp.IsExpanded)
+            {
+                if (!wasCollapsed) { collapsed.Add(name); }
+            }
+            else
+            {
+                if (wasCollapsed) collapsed.Remove(name);
+            }
+            SaveCollapsedGroups(collapsed);
+        }
+
+        /// <summary>
+        /// 每个文件夹分组容器**生成时**调用（GroupItem 的 Loaded 事件）。
+        ///
+        /// <para>🚨 <b>这是「记忆展开状态」的唯一正确入口。</b>
+        /// 之前写的是"启动后遍历一遍所有 GroupItem 容器、逐个设置 IsExpanded"，
+        /// 在虚拟化下必错：屏幕外的容器是**滚动时才生成**的，
+        /// 启动那一刻压根不存在（用户实测：11 个分组只找到 3 个，
+        /// 而且点「全部收起」直接提示"暂时拿不到分组容器"）。</para>
+        ///
+        /// <para>改成事件驱动后：<b>任何一个</b>分组无论何时被生成（启动 / 滚动 / 切换视图），
+        /// 都会立刻按配置里的「已收起列表」摆正状态，不依赖"当时屏幕上有什么"。</para>
+        /// </summary>
+        private void OnTaskGroupItemLoaded(object sender, RoutedEventArgs e)
+        {
+            var gi = sender as GroupItem;
+            if (gi == null) return;
+            ApplyExpandedStateToGroup(gi);
+        }
+
+        /// <summary>
+        /// 按「已收起列表」摆正某个分组的展开状态，并挂上变化监听。
+        /// 供容器生成（<see cref="OnTaskGroupItemLoaded"/>）与批量操作后统一调用。
+        /// </summary>
+        private void ApplyExpandedStateToGroup(GroupItem gi)
+        {
+            if (_settings.TaskView != TaskViewMode.Grouped) return;
+            var name = GroupNameOf(gi);
+            if (string.IsNullOrEmpty(name)) return;
+
+            var exp = FindGroupExpander(gi);   // 内部会顺手挂好 IsExpanded 监听
+            if (exp == null) return;
+
+            bool wantCollapsed = GetCollapsedGroups().Contains(name);
+            if (exp.IsExpanded == !wantCollapsed) return;   // 已经是目标状态
+
+            _restoringGroupState = true;       // 恢复期间不记录，避免回写自己
+            try { exp.IsExpanded = !wantCollapsed; }
+            finally { _restoringGroupState = false; }
+        }
+
+        /// <summary>读「已收起的分组名」列表。</summary>
+        private List<string> GetCollapsedGroups()
+        {
+            var raw = _settings.TaskCollapsedGroups;
+            var list = new List<string>();
+            if (string.IsNullOrEmpty(raw)) return list;
+            // 兼容旧数据：早期版本用过 '\u0001' 做分隔符（那是个会写坏 XML 的字符，
+            // 见 GroupSep 的注释）。磁盘上真存着的话也一并切开，别当成一个怪名字。
+            foreach (var s in raw.Split(new[] { GroupSep, '\u0001' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var t = s.Trim('\r', ' ', '\t');
+                if (t.Length > 0) list.Add(t);
+            }
+            return list;
+        }
+
+        /// <summary>写回「已收起的分组名」并落盘。</summary>
+        private void SaveCollapsedGroups(List<string> collapsed)
+        {
+            // 兜底：任何 XML 非法字符都不许进配置（见 GroupSep 的注释，这里曾经毁过一次配置）。
+            var safe = new List<string>(collapsed.Count);
+            foreach (var s in collapsed)
+            {
+                if (string.IsNullOrEmpty(s)) continue;
+                safe.Add(Util.StripXmlInvalid(s));
+            }
+            string raw = string.Join(GroupSep.ToString(), safe);
+            if (raw == _settings.TaskCollapsedGroups) return;
+            _settings.TaskCollapsedGroups = raw;
+            try { SettingsStore.Save(_settings); } catch { }
+        }
+
+        /// <summary>把某个分组的展开状态记下来（供「全部收起/展开」批量操作时统一保存）。</summary>
+        private void RememberGroupState(GroupItem gi, bool collapsed)
+        {
+            var name = GroupNameOf(gi);
+            if (string.IsNullOrEmpty(name)) return;
+            var list = GetCollapsedGroups();
+            bool has = list.Contains(name);
+            if (collapsed && !has) { list.Add(name); SaveCollapsedGroups(list); }
+            else if (!collapsed && has) { list.Remove(name); SaveCollapsedGroups(list); }
+        }
+
+        /// <summary>
+        /// 恢复各分组的展开状态（按记忆）。
+        ///
+        /// <para>⚠️ 【2026-10-22】只负责**已经生成**的容器，作为
+        /// <see cref="OnTaskGroupItemLoaded"/> 的补充（切换视图后容器已存在时立即生效）。
+        /// 真正保证"屏幕外的分组也正确"的是那个 Loaded 事件 ——
+        /// 所以这里**不再**要求"必须遍历到全部容器"，拿不到就跳过。</para>
+        /// </summary>
+        private void RestoreGroupExpandedStates()
+        {
+            if (_settings.TaskView != TaskViewMode.Grouped) return;
+            try
+            {
+                foreach (var gi in EnumerateGroupItems())
+                    ApplyExpandedStateToGroup(gi);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 【2026-10-22 已废弃，保留为空实现】原先是"等容器生成后恢复展开状态"的轮询。
+        ///
+        /// <para>现在恢复完全由 <see cref="OnTaskGroupItemLoaded"/> 驱动（每个容器
+        /// 生成时自己读配置），**不再需要**"等所有容器都出现"这种前提 ——
+        /// 而那个前提在虚拟化下永远不成立，正是"点全部收起没反应"的病根。
+        /// 保留空实现只为不用去翻改各个调用点。</para>
+        /// </summary>
+        private void TryRestoreGroupExpandedStates()
+        {
+            try { _groupStateTimer?.Stop(); } catch { }
+        }
+
+        /// <summary>
+        /// 「全部收起 / 全部展开」按钮。
+        ///
+        /// <para>🚨 <b>实现方式：改配置，而不是改容器。</b>
+        /// 旧实现在这里遍历 GroupItem 容器、逐个点 <c>IsExpanded</c>，
+        /// 但虚拟化下拿不到屏幕外的容器 —— 用户实测 11 个分组只处理了 3 个，
+        /// 后来又变成"暂时拿不到分组容器（共有 11 个分组）"，点了完全没反应。</para>
+        ///
+        /// <para>正确做法：把"全部收起/展开"这个<b>事实</b>写进配置里的已收起列表，
+        /// 再让已经生成的容器同步过去；将来滚动出来的新容器会在
+        /// <see cref="OnTaskGroupItemLoaded"/> 里自动对上状态。
+        /// 这样"屏幕上有几个容器"再也影响不到结果。</para>
+        /// </summary>
+        private void OnToggleCollapseAllGroups(object sender, RoutedEventArgs e)
+        {
+            if (_settings.TaskView != TaskViewMode.Grouped)
+            {
+                Log("当前是平铺视图，没有文件夹分组可收起。");
+                return;
+            }
+
+            bool collapse = _collapseAllMode;
+
+            // ① 全部当前分组名 —— 从**视图数据**取，与容器是否生成无关
+            var names = GetAllGroupNames();
+            if (names.Count == 0)
+            {
+                Log("当前没有可收起的文件夹分组。");
+                return;
+            }
+
+            // ⚠️ 【2026-10-22】点之前先核对一下"实际是不是已经全收起了"。
+            //   _collapseAllMode 是**自维护**的布尔，启动时按"上次收起的数量"推得，
+            //   一旦和真实 UI 不同步（实测：重启后全是收起的，但标志是 true，
+            //   于是第一次点击执行了"展开"而不是"收起"，用户看到"点了没反应"），
+            //   后面每次点击都会反着来。
+            //   修法：以**实际状态**为准 —— 已经全收起就必然转为展开，反之亦然。
+            bool allCollapsedNow = names.Count > 0;
+            foreach (var n in names)
+            {
+                if (!GetCollapsedGroups().Contains(n)) { allCollapsedNow = false; break; }
+            }
+            collapse = !allCollapsedNow;
+
+            // ② 把事实写进配置（这才是唯一事实来源）
+            if (collapse) SaveCollapsedGroups(new List<string>(names));
+            else SaveCollapsedGroups(new List<string>());
+
+            // ③ 已经生成出来的容器立刻同步（没生成的交给 Loaded 事件）
+            int applied = 0;
+            foreach (var gi in EnumerateGroupItems())
+            {
+                try
+                {
+                    ApplyExpandedStateToGroup(gi);
+                    applied++;
+                }
+                catch { }
+            }
+
+            _collapseAllMode = !collapse;
+            UpdateCollapseAllButton();
+            Log(collapse
+                ? string.Format("已收起全部 {0} 个文件夹分组（屏幕上即时同步 {1} 个）。", names.Count, applied)
+                : string.Format("已展开全部 {0} 个文件夹分组（屏幕上即时同步 {1} 个）。", names.Count, applied));
+        }
+
+        /// <summary>
+        /// 当前视图里**所有**分组名 —— 直接从 <see cref="ListCollectionView.Groups"/> 读。
+        ///
+        /// <para>这个属性是分组结果的**数据模型**（<c>CollectionViewGroup</c> 集合），
+        /// 与虚拟化、与容器是否生成**完全无关** —— 所以永远拿得到全量。
+        /// 之前绕道去翻容器，才是"只有 3 个"和"一个都拿不到"的根源。</para>
+        /// </summary>
+        private List<string> GetAllGroupNames()
+        {
+            var names = new List<string>();
+            try
+            {
+                if (_taskView == null) return names;
+                var groups = _taskView.Groups;
+                if (groups == null) return names;
+                foreach (var g in groups)
+                {
+                    var cvg = g as System.Windows.Data.CollectionViewGroup;
+                    if (cvg == null) continue;
+                    // ListCollectionView 未分组时，Groups 里会有一个 Name == null 的整包组，
+                    // 那不是文件夹分组，跳过。
+                    var n = cvg.Name == null ? null : cvg.Name.ToString();
+                    if (string.IsNullOrEmpty(n)) continue;
+                    if (!names.Contains(n)) names.Add(n);
+                }
+            }
+            catch { }
+            return names;
+        }
+
+        /// <summary>
+        /// 同步「全部收起 / 全部展开」按钮的文案与图标。
+        ///
+        /// <para>🚨 【2026-10-22】文案**必须从实际状态推导**，不能用自维护的
+        /// <c>_collapseAllMode</c>。实测事故：重启后所有分组都是收起的，
+        /// 但标志位默认 <c>true</c>，于是按钮显示"全部收起"（其实已经收起了），
+        /// 点一下执行的是"展开" —— 用户看到的就是"点了没反应 / 行为反着来"。</para>
+        /// </summary>
+        private void UpdateCollapseAllButton()
+        {
+            if (TaskCollapseAllText == null) return;
+
+            // 实际是否"已经全收起"：分组全在已收起列表里 → 按钮该显示"全部展开"
+            bool allCollapsed = false;
+            var names = GetAllGroupNames();
+            if (names.Count > 0)
+            {
+                allCollapsed = true;
+                var collapsed = GetCollapsedGroups();
+                foreach (var n in names)
+                {
+                    if (!collapsed.Contains(n)) { allCollapsed = false; break; }
+                }
+            }
+
+            // 把标志位拉回和现实一致，后续点击才能算对方向
+            _collapseAllMode = !allCollapsed;
+
+            TaskCollapseAllText.Text = _collapseAllMode ? "全部收起" : "全部展开";
+            var geo = TryFindResource(_collapseAllMode ? "IconCollapseAll" : "IconExpandAll") as Geometry;
+            if (geo != null) TaskCollapseAllIcon.Data = geo;
+            TaskCollapseAllBtn.ToolTip = _collapseAllMode
+                ? "当前：展开状态（点击把所有文件夹收起）"
+                : "当前：收起状态（点击把所有文件夹展开）";
         }
 
         // ---------------- 任务列表：删除选择模式（z / Enter） ----------------
@@ -9298,6 +9739,8 @@ namespace GeZi
                 // 任务列表展示方式（文件夹分组 / 平铺）→ 应用分组 + 同步按钮
                 ApplyTaskGrouping();
                 UpdateTaskViewButton();
+                // 【2026-10-22】「全部收起 / 全部展开」按钮的初始文案与图标
+                UpdateCollapseAllButton();
                 // 【2026-10-21】恢复「运行日志」的可拖拽高度（用户要求记忆）
                 ApplyLogPanelHeight();
                 // 【2026-10-21】设置页「关于与更新」：填版本号 + 恢复红点状态。
