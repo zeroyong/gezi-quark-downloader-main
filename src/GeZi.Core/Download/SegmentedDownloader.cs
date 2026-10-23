@@ -906,27 +906,22 @@ namespace GeZi.Core.Download
                             body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false) ?? "";
                         }
                         catch { }
-                        // 【2026-10-23】把响应头也一并打出来 —— 定位 412/403 时，
-                        // 服务端到底是 Tengine 挡的还是 OSS 回调挡的，区别很大：
-                        //   · Tengine 的 412 只有一行 HTML → 请求层被拦（可能签名/来源校验）
-                        //   · OSS 的 403 会带 <Code>xxx</Code> → 业务层拒绝，能看到具体原因
-                        var rspKeys = new List<string>();
-                        try
-                        {
-                            foreach (var hdr in resp.Headers)
-                                rspKeys.Add(hdr.Key + "=" + string.Join(",", hdr.Value));
-                        }
+                        // 【2026-10-23 精简】只保留判断"谁挡的"所需的两项：
+                        //   · Server（Tengine = 请求层拦截；OSS = 业务层拒绝）
+                        //   · body（OSS 会带 <Code>，Tengine 只有一行 HTML）
+                        // 其余响应头（Access-Control-*、Timing-Allow-Origin 等）
+                        // 对定位没有帮助，全打出来只是刷屏。
+                        string server = "-";
+                        try { server = resp.Headers.Server != null ? resp.Headers.Server.ToString() : "-"; }
                         catch { }
-                        string rspHeaders = rspKeys.Count == 0 ? "-"
-                            : Trim(string.Join(" | ", rspKeys.ToArray()), 400);
 
                         Log?.Invoke("[诊断·探测] 直链探测 HTTP " + probeCode + " "
                             + (resp.ReasonPhrase ?? "")
                             + "｜host=" + SafeHost(url)
                             + (SafeHost(url).IndexOf("guest", StringComparison.OrdinalIgnoreCase) >= 0
-                                ? "｜⚠ 游客域名" : "｜登录域名")
-                            + "｜响应头=" + rspHeaders
-                            + "｜body=" + Trim(body.Replace("\r", " ").Replace("\n", " "), 600));
+                                ? "｜⚠ 游客域名" : "")
+                            + "｜Server=" + Trim(server, 40)
+                            + "｜body=" + Trim(body.Replace("\r", " ").Replace("\n", " "), 300));
                     }
                     else
                     {

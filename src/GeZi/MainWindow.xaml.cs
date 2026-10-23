@@ -403,14 +403,15 @@ namespace GeZi
             _scheduler.Log = LogFromWorker;
             _scheduler.Diagnostics = OnDiagnostics;
             LoadSettingsToUi();
-            // 【2026-10-23】把夸克更新源的诊断接到「运行日志」面板。
-            // 实测发现该源能查到版本、能取到直链，但游客态直链（dl-guest-*）
-            // 下载时被 CDN 拒（412）—— 没有日志时完全看不出问题在哪一步。
-            GeZi.Core.Update.QuarkReleaseChecker.Log = Log;
-            // 【2026-10-23】把更新服务的诊断也接到日志面板 ——
-            // 排查"GitHub 不通时夸克源能不能顶上"必须看得见每一步。
-            GeZi.Core.Update.UpdateInstaller.Log = Log;
-            UpdateService.Log = Log;
+            // 【2026-10-23】把更新模块的诊断接到「运行日志」。
+            //
+            // ⚠️ 一律走 LogDetail（详细级）：这些是**排查用**的内部状态
+            // （扫目录层数、token 刷新、直链参数……），
+            // 普通用户点「检查更新」只需要看到「发现新版本」或错误，不需要看过程。
+            // 需要排查时点日志框右上角「详细」按钮即可全部显示。
+            GeZi.Core.Update.QuarkReleaseChecker.Log = LogDetail;
+            GeZi.Core.Update.UpdateInstaller.Log = LogDetail;
+            UpdateService.Log = LogDetail;
             // 🚨 【2026-10-23】把"运行期有效 Cookie"的取法交给更新服务。
             //
             // 为什么必须这样：`_settings.Cookie` 只在**登录那一刻**写入，

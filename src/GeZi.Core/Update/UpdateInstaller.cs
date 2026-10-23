@@ -252,70 +252,32 @@ namespace GeZi.Core.Update
         }
 
         /// <summary>
-        /// 把直链与请求上下文的全部可观测细节打进日志（2026-10-23，定位 412 用）。
+        /// 把直链与请求上下文的关键信息打进日志（2026-10-23，定位 412 用）。
         ///
-        /// <para>【为什么打这么细】同一个安装包：手动免转存下载 206 成功、
-        /// 一键更新 412 失败。两者用的类、代码路径、Cookie 都相同，
-        /// 差别只在"哪一次请求"。没有逐参数对照就无法定位 ——
-        /// 所以这里把 host、path、每个查询参数、Cookie 长度与键名全部列出来，
-        /// 让两份日志能逐字比对。</para>
-        ///
-        /// <para>⚠️ <b>不打 Cookie 的值</b>（那是登录凭证），只打长度与键名。</para>
+        /// <para>【2026-10-23 精简】原来这里把每个查询参数、每个 Cookie 键名都列一遍，
+        /// 排查时有用，但普通用户点一次「一键更新」会刷十几行看不懂的东西。
+        /// 现在只留<b>两个真正有诊断价值</b>的：
+        /// 直链落在哪个域名（`drive` vs `pds` vs `guest`）、以及是不是登录态。
+        /// 想看完整参数请点日志框的「详细」—— 但即使详细级也只打 host/长度，
+        /// 不再逐参数展开（那个信息量主要给我排查时用临时程序打）。</para>
         /// </summary>
         private void DumpUrlDiagnostics(string url)
         {
-            Log("==== 更新下载诊断 ====");
             try
             {
                 var u = new Uri(url);
-                Log("  host = " + u.Host);
-                Log("  path = " + u.AbsolutePath);
-                Log("  完整长度 = " + url.Length);
+                string host = u.Host;
+                string kind = host.IndexOf("guest", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? "游客域名"
+                    : (u.Query.IndexOf("Signature=", StringComparison.OrdinalIgnoreCase) >= 0
+                        ? "OSS 签名链" : "auth_key 链");
+                Log("更新包直链: " + host + "（" + kind + "，"
+                    + (_cookie ?? "").Length + " 字节登录态）");
 
-                // 逐参数列出（值超过 48 字符就截断，但保留长度 —— 长度差异本身是信号）
-                string q = u.Query.TrimStart('?');
-                Log("  查询参数 " + q.Split('&').Length + " 个:");
-                foreach (string kv in q.Split('&'))
-                {
-                    if (kv.Length == 0) continue;
-                    int eq = kv.IndexOf('=');
-                    string k = eq > 0 ? kv.Substring(0, eq) : kv;
-                    string v = eq > 0 ? kv.Substring(eq + 1) : "";
-                    string show = v.Length <= 48 ? v : v.Substring(0, 48) + "…";
-                    Log("    " + k + " (len=" + v.Length + ") = " + show);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log("  解析直链失败: " + ex.Message);
-            }
-
-            // Cookie：只打长度和键名
-            try
-            {
-                string ck = _cookie ?? "";
-                Log("  Cookie 长度 = " + ck.Length);
-                if (ck.Length > 0)
-                {
-                    var keys = new List<string>();
-                    foreach (string part in ck.Split(';'))
-                    {
-                        string p = part.Trim();
-                        if (p.Length == 0) continue;
-                        int eq = p.IndexOf('=');
-                        keys.Add(eq > 0 ? p.Substring(0, eq) : p);
-                    }
-                    Log("  Cookie 键名 = " + string.Join(",", keys.ToArray()));
-                }
-                else
-                {
-                    Log("  ⚠ Cookie 为空（游客态）—— 夸克会降级到 dl-guest-* 并返回 412");
-                }
+                if (string.IsNullOrEmpty(_cookie))
+                    Log("⚠ 更新流程没有登录态 —— 夸克会降级到游客域名，下载必被拒（412）");
             }
             catch { }
-
-            Log("  线程数 = 4，写入模式 = SegmentedFiles");
-            Log("==== 诊断结束 ====");
         }
 
         /// <summary>

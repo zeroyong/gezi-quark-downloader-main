@@ -17,6 +17,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -144,10 +145,8 @@ namespace GeZi.Core.Update
             try
             {
                 var client = shared ?? own;
-                Log("查夸克更新源: pwdId=" + _pwdId
-                    + " passcode=" + (string.IsNullOrEmpty(_passcode) ? "(无)" : "(有)")
-                    + " client=" + (shared != null ? "复用主窗口的（与手动下载同一会话）"
-                                                  : "新建（cookie " + _cookie.Length + " 字节）"));
+                Log("查夸克更新源（client=" + (shared != null ? "复用主窗口会话"
+                    : "新建 cookie " + _cookie.Length + "B") + "）");
 
                 ShareTokenInfo info;
                 try
@@ -164,7 +163,7 @@ namespace GeZi.Core.Update
                     Log("夸克源失败：拿不到 stoken（分享可能失效或提取码变了）");
                     return null;
                 }
-                Log("夸克源 stoken OK，分享标题: " + info.Title);
+                Log("夸克源：分享「" + info.Title + "」");
 
                 var found = new List<QuarkRelease>();
                 await ScanAsync(client, _pwdId, info.Stoken, "0", 0, found, ct).ConfigureAwait(false);
@@ -181,8 +180,21 @@ namespace GeZi.Core.Update
                     if (c != 0) return c;
                     return b.PublishedTicks.CompareTo(a.PublishedTicks);
                 });
-                Log("夸克源找到 " + found.Count + " 个包，最新是 " + found[0].Version
-                    + "（" + found[0].FileName + "，" + found[0].Size + " 字节）");
+                Log("夸克源：找到 " + found.Count + " 个包，最新 v" + found[0].Version
+                    + "（" + found[0].FileName + "）");
+
+                // 【2026-10-23】顺带读同层的更新日志（用户需求：
+                // 「加个更新日志.md 一起上传，检查到新版本就可以读取日志展示」）。
+                // 失败不影响更新本身 —— 日志只是展示用。
+                try
+                {
+                    string notes = await FetchNotesAsync(client, _pwdId, info.Stoken,
+                        found[0].DirFid, ct).ConfigureAwait(false);
+                    if (!string.IsNullOrEmpty(notes))
+                        found[0].NotesText = notes;
+                }
+                catch { }
+
                 return found[0];
             }
             finally
@@ -235,15 +247,11 @@ namespace GeZi.Core.Update
                     ShareTokenInfo fresh = await client.GetShareInfoAsync(rel.PwdId, _passcode)
                         .ConfigureAwait(false);
                     if (fresh != null && !string.IsNullOrEmpty(fresh.Stoken))
-                    {
-                        if (!string.Equals(fresh.Stoken, rel.Stoken, StringComparison.Ordinal))
-                            Log("夸克源：stoken 已更新（旧的可能过期）");
                         stoken = fresh.Stoken;
-                    }
                 }
                 catch (Exception ex)
                 {
-                    Log("夸克源重新申请 stoken 失败，沿用旧的: " + ex.Message);
+                    Log("夸克源：重新申请 stoken 失败，沿用旧的（" + ex.Message + "）");
                 }
 
                 // ② 重新定位该文件，拿**新的** share_fid_token
@@ -254,19 +262,13 @@ namespace GeZi.Core.Update
                     QuarkFileEntry entry = await FindEntryByFidAsync(client, rel.PwdId, stoken, rel.Fid, ct)
                         .ConfigureAwait(false);
                     if (entry != null && !string.IsNullOrEmpty(entry.Token))
-                    {
-                        if (!string.Equals(entry.Token, rel.Token, StringComparison.Ordinal))
-                            Log("夸克源：token 已刷新（旧的可能过期）");
                         token = entry.Token;
-                    }
                     else
-                    {
                         Log("夸克源：没能重新定位文件，沿用旧 token");
-                    }
                 }
                 catch (Exception ex)
                 {
-                    Log("夸克源重新定位文件失败，沿用旧 token: " + ex.Message);
+                    Log("夸克源：重新定位文件失败，沿用旧 token（" + ex.Message + "）");
                 }
 
                 Log("夸克源取链参数: fid=" + Short(rel.Fid) + " token=" + Short(token)
@@ -369,6 +371,116 @@ namespace GeZi.Core.Update
         /// </summary>
         public static Action<string> Log { get; set; }
 
+        /// <summary>
+        /// 更新日志的文件名候选（2026-10-23 新增）。
+        /// <para>用户需求：「加个更新日志.md 一起上传，这样当检查到新版本就可以读取日志展示了」。
+        /// 允许中文名与英文名两种，按顺序匹配第一个存在的。</para>
+        /// </summary>
+        public static readonly string[] NotesFileNames =
+        {
+            "更新日志.md", "更新日志.MD", "更新日志.md.txt",
+            "CHANGELOG.md", "changelog.md", "CHANGELOG.MD",
+            "更新日志.txt", "CHANGELOG.txt",
+        };
+
+        /// <summary>
+        /// 在分享里找更新日志文件、下载它的文本内容。
+        ///
+        /// <para>【查找范围】与安装包<b>同一层</b>（通常是分享里的那个子目录）。
+        /// 只在已扫过的目录里找，不额外遍历整棵树 —— 日志是附属信息，
+        /// 多打十几个请求去翻全分享不值得。</para>
+        ///
+        /// <para>【失败不报错】找不到 / 下载失败一律返回 null，
+        /// 上层按"没有更新说明"处理（UI 会退回"去分享页看"）。</para>
+        /// </summary>
+        /// <param name="client">已登录的客户端。</param>
+        /// <param name="pkgDirFid">安装包所在目录的 fid（日志就在这一层找）。</param>
+        public async Task<string> FetchNotesAsync(QuarkClient client, string pwdId,
+            string stoken, string pkgDirFid, CancellationToken ct = default(CancellationToken))
+        {
+            if (client == null || string.IsNullOrEmpty(pwdId) || string.IsNullOrEmpty(stoken))
+                return null;
+            string dir = string.IsNullOrEmpty(pkgDirFid) ? "0" : pkgDirFid;
+
+            try
+            {
+                List<QuarkFileEntry> items = await client.ShareDetailAsync(pwdId, stoken, dir)
+                    .ConfigureAwait(false);
+                if (items == null || items.Count == 0) return null;
+
+                QuarkFileEntry hit = null;
+                foreach (string want in NotesFileNames)
+                {
+                    foreach (QuarkFileEntry it in items)
+                    {
+                        if (it == null || it.IsDir) continue;
+                        if (string.Equals(it.Name, want, StringComparison.OrdinalIgnoreCase))
+                        { hit = it; break; }
+                    }
+                    if (hit != null) break;
+                }
+                if (hit == null) return null;
+
+                Log("夸克源：找到更新日志「" + hit.Name + "」");
+
+                // 取直链
+                List<DownloadLink> links = await client.GetShareDownloadAsync(
+                    new List<string> { hit.Fid },
+                    new List<string> { hit.Token ?? "" },
+                    pwdId, stoken).ConfigureAwait(false);
+                string url = null;
+                if (links != null)
+                    foreach (DownloadLink l in links)
+                        if (!string.IsNullOrEmpty(l.DownloadUrl)) { url = l.DownloadUrl; break; }
+                if (string.IsNullOrEmpty(url))
+                {
+                    Log("夸克源：更新日志取直链失败");
+                    return null;
+                }
+
+                // 下载正文（几十 KB 以内，直接读成字符串）
+                string text = await DownloadTextAsync(url, ct).ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(text))
+                    Log("夸克源：更新日志已读取，共 " + text.Length + " 字符");
+                return text;
+            }
+            catch (Exception ex)
+            {
+                Log("夸克源：读取更新日志失败（" + ex.GetType().Name + ": " + ex.Message + "）");
+                return null;
+            }
+        }
+
+        /// <summary>下载一个文本文件的正文（用于更新日志）。</summary>
+        private static async Task<string> DownloadTextAsync(string url, CancellationToken ct)
+        {
+            try
+            {
+                using (var http = new System.Net.Http.HttpClient())
+                {
+                    http.Timeout = TimeSpan.FromSeconds(20);
+                    // 埋点：与下载器一致，夸克 CDN 需要常见浏览器头
+                    http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        + "(KHTML, like Gecko) quark-cloud-drive/3.14.2 Chrome/112.0.5615.165 "
+                        + "Electron/24.1.3.8 Safari/537.36 Channel/pckk_other_ch");
+                    http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://pan.quark.cn/");
+
+                    byte[] raw = await http.GetByteArrayAsync(url).ConfigureAwait(false);
+                    if (raw == null || raw.Length == 0) return null;
+                    if (raw.Length > 2 * 1024 * 1024) return null;   // 防御：日志不该这么大
+                    // 优先按 UTF-8 解；失败退回 GB18030（用户可能用记事本存成 ANSI）
+                    try { return new UTF8Encoding(false).GetString(raw); }
+                    catch
+                    {
+                        try { return Encoding.GetEncoding("GB18030").GetString(raw); }
+                        catch { return null; }
+                    }
+                }
+            }
+            catch { return null; }
+        }
+
         /// <summary>递归扫分享目录（分享接口没有"全量递归列目录"，只能一层层来）。</summary>
         private async Task ScanAsync(QuarkClient client, string pwdId, string stoken,
             string pdirFid, int depth, List<QuarkRelease> found, CancellationToken ct)
@@ -391,8 +503,9 @@ namespace GeZi.Core.Update
                 Log("夸克源扫目录返回 null (pdirFid=" + pdirFid + ", depth=" + depth + ")");
                 return;
             }
-            Log("夸克源扫目录 depth=" + depth + " pdirFid=" + pdirFid
-                + " 共 " + items.Count + " 项");
+            // 只有真的扫到东西才记一行；空目录不刷屏。
+            if (items.Count > 0)
+                Log("夸克源扫目录 depth=" + depth + " 共 " + items.Count + " 项");
 
             foreach (var it in items)
             {
@@ -408,7 +521,12 @@ namespace GeZi.Core.Update
                 }
 
                 var rel = TryParseName(it, pwdId, stoken);
-                if (rel != null) found.Add(rel);
+                if (rel != null)
+                {
+                    // 记下所在目录 —— 更新日志就放在同一层，不用再遍历整棵树。
+                    rel.DirFid = pdirFid;
+                    found.Add(rel);
+                }
             }
         }
 

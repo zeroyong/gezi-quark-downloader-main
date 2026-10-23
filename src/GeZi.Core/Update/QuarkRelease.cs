@@ -55,6 +55,25 @@ namespace GeZi.Core.Update
         /// <summary>分享页地址。</summary>
         public string ShareUrl { get; set; }
 
+        /// <summary>
+        /// 更新说明正文（2026-10-23 新增）。
+        ///
+        /// <para>【来由】用户需求：「可以加个更新日志.md 一起上传，
+        /// 这样当检查到新版本就可以读取日志展示了」。</para>
+        ///
+        /// <para>分享目录里与安装包<b>同一层</b>放一个 <c>更新日志.md</c>（或 CHANGELOG.md），
+        /// 由 <see cref="QuarkReleaseChecker"/> 顺带下载并填到这里；
+        /// 找不到就是空串（此时 UI 退回"去分享页看"的提示）。</para>
+        /// </summary>
+        public string NotesText { get; set; }
+
+        /// <summary>
+        /// 安装包所在的**目录 fid**（2026-10-23 新增）。
+        /// <para>用于在同层找 <c>更新日志.md</c> —— 日志与安装包放在一起，
+        /// 不需要再遍历整棵树。空串表示在分享根目录。</para>
+        /// </summary>
+        public string DirFid { get; set; }
+
         /// <summary>排序用的时间刻度（分享接口不返发布时间，恒为 0）。</summary>
         internal long PublishedTicks { get; set; }
 
@@ -78,10 +97,13 @@ namespace GeZi.Core.Update
             get { return FileName ?? ""; }
         }
 
-        /// <summary>说明固定为空，UI 会提示"去分享页看"。</summary>
+        /// <summary>
+        /// 更新说明：优先用分享里那份 <c>更新日志.md</c> 的内容
+        /// （见 <see cref="NotesText"/>）；没有就返回空串，UI 会提示"去分享页看"。
+        /// </summary>
         public string Notes
         {
-            get { return ""; }
+            get { return NotesText ?? ""; }
         }
 
         /// <summary>「查看详情」打开分享页。</summary>

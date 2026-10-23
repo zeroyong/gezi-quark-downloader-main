@@ -389,7 +389,7 @@ namespace GeZi
                 try { shared = SharedClientProvider != null ? SharedClientProvider() : null; }
                 catch { }
                 Log("夸克源用 Cookie 长度=" + cookie.Length
-                    + "，client=" + (shared != null ? "复用主窗口的（与手动下载同一会话）" : "新建"));
+                    + "，client=" + (shared != null ? "复用主窗口会话" : "新建"));
 
                 var checker = new QuarkReleaseChecker(cookie: cookie, sharedClient: shared);
                 return await checker.FindLatestAsync().ConfigureAwait(false);
