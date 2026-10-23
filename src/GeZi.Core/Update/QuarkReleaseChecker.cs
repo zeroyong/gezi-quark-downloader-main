@@ -71,13 +71,57 @@ namespace GeZi.Core.Update
         private readonly string _pwdId;
         private readonly string _passcode;
         private readonly TimeSpan _timeout;
+        private readonly string _cookie;
 
+        /// <summary>
+        /// 构造夸克源检查器。
+        ///
+        /// <para>【2026-10-23 关键修复：必须传登录 Cookie】</para>
+        /// <para>原来这里固定用 <c>new QuarkClient("")</c>（游客态）取链，
+        /// 结果拿到的直链落在 <c>dl-guest-*</c> 域名上，下载时被 CDN 直接拒
+        /// （<b>HTTP 412</b>）—— 于是"一键更新"在 GitHub 不通时必然失败。</para>
+        /// <para>实测对照（同一个包 <c>GeZi-v2.8.4-win64.zip</c>）：</para>
+        /// <list type="bullet">
+        /// <item>游客（空 cookie）→ <c>dl-guest-sz-u.drive.quark.cn</c> → <b>412 失败</b></item>
+        /// <item>登录（真实 cookie）→ <c>dl-pc-sz.drive.quark.cn</c> → <b>206 成功</b></item>
+        /// </list>
+        /// <para>游客态之所以"能查到版本、能取到直链"，是因为分享接口本身不要求登录；
+        /// 但<b>取直链</b>这一步对身份敏感 —— 游客会被降级到只能预览的域名。
+        /// 所以必须把登录态传进来。</para>
+        /// </summary>
+        /// <param name="cookie">
+        /// 登录 Cookie；<b>传空串会退化成游客态，直链下不了</b>（仅用于诊断对照）。
+        /// </param>
+        /// <param name="sharedClient">
+        /// 直接复用的 <see cref="QuarkClient"/>（2026-10-23 新增）。
+        ///
+        /// <para>【为什么需要它】新建的 client 用的是配置里那份**静态 Cookie 快照**，
+        /// 取直链接口会放行，但换来的直链在真正下载时稳定 412
+        /// （Tengine Precondition Failed）—— 实测连点三次全失败。
+        /// 而主窗口那个**长期存活**的 client 从没失败过，
+        /// 它的会话 jar 里有服务端滚动下发的最新字段。</para>
+        ///
+        /// <para>传了这个就不再新建、也不 <c>Dispose</c> 它（生命周期归调用方）；
+        /// 传 null 则退回"用 cookie 新建一个"的老行为。</para>
+        /// </param>
         public QuarkReleaseChecker(string pwdId = null, string passcode = null,
-            TimeSpan? timeout = null)
+            string cookie = null, TimeSpan? timeout = null,
+            QuarkClient sharedClient = null)
         {
             _pwdId = string.IsNullOrEmpty(pwdId) ? DefaultPwdId : pwdId;
             _passcode = passcode ?? DefaultPasscode;   // 空串 = 分享没有提取码
+            _cookie = cookie ?? "";
+            _sharedClient = sharedClient;
             _timeout = timeout ?? TimeSpan.FromSeconds(15);
+        }
+
+        /// <summary>外部传入的长期 client（null = 自己新建）。</summary>
+        private readonly QuarkClient _sharedClient;
+
+        /// <summary>这次查链用的是不是登录态（诊断用）。</summary>
+        public bool IsLoggedIn
+        {
+            get { return !string.IsNullOrEmpty(_cookie); }
         }
 
         /// <summary>分享页地址（实例化后可取，方便 UI 用当前配置的源）。</summary>
@@ -93,25 +137,43 @@ namespace GeZi.Core.Update
         /// </summary>
         public async Task<QuarkRelease> FindLatestAsync(CancellationToken ct = default(CancellationToken))
         {
-            using (var client = new QuarkClient(""))
+            // ⚠️ 优先用外部传入的长期 client（与手动下载同一条会话），
+            //    否则才 new 一个（会拿到 412 的直链）。
+            var shared = _sharedClient;
+            var own = shared == null ? new QuarkClient(_cookie) : null;
+            try
             {
-                // 游客态：空 cookie 也能拿 stoken（分享本身没有登录要求）。
+                var client = shared ?? own;
+                Log("查夸克更新源: pwdId=" + _pwdId
+                    + " passcode=" + (string.IsNullOrEmpty(_passcode) ? "(无)" : "(有)")
+                    + " client=" + (shared != null ? "复用主窗口的（与手动下载同一会话）"
+                                                  : "新建（cookie " + _cookie.Length + " 字节）"));
+
                 ShareTokenInfo info;
                 try
                 {
                     info = await client.GetShareInfoAsync(_pwdId, _passcode).ConfigureAwait(false);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    Log("夸克源失败：拿 stoken 异常 " + ex.GetType().Name + ": " + ex.Message);
                     return null;
                 }
                 if (info == null || string.IsNullOrEmpty(info.Stoken))
+                {
+                    Log("夸克源失败：拿不到 stoken（分享可能失效或提取码变了）");
                     return null;
+                }
+                Log("夸克源 stoken OK，分享标题: " + info.Title);
 
                 var found = new List<QuarkRelease>();
                 await ScanAsync(client, _pwdId, info.Stoken, "0", 0, found, ct).ConfigureAwait(false);
                 if (found.Count == 0)
+                {
+                    Log("夸克源失败：分享里没有符合命名规则的安装包"
+                        + "（规则 " + PackageNamePattern + "）");
                     return null;
+                }
 
                 found.Sort((a, b) =>
                 {
@@ -119,39 +181,193 @@ namespace GeZi.Core.Update
                     if (c != 0) return c;
                     return b.PublishedTicks.CompareTo(a.PublishedTicks);
                 });
+                Log("夸克源找到 " + found.Count + " 个包，最新是 " + found[0].Version
+                    + "（" + found[0].FileName + "，" + found[0].Size + " 字节）");
                 return found[0];
+            }
+            finally
+            {
+                // 只释放自己创建的；外部传入的那个生命周期归调用方。
+                if (own != null) { try { own.Dispose(); } catch { } }
             }
         }
 
         /// <summary>
-        /// 取安装包的下载直链（不带 cookie，分享直链可直接下载）。
-        /// 独立于 <see cref="FindLatestAsync"/>，因为直链有时效，
-        /// 用户可能隔一会儿才点「一键更新」。
+        /// 取安装包的下载直链。
+        ///
+        /// <para>【2026-10-23 关键发现：必须**现查现取**，不能复用旧的 token】</para>
+        ///
+        /// <para>实测现象：用户手动下载同一个包能成（直链可探测 HTTP 206），
+        /// 但「一键更新」拿到直链后探测 <b>403 RequestDeniedByCallback /
+        /// require login [auth expired]</b>。</para>
+        ///
+        /// <para><b>根因</b>：<see cref="FindLatestAsync"/> 是在<b>用户点「检查更新」那一刻</b>
+        /// 跑的，它记下的 <c>Token</c>（share_fid_token）与 <c>Stoken</c> 都有寿命；
+        /// 而真正取链发生在用户点「一键更新」之后（中间可能隔几分钟、
+        /// 甚至用户看完更新说明再点）。这时旧 token 已被服务端判过期，
+        /// 拿它换来的直链在 OSS 回调校验时就会 auth expired。</para>
+        ///
+        /// <para><b>修法</b>：这里<b>不再用 rel 里存的 stoken/token</b>，
+        /// 而是重新走一遍「申请 stoken → 进目录 → 按 fid 找 entry 拿新 token」，
+        /// 拿到就用 —— 与手动下载的时序完全一致。</para>
         /// </summary>
         public async Task<string> ResolveDownloadUrlAsync(QuarkRelease rel,
             CancellationToken ct = default(CancellationToken))
         {
             if (rel == null || !rel.IsValid) return null;
-            using (var client = new QuarkClient(""))
+
+            // ⚠️ 优先复用主窗口那个长期 client（与手动下载同一会话）。
+            //    实测新建 client 取来的直链在下载阶段稳定 412。
+            QuarkClient shared = _sharedClient;
+            QuarkClient own = shared == null ? new QuarkClient(_cookie) : null;
+            QuarkClient client = shared ?? own;
+
+            try
             {
+                Log("夸克源准备取直链: fid=" + rel.Fid
+                    + " 旧token=" + Short(rel.Token)
+                    + " client=" + (shared != null ? "复用主窗口的（与手动下载同一会话）" : "新建"));
+
+                // ① 重新申请 stoken（旧的可能已过期）
+                string stoken = rel.Stoken;
                 try
                 {
-                    var links = await client.GetShareDownloadAsync(
-                        new List<string> { rel.Fid },
-                        new List<string> { rel.Token },
-                        rel.PwdId, rel.Stoken).ConfigureAwait(false);
-                    if (links == null || links.Count == 0) return null;
-                    foreach (var l in links)
-                        if (!string.IsNullOrEmpty(l.DownloadUrl))
-                            return l.DownloadUrl;
-                    return null;
+                    ShareTokenInfo fresh = await client.GetShareInfoAsync(rel.PwdId, _passcode)
+                        .ConfigureAwait(false);
+                    if (fresh != null && !string.IsNullOrEmpty(fresh.Stoken))
+                    {
+                        if (!string.Equals(fresh.Stoken, rel.Stoken, StringComparison.Ordinal))
+                            Log("夸克源：stoken 已更新（旧的可能过期）");
+                        stoken = fresh.Stoken;
+                    }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    Log("夸克源重新申请 stoken 失败，沿用旧的: " + ex.Message);
+                }
+
+                // ② 重新定位该文件，拿**新的** share_fid_token
+                //    （按 fid 找：fid 在同一分享内不变，名字可能改）
+                string token = rel.Token;
+                try
+                {
+                    QuarkFileEntry entry = await FindEntryByFidAsync(client, rel.PwdId, stoken, rel.Fid, ct)
+                        .ConfigureAwait(false);
+                    if (entry != null && !string.IsNullOrEmpty(entry.Token))
+                    {
+                        if (!string.Equals(entry.Token, rel.Token, StringComparison.Ordinal))
+                            Log("夸克源：token 已刷新（旧的可能过期）");
+                        token = entry.Token;
+                    }
+                    else
+                    {
+                        Log("夸克源：没能重新定位文件，沿用旧 token");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log("夸克源重新定位文件失败，沿用旧 token: " + ex.Message);
+                }
+
+                Log("夸克源取链参数: fid=" + Short(rel.Fid) + " token=" + Short(token)
+                    + " stoken=" + Short(stoken));
+
+                // ③ 取直链
+                List<DownloadLink> links = await client.GetShareDownloadAsync(
+                    new List<string> { rel.Fid },
+                    new List<string> { token },
+                    rel.PwdId, stoken).ConfigureAwait(false);
+
+                if (links == null || links.Count == 0)
+                {
+                    Log("夸克源取直链失败：接口没返回任何链接");
                     return null;
                 }
+
+                foreach (DownloadLink l in links)
+                {
+                    if (string.IsNullOrEmpty(l.DownloadUrl)) continue;
+                    string host = SafeHost(l.DownloadUrl);
+                    Log("夸克源拿到直链 host=" + host
+                        + " 长度=" + l.DownloadUrl.Length
+                        + (l.DownloadUrl.IndexOf("Signature=", StringComparison.OrdinalIgnoreCase) >= 0
+                            ? "（OSS 签名链）" : "（auth_key 链）")
+                        + (host.IndexOf("guest", StringComparison.OrdinalIgnoreCase) >= 0
+                            ? "  ⚠ 游客域名" : ""));
+                    return l.DownloadUrl;
+                }
+
+                Log("夸克源取直链失败：返回的链接里没有 download_url");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Log("夸克源取直链异常: " + ex.GetType().Name + ": " + ex.Message);
+                return null;
+            }
+            finally
+            {
+                // 只释放自己创建的；外部传入的那个生命周期归调用方。
+                if (own != null) { try { own.Dispose(); } catch { } }
             }
         }
+
+
+        private static string SafeHost(string url)
+        {
+            try { return new Uri(url).Host; } catch { return "?"; }
+        }
+
+        /// <summary>日志用：只留前 8 个字符，避免把凭证整条写进日志。</summary>
+        private static string Short(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "(空)";
+            return s.Length <= 8 ? s : s.Substring(0, 8) + "…(" + s.Length + ")";
+        }
+
+        /// <summary>
+        /// 在分享里**按 fid** 重新找出文件条目，拿它当前的 share_fid_token。
+        /// <para>用于取链前刷新 token（旧 token 可能已过期）。
+        /// fid 在同一分享内不变，比按名字可靠。</para>
+        /// </summary>
+        private async Task<QuarkFileEntry> FindEntryByFidAsync(QuarkClient client,
+            string pwdId, string stoken, string fid, CancellationToken ct)
+        {
+            var queue = new Queue<string>();
+            queue.Enqueue("0");
+            int visited = 0;
+            const int maxDirs = 100;   // 更新包所在的分享通常只有一两层
+
+            while (queue.Count > 0 && visited < maxDirs)
+            {
+                ct.ThrowIfCancellationRequested();
+                string dir = queue.Dequeue();
+                visited++;
+
+                List<QuarkFileEntry> items;
+                try
+                {
+                    items = await client.ShareDetailAsync(pwdId, stoken, dir).ConfigureAwait(false);
+                }
+                catch { continue; }
+                if (items == null) continue;
+
+                foreach (var it in items)
+                {
+                    if (it == null) continue;
+                    if (it.IsDir) { queue.Enqueue(it.Fid); continue; }
+                    if (string.Equals(it.Fid, fid, StringComparison.Ordinal))
+                        return it;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 诊断日志出口。主窗口启动时挂上（转到「运行日志」面板）；
+        /// 为空则静默 —— 让这个类在不关心日志的场景（单测/命令行）也能直接用。
+        /// </summary>
+        public static Action<string> Log { get; set; }
 
         /// <summary>递归扫分享目录（分享接口没有"全量递归列目录"，只能一层层来）。</summary>
         private async Task ScanAsync(QuarkClient client, string pwdId, string stoken,
@@ -163,11 +379,20 @@ namespace GeZi.Core.Update
             {
                 items = await client.ShareDetailAsync(pwdId, stoken, pdirFid).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
-                return;         // 单个目录读失败不该让整次检查失败
+                // 单个目录读失败不该让整次检查失败，但要能看见
+                Log("夸克源扫目录失败 (pdirFid=" + pdirFid + ", depth=" + depth
+                    + "): " + ex.GetType().Name + ": " + ex.Message);
+                return;
             }
-            if (items == null) return;
+            if (items == null)
+            {
+                Log("夸克源扫目录返回 null (pdirFid=" + pdirFid + ", depth=" + depth + ")");
+                return;
+            }
+            Log("夸克源扫目录 depth=" + depth + " pdirFid=" + pdirFid
+                + " 共 " + items.Count + " 项");
 
             foreach (var it in items)
             {

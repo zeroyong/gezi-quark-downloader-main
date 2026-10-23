@@ -403,6 +403,53 @@ namespace GeZi
             _scheduler.Log = LogFromWorker;
             _scheduler.Diagnostics = OnDiagnostics;
             LoadSettingsToUi();
+            // 【2026-10-23】把夸克更新源的诊断接到「运行日志」面板。
+            // 实测发现该源能查到版本、能取到直链，但游客态直链（dl-guest-*）
+            // 下载时被 CDN 拒（412）—— 没有日志时完全看不出问题在哪一步。
+            GeZi.Core.Update.QuarkReleaseChecker.Log = Log;
+            // 【2026-10-23】把更新服务的诊断也接到日志面板 ——
+            // 排查"GitHub 不通时夸克源能不能顶上"必须看得见每一步。
+            GeZi.Core.Update.UpdateInstaller.Log = Log;
+            UpdateService.Log = Log;
+            // 🚨 【2026-10-23】把"运行期有效 Cookie"的取法交给更新服务。
+            //
+            // 为什么必须这样：`_settings.Cookie` 只在**登录那一刻**写入，
+            // 冷启动时它是几天前的快照；而夸克的 __puus 会随请求滚动更新，
+            // 真正有效的那份在 `_client.CookieStr`。
+            // 实测：用手动下载能成功（1986 字节），但一键更新 403
+            // （服务端原文 `require login [auth expired]`），因为它拿到的是
+            // 1865 字节的旧值。
+            //
+            // 顺序与主窗口其它地方一致（见 ShowAccountsDialog / 导出 Cookie）：
+            //   ① _client.CookieStr（运行期最新）
+            //   ② _settings.Cookie（登录时保存的，可能过期）
+            UpdateService.CookieProvider = () =>
+            {
+                try
+                {
+                    if (_client != null && !string.IsNullOrEmpty(_client.CookieStr))
+                        return _client.CookieStr;
+                }
+                catch { }
+                return _settings != null ? _settings.Cookie : "";
+            };
+            // 🚨 【2026-10-23】把主窗口那个**长期存活**的 client 交给更新流程复用。
+            //
+            // 【为什么必须复用，而不是新建一个】
+            // 实测（同一份配置、同一个包、Cookie 长度都是 1986）：
+            //   · 更新流程自己 new QuarkClient → 取链成功，但下载阶段**稳定 412**
+            //     （Tengine Precondition Failed），连点三次全失败；
+            //   · 手动在分享页下载（用本窗口的 _client）→ 立刻 206 成功；
+            //   · 手动下载成功之后再点「一键更新」→ **也成功了**。
+            //
+            // 差别不在 Cookie 字符串（长度完全相同），而在于 `_client` 是
+            // **一直在用**的会话：它内部的 jar 收过服务端滚动下发的
+            // __puus/__kp/__kps 等字段，而新建的 client 只有配置里那份静态快照。
+            // 夸克 CDN 的 OAuth 回调据此判断"是不是活跃会话"，
+            // 于是对新建会话的直链在真正下载时返回 412。
+            //
+            // 复用之后，"一键更新"与"手动下载"走的是完全同一条链路。
+            UpdateService.SharedClientProvider = () => _client;
             // 检查更新：注入配置，恢复上次的红点状态（不在这里发网络请求）
             UpdateService.Attach(_settings);
             // Attach 之后 HasUpdate 才有值（LoadSettingsToUi 跑在 Attach 之前，
@@ -5346,6 +5393,13 @@ namespace GeZi
                     + " stoken=" + Short(_stoken)
                     + " 首个fid=" + Short(batch[0].Fid)
                     + " 首个token=" + Short(batch[0].Token));
+                // 【2026-10-23 诊断】打清"这次取链用的是不是登录态" ——
+                // 夸克更新源用**空 cookie（游客）** 取链，拿到的是 dl-guest-* 域名，
+                // 实测下载被拒（412）。手动免转存走这里，是**带登录态**的，
+                // 拿到的应该是 dl-pc-*。两条日志对照即可确认差别。
+                Log("[诊断·批量取链] 登录态: cookie 长度="
+                    + (_client == null || _client.CookieStr == null ? 0 : _client.CookieStr.Length)
+                    + "（0 = 游客，非 0 = 登录）");
                 return _client.GetShareDownloadAsync(
                     batch.Select(t => t.Fid).ToList(),
                     batch.Select(t => t.Token ?? "").ToList(),

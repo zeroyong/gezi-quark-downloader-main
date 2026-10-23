@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.IO.Compression;
@@ -87,10 +88,22 @@ namespace GeZi.Core.Update
 
         private readonly string _appDir;
 
-        public UpdateInstaller(string appDir)
+        public UpdateInstaller(string appDir) : this(appDir, null) { }
+
+        /// <summary>
+        /// 构造安装器。
+        /// </summary>
+        /// <param name="appDir">程序所在目录（覆盖目标）。</param>
+        /// <param name="cookie">
+        /// 登录 Cookie。**必须传**：夸克源的直链在游客态会降级到
+        /// <c>dl-guest-*</c> 域名，下载被 CDN 拒（412）；登录态才是 <c>dl-pc-*</c>。
+        /// GitHub 源的直链不需要它，传空也能下。
+        /// </param>
+        public UpdateInstaller(string appDir, string cookie)
         {
             if (string.IsNullOrEmpty(appDir)) throw new ArgumentNullException("appDir");
             _appDir = appDir;
+            _cookie = cookie ?? "";
         }
 
         /// <summary>程序所在目录（用于把更新内容覆盖到哪里）。</summary>
@@ -163,36 +176,157 @@ namespace GeZi.Core.Update
 
         // ---------------- 下载 ----------------
 
+        /// <summary>
+        /// 下载安装包。
+        ///
+        /// <para>【2026-10-23 重写：复用下载器那套 HttpClient + CookieContainer】</para>
+        ///
+        /// <para><b>原来的实现为什么不行</b>：用的是 <see cref="HttpWebRequest"/> +
+        /// 手写请求头（<c>req.Headers.Add("Cookie", ...)</c>），
+        /// 实测对夸克 OSS 直链（<c>dl-pc-sz.pds.quark.cn</c>，带
+        /// <c>Signature</c>/<c>callback</c>/<c>ud</c> 参数）<b>一律 403</b>，
+        /// 而**同一个 URL 交给下载器就能下</b>。</para>
+        ///
+        /// <para><b>差别在哪</b>：下载器用 <c>HttpClient</c> + <see cref="CookieContainer"/>
+        /// 种 cookie，并由 <see cref="NetworkOptions"/> 统一代理策略；
+        /// 手写 <c>HttpWebRequest</c> 会走另一条 request pipeline
+        /// （默认跟随系统代理、cookie 头手工拼、header 规范化不同），
+        /// OSS 的签名校验对这类差异很敏感。</para>
+        ///
+        /// <para><b>结论</b>：既然"下载器能下"，就<b>直接用下载器</b> ——
+        /// 这也正合用户的要求：「内置更新本质上也是下载最新版，
+        /// 那就在下载成功的地方复用，相当于不用人点击下载」。</para>
+        /// </summary>
         private async Task<string> DownloadAsync(string url, string dir, string fileName,
             IProgress<UpdateProgress> progress, CancellationToken ct)
         {
             string zip = Path.Combine(dir, SafeFileName(fileName));
-            var request = (HttpWebRequest)WebRequest.Create(url);
-            request.Method = "GET";
-            request.UserAgent = "GeZi-Updater";
-            request.Timeout = 60000;
-            request.ReadWriteTimeout = 60000;
-            request.Proxy = null;      // 与下载器一致：不跟系统代理走
 
-            using (ct.Register(() => { try { request.Abort(); } catch { } }))
-            using (var resp = (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false))
-            using (var src = resp.GetResponseStream())
-            using (var dst = new FileStream(zip, FileMode.Create, FileAccess.Write, FileShare.None))
+            // 【2026-10-23 逐字节对照用的完整诊断】
+            // 用户实测：同一个包、同一份登录态，手动免转存下载 HTTP 206 成功，
+            // 但「一键更新」走到这里就 412。为了在不接触用户机器的情况下定位，
+            // 这里把**请求的全部可观测面**打出来：
+            //   · 直链的每一个查询参数（auth_key / token / sp ... 逐项列出）
+            //   · Cookie 长度与头几个 key（不打值，避免泄漏登录态）
+            //   · 实际发出的请求头键名
+            // 拿到两份日志（成功的 + 失败的）就能逐字对比出差异。
+            try
             {
-                if (src == null) return null;
-                long total = resp.ContentLength;
-                long got = 0;
-                var buf = new byte[256 * 1024];
-                int n;
-                while ((n = await src.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false)) > 0)
+                DumpUrlDiagnostics(url);
+            }
+            catch { }
+
+            // 安装包只有几 MB，单线程足够；线程数给小值避免占满连接池。
+            int threads = 4;
+            // 关键：带上登录 Cookie。夸克分享直链在游客态会被降级到
+            // dl-guest-* 域名并最终 412，登录态才是 dl-pc-*。
+            using (var dl = new GeZi.Core.Download.SegmentedDownloader(
+                       threads: threads, cookie: _cookie ?? "",
+                       writeMode: GeZi.Core.Download.WriteMode.SegmentedFiles, partsRoot: null))
+            {
+                dl.Log = m => Log("  [upd-dl] " + m);
+
+                var inner = new Progress<GeZi.Core.Download.DownloadProgress>(p =>
                 {
-                    await dst.WriteAsync(buf, 0, n, ct).ConfigureAwait(false);
-                    got += n;
-                    Report(progress, UpdateStage.Downloading, got, total, null);
+                    if (p == null) return;
+                    Report(progress, UpdateStage.Downloading, p.Done, p.Total, null);
+                });
+
+                var res = await dl.DownloadAsync(url, zip, inner, ct,
+                    new GeZi.Core.Download.PauseToken()).ConfigureAwait(false);
+
+                if (!res.Ok)
+                {
+                    Log("安装包下载失败: " + res.Message);
+                    return null;
                 }
             }
+
+            if (!File.Exists(zip) || new FileInfo(zip).Length == 0)
+            {
+                Log("安装包下载后文件不存在或为空");
+                return null;
+            }
+            Log("安装包下载完成: " + new FileInfo(zip).Length + " 字节");
             return zip;
         }
+
+        /// <summary>
+        /// 把直链与请求上下文的全部可观测细节打进日志（2026-10-23，定位 412 用）。
+        ///
+        /// <para>【为什么打这么细】同一个安装包：手动免转存下载 206 成功、
+        /// 一键更新 412 失败。两者用的类、代码路径、Cookie 都相同，
+        /// 差别只在"哪一次请求"。没有逐参数对照就无法定位 ——
+        /// 所以这里把 host、path、每个查询参数、Cookie 长度与键名全部列出来，
+        /// 让两份日志能逐字比对。</para>
+        ///
+        /// <para>⚠️ <b>不打 Cookie 的值</b>（那是登录凭证），只打长度与键名。</para>
+        /// </summary>
+        private void DumpUrlDiagnostics(string url)
+        {
+            Log("==== 更新下载诊断 ====");
+            try
+            {
+                var u = new Uri(url);
+                Log("  host = " + u.Host);
+                Log("  path = " + u.AbsolutePath);
+                Log("  完整长度 = " + url.Length);
+
+                // 逐参数列出（值超过 48 字符就截断，但保留长度 —— 长度差异本身是信号）
+                string q = u.Query.TrimStart('?');
+                Log("  查询参数 " + q.Split('&').Length + " 个:");
+                foreach (string kv in q.Split('&'))
+                {
+                    if (kv.Length == 0) continue;
+                    int eq = kv.IndexOf('=');
+                    string k = eq > 0 ? kv.Substring(0, eq) : kv;
+                    string v = eq > 0 ? kv.Substring(eq + 1) : "";
+                    string show = v.Length <= 48 ? v : v.Substring(0, 48) + "…";
+                    Log("    " + k + " (len=" + v.Length + ") = " + show);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("  解析直链失败: " + ex.Message);
+            }
+
+            // Cookie：只打长度和键名
+            try
+            {
+                string ck = _cookie ?? "";
+                Log("  Cookie 长度 = " + ck.Length);
+                if (ck.Length > 0)
+                {
+                    var keys = new List<string>();
+                    foreach (string part in ck.Split(';'))
+                    {
+                        string p = part.Trim();
+                        if (p.Length == 0) continue;
+                        int eq = p.IndexOf('=');
+                        keys.Add(eq > 0 ? p.Substring(0, eq) : p);
+                    }
+                    Log("  Cookie 键名 = " + string.Join(",", keys.ToArray()));
+                }
+                else
+                {
+                    Log("  ⚠ Cookie 为空（游客态）—— 夸克会降级到 dl-guest-* 并返回 412");
+                }
+            }
+            catch { }
+
+            Log("  线程数 = 4，写入模式 = SegmentedFiles");
+            Log("==== 诊断结束 ====");
+        }
+
+        /// <summary>
+        /// 下载安装包时用的登录 Cookie（来自设置）。
+        /// <para>空串 = 游客态，夸克源会拿到 <c>dl-guest-*</c> 直链并最终 412，
+        /// 所以主程序在构造本类时应当把登录 Cookie 传进来。</para>
+        /// </summary>
+        private readonly string _cookie;
+
+        /// <summary>诊断日志出口（主窗口挂到「运行日志」）。为空则静默。</summary>
+        public static Action<string> Log { get; set; }
 
         // ---------------- 脚本接力 ----------------
 

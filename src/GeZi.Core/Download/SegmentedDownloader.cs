@@ -906,10 +906,36 @@ namespace GeZi.Core.Download
                             body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false) ?? "";
                         }
                         catch { }
+                        // 【2026-10-23】把响应头也一并打出来 —— 定位 412/403 时，
+                        // 服务端到底是 Tengine 挡的还是 OSS 回调挡的，区别很大：
+                        //   · Tengine 的 412 只有一行 HTML → 请求层被拦（可能签名/来源校验）
+                        //   · OSS 的 403 会带 <Code>xxx</Code> → 业务层拒绝，能看到具体原因
+                        var rspKeys = new List<string>();
+                        try
+                        {
+                            foreach (var hdr in resp.Headers)
+                                rspKeys.Add(hdr.Key + "=" + string.Join(",", hdr.Value));
+                        }
+                        catch { }
+                        string rspHeaders = rspKeys.Count == 0 ? "-"
+                            : Trim(string.Join(" | ", rspKeys.ToArray()), 400);
+
                         Log?.Invoke("[诊断·探测] 直链探测 HTTP " + probeCode + " "
                             + (resp.ReasonPhrase ?? "")
                             + "｜host=" + SafeHost(url)
-                            + "｜body=" + Trim(body.Replace("\r", " ").Replace("\n", " "), 300));
+                            + (SafeHost(url).IndexOf("guest", StringComparison.OrdinalIgnoreCase) >= 0
+                                ? "｜⚠ 游客域名" : "｜登录域名")
+                            + "｜响应头=" + rspHeaders
+                            + "｜body=" + Trim(body.Replace("\r", " ").Replace("\n", " "), 600));
+                    }
+                    else
+                    {
+                        // 探测成功也记一行：这样"哪种域名能下"就有正面证据，
+                        // 而不是只靠失败日志反推。
+                        Log?.Invoke("[诊断·探测] 直链可用 HTTP " + probeCode
+                            + "｜host=" + SafeHost(url)
+                            + "｜Content-Range=" + (resp.Content.Headers.ContentRange == null
+                                ? "-" : resp.Content.Headers.ContentRange.ToString()));
                     }
 
                     if (probeCode == 206)
