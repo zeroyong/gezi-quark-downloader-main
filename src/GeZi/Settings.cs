@@ -49,8 +49,33 @@ namespace GeZi
         /// </summary>
         public bool AutoTune { get; set; } = false;
 
+        /// <summary>
+        /// 网盘文件列表按名排序时是否倒序（2026-10-24 新增）。
+        ///
+        /// <para>【用户需求】「另外把上级按钮改成按文件名（默认倒序）」。</para>
+        ///
+        /// <para>true = 降序 Z→A（默认）；false = 升序 A→Z。
+        /// 目录始终排在最前，本项只影响同类内部的顺序。</para>
+        /// </summary>
+        public bool FileSortDescending { get; set; } = true;
+
         public string OutDir { get; set; } = "";
         public bool AutoClean { get; set; } = true;
+
+        /// <summary>
+        /// 分享模式下点「下载」时，是否先询问「要不要转存后下载」（2026-10-24 新增）。
+        ///
+        /// <para>【用户实测发现】免转存的速度**甚至比转存更快**：
+        /// 转存要先往网盘写一份中转文件（占空间 + 多一次写盘 + 取链绕一圈），
+        /// 而免转存直接从分享取链。用户原话：
+        /// 「发现免转存速度甚至比转存快，所以在下载选中时，添加提示：
+        ///  是否转存文件后下载，这样不仅下载速度变慢、而且会占用我的云盘空间」。</para>
+        ///
+        /// <para>默认 <c>false</c>（= 询问），因为两个选项确实各有取舍：
+        /// 转存后中转副本在网盘里，**续传更稳**（副本不依赖分享 stoken）；
+        /// 免转存不占空间、更快，但 stoken 过期后需要重新解析分享才能续传。</para>
+        /// </summary>
+        public bool AskBeforeSave { get; set; } = true;
 
         /// <summary>
         /// 分片落盘方式。**已唯一化为 SegmentedFiles（独立分片 + 边合并）**。

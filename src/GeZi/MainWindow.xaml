@@ -650,6 +650,25 @@
                                             <TextBlock Text="上级" Margin="6,0,0,0" VerticalAlignment="Center"/>
                                         </StackPanel>
                                     </Button>
+                                    <!-- 【2026-10-24 新增】按文件名排序（用户要求「把上级按钮改成按文件名
+                                         （默认倒序）」→ 澄清后改为保留「上级」、另加一个排序按钮）。
+                                         点一下在 升序 / 降序 之间切换，默认倒序。
+                                         目录始终排在最前（与资源管理器一致），排序只作用于同类内部。 -->
+                                    <Button x:Name="DriveSortBtn" Click="OnToggleFileSort"
+                                            Style="{StaticResource ToolButton}"
+                                            ToolTip="按文件名排序（点击切换 升序 / 降序，默认倒序）">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Path x:Name="SortIconPath" Data="{StaticResource IconSortDesc}"
+                                                  Stretch="Uniform"
+                                                  Width="13" Height="13" VerticalAlignment="Center"
+                                                  Stroke="{DynamicResource TextSecondaryBrush}"
+                                                  StrokeThickness="2"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                  StrokeLineJoin="Round"/>
+                                            <TextBlock x:Name="DriveSortBtnText" Text="文件名 ↓"
+                                                       Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
                                     <Button x:Name="DriveRefreshBtn" Click="OnRefresh"
                                             Style="{StaticResource ToolButton}">
                                         <StackPanel Orientation="Horizontal">
@@ -905,6 +924,24 @@
                                           StrokeStartLineCap="Round" StrokeEndLineCap="Round"
                                           StrokeLineJoin="Round"/>
                                     <TextBlock Text="获取直链" Margin="7,0,0,0" VerticalAlignment="Center"/>
+                                </StackPanel>
+                            </Button>
+                            <!-- 【2026-10-24 新增】清空当前目录。
+                                 用户需求：「有时候转存太多」，需要一个一键清空的入口。
+                                 只删**当前目录下的条目**（不递归进子文件夹）—— 那样风险太大，
+                                 而且「删除文件夹」在夸克侧本身就是递归删的，行为难以预期。
+                                 点击后先统计「共 N 个文件，总计 X GB」再二次确认。 -->
+                            <Button x:Name="EmptyDirBtn" Click="OnEmptyCurrentDir"
+                                    Style="{StaticResource SecondaryButton}" Margin="8,0,0,0"
+                                    ToolTip="删除当前目录下的全部文件与文件夹（不进入子文件夹，不可恢复）">
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconXCircle}" Stretch="Uniform" Width="14"
+                                          Height="14" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource DangerBrush}" StrokeThickness="1.9"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                          StrokeLineJoin="Round"/>
+                                    <TextBlock Text="清空当前目录" Margin="7,0,0,0" VerticalAlignment="Center"
+                                               Foreground="{DynamicResource DangerBrush}"/>
                                 </StackPanel>
                             </Button>
                             <!-- 【用户要求】「标红的是后方括号内的字」——
@@ -2233,6 +2270,19 @@
                                               Content="下载完成后自动清理云盘转存文件"
                                               Style="{StaticResource AppCheckBox}"
                                               Click="OnSettingChanged"/>
+
+                                    <!-- 【2026-10-24 新增】下载前询问是否转存。
+                                         用户实测：「发现免转存速度甚至比转存快，所以在下载选中时，
+                                         添加提示：是否转存文件后下载，这样不仅下载速度变慢、
+                                         而且会占用我的云盘空间」—— 默认「否」即免转存。
+                                         但转存换来的好处是「续传更稳」（副本不依赖分享 stoken），
+                                         所以不替用户独断，给一个可关闭的询问。 -->
+                                    <CheckBox x:Name="AskBeforeSaveCheck"
+                                              Content="下载前询问「是否转存后下载」（转存会占网盘空间，但续传更稳）"
+                                              Style="{StaticResource AppCheckBox}"
+                                              Margin="0,8,0,0"
+                                              Click="OnAskBeforeSaveChanged"
+                                              AutomationProperties.Name="下载前询问是否转存"/>
 
                                     <!-- 跟随系统代理：默认关闭（直连），公司网络/只能经代理出口时才开。
                                          【2026-10-20】走独立处理器 OnSystemProxyChanged，**不**走 OnSettingChanged ——

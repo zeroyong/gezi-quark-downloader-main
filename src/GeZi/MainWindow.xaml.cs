@@ -2013,6 +2013,33 @@ namespace GeZi
         /// <para>开关一改就立刻重排并落盘 —— 用户想看到的是"勾上马上生效"，
         /// 而不是下次启动才变。</para>
         /// </summary>
+        /// <summary>
+        /// 设置页「下载前询问是否转存」勾选变化（2026-10-24 新增）。
+        ///
+        /// <para>【用户需求】「发现免转存速度甚至比转存快，所以在下载选中时，
+        /// 添加提示：是否转存文件后下载」。</para>
+        ///
+        /// <para>勾选 = 每次下载前问一次（默认）；
+        /// 取消 = 静默走「转存→取直链」（原来的行为，续传更稳）。</para>
+        /// </summary>
+        private void OnAskBeforeSaveChanged(object sender, RoutedEventArgs e)
+        {
+            if (_applyingSettings) return;
+            try
+            {
+                bool on = AskBeforeSaveCheck.IsChecked == true;
+                _settings.AskBeforeSave = on;
+                SettingsStore.Save(_settings);
+                Log(on
+                    ? "已开启：下载前会询问「是否转存后下载」（默认「否」= 免转存，更快）"
+                    : "已关闭：下载时直接走「转存→取直链」（续传更稳，但会占用网盘空间）");
+            }
+            catch (Exception ex)
+            {
+                Log("转存询问设置保存失败: " + ex.Message);
+            }
+        }
+
         private void OnTaskUnfinishedFirstChanged(object sender, RoutedEventArgs e)
         {
             // 回填控件时也会触发 Click（走 _applyingSettings 保护，同其它设置项）
@@ -2987,18 +3014,103 @@ namespace GeZi
                 : _client.ListDirPageAsync(fid, page);
         }
 
-        /// <summary>目录在前、文件在后，同类按名称排序 —— 与 Python Flet 版一致。</summary>
-        private static List<ShareFileItem> SortDirEntries(IList<QuarkFileEntry> items)
+        /// <summary>
+        /// 当前文件列表的按名排序方向（2026-10-24 新增）。
+        ///
+        /// <para>【用户需求】「把上级按钮改成按文件名（默认倒序）」——
+        /// 澄清后改为：保留「上级」，另加一个排序按钮，默认倒序。</para>
+        ///
+        /// <para>true = 降序（Z→A，默认）；false = 升序（A→Z）。
+        /// <b>目录始终排在最前</b>（与资源管理器一致），排序只作用于同类内部。</para>
+        /// </summary>
+        private bool _fileSortDescending = true;
+
+        /// <summary>
+        /// 当前列表的排序方向在界面上不可见时（如从缓存还原），用它重排一次。
+        /// 把已构造好的 <see cref="ShareFileItem"/> 按当前方向排序。
+        /// </summary>
+        private List<ShareFileItem> SortFileItems(IEnumerable<ShareFileItem> items)
         {
-            return items
-                .OrderBy(it => it.IsDir ? 0 : 1)
-                .ThenBy(it => it.Name, StringComparer.CurrentCultureIgnoreCase)
-                .Select(it => new ShareFileItem
+            if (items == null) return new List<ShareFileItem>();
+            // 目录在前，然后按名称（方向由 _fileSortDescending 决定）
+            return _fileSortDescending
+                ? items.OrderBy(it => it.IsDir ? 0 : 1)
+                       .ThenByDescending(it => it.Name, StringComparer.CurrentCultureIgnoreCase)
+                       .ToList()
+                : items.OrderBy(it => it.IsDir ? 0 : 1)
+                       .ThenBy(it => it.Name, StringComparer.CurrentCultureIgnoreCase)
+                       .ToList();
+        }
+
+        /// <summary>目录在前、文件在后，同类按名称排序 —— 与 Python Flet 版一致。</summary>
+        private List<ShareFileItem> SortDirEntries(IList<QuarkFileEntry> items)
+        {
+            // 2026-10-24：改为实例方法并遵循 _fileSortDescending（默认倒序）。
+            return SortFileItems(items.Select(it => new ShareFileItem
+            {
+                Fid = it.Fid, Name = it.Name, Size = it.Size,
+                IsDir = it.IsDir, Token = it.Token,
+            }));
+        }
+
+        /// <summary>
+        /// 点击「文件名 ↓ / ↑」按钮：切换排序方向并就地重排当前列表。
+        ///
+        /// <para>【为什么不重新加载目录】用户点排序只想要"眼睛看到的顺序变一下"，
+        /// 重新走 <c>LoadDirAsync</c> 会发一串网络请求、丢失多选状态、还打断滚动位置。
+        /// 这里直接对已加载的 <c>_files</c> 重排即可。</para>
+        /// </summary>
+        private void OnToggleFileSort(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                _fileSortDescending = !_fileSortDescending;
+
+                // 更新按钮外观：文字 + 图标
+                if (DriveSortBtnText != null)
+                    DriveSortBtnText.Text = _fileSortDescending ? "文件名 ↓" : "文件名 ↑";
+                if (SortIconPath != null)
                 {
-                    Fid = it.Fid, Name = it.Name, Size = it.Size,
-                    IsDir = it.IsDir, Token = it.Token,
-                })
-                .ToList();
+                    SortIconPath.Data = (System.Windows.Media.Geometry)
+                        FindResource(_fileSortDescending ? "IconSortDesc" : "IconSortAsc");
+                }
+
+                // 记住用户偏好（下次启动沿用）
+                try
+                {
+                    _settings.FileSortDescending = _fileSortDescending;
+                    SettingsStore.Save(_settings);
+                }
+                catch { }
+
+                // 就地重排（保留选中项）
+                var selectedFids = new HashSet<string>(
+                    FileList.SelectedItems.Cast<ShareFileItem>()
+                        .Where(x => x != null && !string.IsNullOrEmpty(x.Fid))
+                        .Select(x => x.Fid), StringComparer.Ordinal);
+
+                var sorted = SortFileItems(_files);
+                _files.Clear();
+                foreach (var it in sorted) _files.Add(it);
+
+                // 恢复选中
+                if (selectedFids.Count > 0)
+                {
+                    try
+                    {
+                        foreach (var it in _files)
+                            if (selectedFids.Contains(it.Fid)) FileList.SelectedItems.Add(it);
+                    }
+                    catch { }
+                }
+
+                Log("文件列表已按名称" + (_fileSortDescending ? "倒序" : "正序")
+                    + "排列（共 " + _files.Count + " 项，目录始终在前）。");
+            }
+            catch (Exception ex)
+            {
+                Log("切换排序失败: " + ex.Message);
+            }
         }
 
         /// <summary>
@@ -3622,6 +3734,119 @@ namespace GeZi
             catch (Exception ex)
             {
                 Log("删除网盘文件失败: " + ex.Message);
+            }
+            finally
+            {
+                SetBusy(false);
+            }
+        }
+
+        /// <summary>
+        /// 清空当前目录（2026-10-24 新增）。
+        ///
+        /// <para>【用户需求】「给我的网盘添加一个清空所有的按钮，点击后提示用户
+        /// 是否删除 num 个文件，总大小：size —— 有时候转存太多」。</para>
+        ///
+        /// <para><b>只删当前目录这一层</b>，不递归进子文件夹。理由：
+        /// ① 递归删风险太大，用户看不到自己删了什么；
+        /// ② 夸克删文件夹本身就是递归的，行为难以预期；
+        /// ③ 「清空当前目录」这个语义本身就该是"这一层"。</para>
+        ///
+        /// <para>统计口径：文件用接口给的真实 <c>Size</c>；文件夹用后台算出的
+        /// <c>DirSize</c>（可能还是 null = 计算中），此时如实说明"部分未统计"，
+        /// 不假装知道总大小。</para>
+        /// </summary>
+        private async void OnEmptyCurrentDir(object sender, RoutedEventArgs e)
+        {
+            if (_client == null) { Log("请先登录"); return; }
+            if (ShareMode)
+            {
+                Log("「清空当前目录」只在「我的网盘」模式下可用（分享里的文件属于分享者）");
+                AppDialog.Show(this,
+                    "这里浏览的是**别人的分享**，不能删除。\n\n"
+                    + "请切到「我的网盘」再使用「清空当前目录」。",
+                    "只能清空自己的网盘", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var all = _files.Where(f => f != null && !string.IsNullOrEmpty(f.Fid)).ToList();
+            if (all.Count == 0)
+            {
+                Log("当前目录已经是空的。");
+                return;
+            }
+
+            // ---- 统计：个数 + 总大小 ----
+            int fileCount = all.Count(f => !f.IsDir);
+            int dirCount = all.Count(f => f.IsDir);
+
+            long knownBytes = 0;
+            int sizeUnknown = 0;
+            foreach (var f in all)
+            {
+                if (!f.IsDir) { knownBytes += f.Size; }
+                else if (f.DirSize.HasValue) { knownBytes += f.DirSize.Value; }
+                else if (f.DirSizeFailed) { sizeUnknown++; }   // 算失败：大小确实不知道
+                else { sizeUnknown++; }                        // 还在计算中
+            }
+
+            string sizeText;
+            if (sizeUnknown == 0)
+                sizeText = Util.FormatSize(knownBytes);
+            else
+                sizeText = Util.FormatSize(knownBytes) + " 以上（" + sizeUnknown
+                    + " 个文件夹大小未统计完，实际可能更大）";
+
+            string detail = string.Format(
+                "共 {0} 项 —— {1} 个文件{2}，总大小：{3}",
+                all.Count,
+                fileCount,
+                dirCount > 0 ? "、" + dirCount + " 个文件夹" : "",
+                sizeText);
+
+            var ans = AppDialog.Show(this,
+                "确定要清空当前目录吗？\n\n"
+                + detail + "\n\n"
+                + "· 只会删除**当前这一层**，不会进入子文件夹内部\n"
+                + "· 删除后会一并清空回收站，**无法恢复**\n\n"
+                + "如果只想删掉一部分，请按 Esc 取消，改用多选（快捷键 s）后删除。",
+                "清空当前目录", MessageBoxButton.YesNo, MessageBoxImage.Warning,
+                MessageBoxResult.No);
+            if (ans != MessageBoxResult.Yes) return;
+
+            var fids = all.Select(f => f.Fid).ToList();
+
+            SetBusy(true);
+            try
+            {
+                Log("正在清空当前目录（" + fids.Count + " 项，" + detail + "）…");
+
+                // 夸克接口对单次删除有数量上限，分批提交更稳（每批 100）
+                const int batch = 100;
+                int done = 0;
+                for (int i = 0; i < fids.Count; i += batch)
+                {
+                    var slice = fids.Skip(i).Take(batch).ToList();
+                    await _client.DeleteAsync(slice);
+                    try { await _client.PurgeRecycleAsync(slice); } catch { }
+                    done += slice.Count;
+                    if (fids.Count > batch)
+                        Log("  已删除 " + done + " / " + fids.Count + " 项…");
+                }
+
+                Log("已清空当前目录，共删除 " + done + " 项。");
+
+                // 清空后重新加载（顺带把容量卡刷新 —— 删文件会改变已用空间）
+                await LoadDirAsync(_curFid);
+                await RefreshCapacityAsync();
+            }
+            catch (Exception ex)
+            {
+                Log("清空当前目录失败: " + ex.Message);
+                AppDialog.Show(this,
+                    "清空时出错：\n\n" + ex.Message
+                    + "\n\n已经删掉的部分不会恢复，可以刷新列表确认当前状态。",
+                    "清空失败", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
             finally
             {
@@ -5037,6 +5262,13 @@ namespace GeZi
 
                 var items = await GetDownloadItemsAsync(files, forceNoSave);
 
+                // 用户在上面的「是否转存」询问里点了取消 → 直接收工
+                if (items == null)
+                {
+                    Log("已取消下载。");
+                    return;
+                }
+
                 // 【2026-10-24 新增】自动调度：开下载前按**真实文件数**重算一次。
                 //
                 // 设置页那个「当前：单文件 64 路 × 同时 5 个」只是在文件数未知时
@@ -5194,6 +5426,54 @@ namespace GeZi
                 bool loggedIn = !string.IsNullOrEmpty(_settings.Cookie);
                 if (loggedIn)
                 {
+                    // 【2026-10-24 新增】下载前先问一句「要不要转存」。
+                    //
+                    // 【为什么改默认行为】用户实测发现**免转存反而更快**：
+                    // 转存要先往网盘写一份中转文件（占空间 + 多一次写盘 + 取链绕一圈），
+                    // 免转存直接从分享取链。用户原话：
+                    //   「发现免转存速度甚至比转存快，所以在下载选中时，添加提示：
+                    //    是否转存文件后下载，这样不仅下载速度变慢、而且会占用我的云盘空间」
+                    //
+                    // 【为什么不直接改成默认免转存】两者各有取舍，不能替用户独断：
+                    //   · 转存后中转副本在网盘里 → **续传更稳**（不依赖分享 stoken，
+                    //     而 stoken 几小时~几天就过期，过期后免转存任务必须重新解析分享）
+                    //   · 免转存 → 不占空间、更快，但续传依赖 stoken
+                    // 所以：**问一次**，用户自己选。默认按钮是「免转存」（更快、更省）。
+                    //
+                    // 「不再询问」由设置项控制（设置 → 下载与网络），勾掉就回到原来的
+                    // 无条件转存行为 —— 给不想每次被问的用户一条路。
+                    //
+                    // ⚠️ 【2026-10-24 改：只用两个按钮，不要 Cancel】
+                    // 第一版用了 YesNoCancel，把「否」当成"免转存"、
+                    // 「取消」当成"什么都不做"。但用户看到「否」时以为那是取消，
+                    // 于是点了之后发现"下载没开始"，体验成为：
+                    // 「否就直接免转存下载啊，还直接退出干嘛」。
+                    // 现在只有两个按钮：
+                    //   是 → 转存后下载
+                    //   否 → 免转存下载（默认，也是用户实测更快的那个）
+                    // 想放弃下载，直接关掉对话框（右上角 × 等价于"否"也合理，
+                    // 因为默认动作就是免转存，不会造成任何意外后果）。
+                    if (_settings.AskBeforeSave)
+                    {
+                        var choice = AppDialog.Show(this,
+                            "要把这些文件**转存到你的网盘**再下载吗？\n\n"
+                            + "· 选「否」= 免转存：直接从分享取链，**更快**、不占网盘空间\n"
+                            + "  （分享凭证过期后，续传需要重新解析分享）\n\n"
+                            + "· 选「是」= 先转存：往网盘写一份中转副本，**续传更稳**\n"
+                            + "  （会占用网盘空间，下载完成后可自动清理）\n\n"
+                            + "想以后不再问，去「设置 → 下载与网络」关掉「下载前询问是否转存」。",
+                            "是否转存后下载",
+                            MessageBoxButton.YesNo, MessageBoxImage.Question,
+                            MessageBoxResult.No);   // ← 默认「否」= 免转存（更快）
+
+                        if (choice != MessageBoxResult.Yes)
+                        {
+                            Log("按你的选择走「免转存」：直接从分享取链，不写入网盘。");
+                            return await NoSaveGetItemsAsync(files);
+                        }
+                        Log("按你的选择先转存到网盘，再取直链下载。");
+                    }
+
                     Log("已登录，走「转存→取直链」路径（更稳定）");
                     try
                     {
@@ -7063,6 +7343,65 @@ namespace GeZi
             ApplyTaskOrder();   // 按「新任务在前 / 在后」的偏好重排
             Log(string.Format("已恢复上次的任务记录: {0} 项{1}", restored,
                 unfinished > 0 ? "（其中 " + unfinished + " 个未完成，点 ▶ 可续传）" : ""));
+
+            // 【2026-10-24 新增】检测重复目标路径。
+            //
+            // 【为什么需要】DownloadScheduler 有同路径互斥（`_activeDests`），
+            // 两条任务指向同一个磁盘文件时，**后开始的那条必然失败**，
+            // 错误是「已跳过：同一文件正在下载中」。用户实测遇到过：
+            // 恢复全部后有几个文件报这个错，而且因为状态变成 Failed，
+            // 点重试又走同一路径、又失败 —— 看起来像"永远恢复不了"。
+            //
+            // 根因往往是历史原因留下的重复行（同一个文件被加了两次）。
+            // 程序不能替用户删（也许是两个不同来源的同名文件），
+            // 但**至少要告诉他是哪几行**，否则他只能一行行点「定位」去比对磁盘路径。
+            DetectDuplicateDestinations();
+        }
+
+        /// <summary>
+        /// 找出任务列表里指向同一个目标路径的多条任务，写进日志提醒用户。
+        ///
+        /// <para>【为什么不自动删】无法判断哪条该留：可能真的是两个不同来源
+        /// 但同名同目录的文件（此时它们本就该在下载时改名），
+        /// 也可能是用户重复添加。自动删有丢任务的的风险，所以只报告。</para>
+        /// </summary>
+        private void DetectDuplicateDestinations()
+        {
+            try
+            {
+                if (_tasks == null || _tasks.Count < 2) return;
+
+                var groups = _tasks
+                    .Where(t => t != null && t.Job != null && !string.IsNullOrEmpty(t.Job.Dest))
+                    .GroupBy(t => t.Job.Dest, StringComparer.OrdinalIgnoreCase)
+                    .Where(g => g.Count() > 1)
+                    .ToList();
+                if (groups.Count == 0) return;
+
+                int totalRows = groups.Sum(g => g.Count());
+                Log(string.Format(
+                    "⚠ 发现 {0} 个目标路径被 {1} 条任务重复占用。"
+                    + "同一路径的任务只有一条能真正下载，其余会报「已跳过：同一文件正在下载中」。",
+                    groups.Count, totalRows));
+
+                foreach (var g in groups)
+                {
+                    // 只列前 3 条，剩下的用"…"概括，避免日志刷屏
+                    var names = g.Take(3).Select(t =>
+                        t.Name + "（" + t.StatusText + "）");
+                    string more = g.Count() > 3 ? " 等 " + g.Count() + " 条" : "";
+                    Log("  · " + string.Join(" / ", names) + more
+                        + "  →  " + g.Key);
+                }
+
+                Log("  处理建议：点行内「定位」确认是不是同一个磁盘文件；"
+                    + "如果是重复添加的，删掉多余那条后即可正常续传。");
+            }
+            catch (Exception ex)
+            {
+                // 检测本身失败不该影响启动
+                Log("重复路径检测失败（不影响使用）: " + ex.Message);
+            }
         }
 
         /// <summary>
@@ -10557,6 +10896,19 @@ namespace GeZi
                 // 【2026-10-24】自动调度：回填勾选 + 若是开启状态，按自动值刷新
                 // 两个输入框并置灰（否则用户会看到"勾开着但还能手改"的矛盾界面）。
                 AutoTuneCheck.IsChecked = _settings.AutoTune;
+                // 【2026-10-24】下载前询问是否转存（默认开）
+                AskBeforeSaveCheck.IsChecked = _settings.AskBeforeSave;
+                // 【2026-10-24】网盘文件列表排序方向（默认倒序）→ 回填到工具栏按钮
+                _fileSortDescending = _settings.FileSortDescending;
+                try
+                {
+                    if (DriveSortBtnText != null)
+                        DriveSortBtnText.Text = _fileSortDescending ? "文件名 ↓" : "文件名 ↑";
+                    if (SortIconPath != null)
+                        SortIconPath.Data = (System.Windows.Media.Geometry)
+                            FindResource(_fileSortDescending ? "IconSortDesc" : "IconSortAsc");
+                }
+                catch { }
                 // 外观主题：把配置里的选择回填到三个单选（_applyingSettings 已挡掉 Checked）
                 SyncThemeRadios();
                 // 任务列表排序偏好 → 同步工具栏那颗切换按钮的文案与图标
