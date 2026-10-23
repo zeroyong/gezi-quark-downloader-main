@@ -1986,6 +1986,38 @@
                                                  KeyDown="OnSettingKeyDown"/>
                                     </Grid>
 
+                                    <!-- ========== 自动调度（2026-10-24 新增）==========
+                                         用户需求：「一般设置几个同时下载数，速度更能跑满？
+                                         可以加一个自动调度的选项，然后自动计算」。
+
+                                         为什么需要它：单文件并发 × 同时任务数 = 总连接数，
+                                         而后者受**账号配额**限制（夸克实测 512 为最优总量）。
+                                         用户自己很难算：7 个文件 × 256 路 = 1792 条，
+                                         远超配额后反而只有几百 KB/s。
+                                         打开这个开关后，程序按 总预算 512 自动把
+                                         「单文件并发」和「同时任务数」配对，用户不用管。
+                                         关掉则完全按上面两项手填值走（保留给想自己调的人）。 -->
+                                    <Grid Margin="0,0,0,10">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="自动调度" Style="{StaticResource FieldLabel}"/>
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                            <CheckBox x:Name="AutoTuneCheck"
+                                                      Content="自动计算并发（推荐）"
+                                                      Style="{StaticResource AppCheckBox}"
+                                                      VerticalAlignment="Center"
+                                                      Checked="OnAutoTuneChanged"
+                                                      Unchecked="OnAutoTuneChanged"/>
+                                            <TextBlock x:Name="AutoTuneHint"
+                                                       Style="{StaticResource TertiaryText}"
+                                                       Margin="12,0,0,0"
+                                                       VerticalAlignment="Center"
+                                                       Text=""/>
+                                        </StackPanel>
+                                    </Grid>
+
                                     <!-- 【2026-10-21】任务列表排序（用户要求）：
                                          「假如有多个文件在文件夹下，应该优先展示未完成的文件，
                                          因为有时候需要滚动到底部才发现」。

@@ -112,44 +112,103 @@ namespace GeZi.Core.Download
                 return result;
             }
 
-            // 有效预算：按"要分几批才跑完"放大（见 remarks）
+            // 有效预算 = 总预算本身（**不放大**）。
+            //
+            // 【2026-10-24 修：两处放大都是错的】
+            //
+            // ① 原实现 `effBudget = budget × ceil(N/concurrency)`：
+            //    实测（用户 7 个 3.2GB 文件，Threads=256，ConcurrentTasks=3）：
+            //        waves = ceil(7/3) = 3
+            //        effBudget = 512 × 3 = 1536
+            //        每文件份额 = 1536 × (3.2/20.68) ≈ 238 → 夹到上限 256
+            //    ⇒ **7 个任务各开 256 路 = 1792 条连接**，512 预算彻底失效。
+            //    理由错误：注释说"N 个文件分 N/concurrency 批跑完，预算该乘批数"，
+            //    但那些批次**不同时存在** —— 没轮到的任务一条连接都不该占。
+            //    提前把它们的额度算进来，等于凭空把总预算放大数倍。
+            //
+            // ② 若改成 `budget × concurrentNow` 同样是错的：
+            //    512 × 3 = 1536，还是 1536。预算是**全局上限**，乘任何东西都不再是上限。
+            //
+            // 正确语义：`budget` 就是"此刻所有活跃任务加起来最多多少条连接"。
+            // 分配时按大小比例切这 512 份，谁在跑谁用，跑完让给下一批。
+            //
+            // 实证依据：夸克按账号限制总连接数，Python 版实测 512 为最优总量。
+            // 用户 1792 条连接的实测表现正是"连接开着但不传数据、总速度几十 KB/s"。
             int k = Math.Max(1, concurrency);
-            int waves = (n + k - 1) / k;
-            long effBudget = (long)budget * Math.Max(1, waves);
+            long effBudget = budget;
 
             long total = 0;
             for (int i = 0; i < n; i++)
                 if (sizes[i] > 0) total += sizes[i];
 
+            // 每个任务的额度 = 总预算 ÷ 同时运行的任务数。
+            //
+            // 【为什么除以 min(n, concurrency) 而不是按大小比例切】
+            // 调度器**同时只跑 concurrency 个**任务，所以任意时刻真正占用连接的
+            // 只有这么多任务。想让"同时占用 ≈ budget"且"任意时刻不超 budget"，
+            // 唯一正确的做法是每个任务拿 budget/concurrency：
+            //     用户场景 n=7, concurrency=3, budget=512
+            //     → 每个任务 512/3 ≈ 170 路，同时跑的 3 个合计 ≈ 510 ✓
+            //
+            // 若按"整批 N 个文件的大小比例"去切 512：
+            //     每个只有 512×3.2/20.68 ≈ 79 路，同时跑的 3 个合计仅 237 ——
+            //     只用掉 46% 预算，白白浪费一半带宽。
+            //
+            // 大小比例的诉求由下面的 min/max 夹取与 SmallFileCap 满足：
+            // 小文件本来就不该开满（<50MB 封顶 5 路），
+            // 差额自然让给了大文件（它们各自仍受 perFileCap 约束）。
+            int slots = Math.Max(1, Math.Min(n, k));
+            long perFileBudget = budget / slots;
+            if (perFileBudget < minPerFile) perFileBudget = minPerFile;
+            if (perFileBudget > cap) perFileBudget = cap;
+
             if (total <= 0)
             {
-                // 大小未知 → 退回"平分"（Python 版行为），避免所有任务只吃下限
-                long even = effBudget / n;
-                if (even < minPerFile) even = minPerFile;
-                if (even > cap) even = cap;
-                for (int i = 0; i < n; i++) result[i] = (int)even;
+                // 大小未知 → 全部按额度走（原"平分"行为的等价形式）
+                for (int i = 0; i < n; i++)
+                    result[i] = (int)Math.Min(CapFor(0), perFileBudget);
                 return result;
             }
 
+            double maxSize = 0;
+            for (int j = 0; j < n; j++) if (sizes[j] > maxSize) maxSize = sizes[j];
+
             for (int i = 0; i < n; i++)
             {
-                double share = sizes[i] > 0 ? effBudget * ((double)sizes[i] / total) : 0;
-                int t = (int)Math.Round(share);
+                // 基础额度 = perFileBudget；再按"相对批内最大文件"做**温和倾斜**。
+                //
+                // ⚠️ 别按 ratio = size/(total/n) 去倾斜 —— 那会算错：
+                //    10 个等大文件时 ratio=1，倾斜系数也是 1，但 perFileBudget=512/3≈170，
+                //    170 × 1 仍是 170，看起来对；可一旦 tie 到 cap 或再被 ceilBudget 回收，
+                //    结果就会掉到 19 这种离谱值。改用"相对最大文件"更稳：
+                //    最大的文件拿满 perFileBudget，其余按 (size/maxSize) 线性缩放，
+                //    并给一个 0.5 的下限系数，保证大文件之间不会拉开太离谱。
+                double tilt = 1.0;
+                if (maxSize > 0 && sizes[i] > 0)
+                {
+                    double rel = sizes[i] / maxSize;          // 0~1，最大文件 = 1
+                    tilt = 0.5 + 0.5 * rel;                   // 映射到 [0.5, 1.0]
+                }
+
+                long share = (long)Math.Round(perFileBudget * tilt);
+                int t = (int)share;
                 if (t < minPerFile) t = minPerFile;   // 下限：小文件也要下得动
                 int fileCap = CapFor(sizes[i]);        // 小文件封顶到 SmallFileCap
                 if (t > fileCap) t = fileCap;          // 上限：小文件≤5、大文件≤用户档位
                 result[i] = t;
             }
 
-            // 四舍五入会让总和略微越界（例如 512/3 → 171×3 = 513）。
-            // 把超出部分从"当前最大"的项上扣回来，保证总量不超有效预算。
-            // ⚠️ 扣的时候不能把任何一项压到下限以下 —— **下限优先于预算**：
-            //    宁可总量略微超预算，也不能让小文件下不动（这正是用户强调的那句
-            //    「不然别让小文件根本下不了了」）。
+            // 回收上限 = 同时运行的总额度（= perFileBudget × slots ≈ budget）。
+            //
+            // ⚠️ 这里必须是**同时运行**的额度，不是全批 N 个的额度：
+            //    调度器一次只跑 slots 个，所以"同时占用"最多就是 perFileBudget × slots。
+            //    若按 N 个的总额去回收，7 个文件每个都会被压到 512/7 ≈ 73 路
+            //    —— 而实际只有 3 个在跑，等于只用了 219/512，白白浪费一半带宽。
+            long ceilBudget = (long)perFileBudget * slots;
             long sum = 0;
             for (int i = 0; i < n; i++) sum += result[i];
             int guard = 0;
-            while (sum > effBudget && guard++ < 100000)
+            while (sum > ceilBudget && guard++ < 100000)
             {
                 int best = -1;
                 for (int i = 0; i < n; i++)

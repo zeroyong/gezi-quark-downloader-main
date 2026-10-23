@@ -232,6 +232,22 @@ namespace GeZi.Core.Download
         /// </summary>
         public static bool PerTaskDiagLog = false;
 
+        /// <summary>
+        /// 当前同时下几个任务（由 UI 在开批次时告知，仅用于诊断日志的推算）。
+        /// 0 = 未知。不参与任何调度决策，只影响日志里那句"N 个任务 × M 路"的算术。
+        /// </summary>
+        public static int ParallelTasksHint
+        {
+            get { return _parallelTasksHint; }
+            set { _parallelTasksHint = value; }
+        }
+        private static int _parallelTasksHint = 0;
+
+        // 并发诊断的三类结论各自只报一次（避免每 200ms 刷屏）
+        private bool diagSlowConnLogged;
+        private bool diagFewConnLogged;
+        private bool diagTailLogged;
+
         public const int MaxRealConcurrency = 512;
 
         // ==================== 慢连接抢占（preempt）====================
@@ -269,6 +285,13 @@ namespace GeZi.Core.Download
 
         /// <summary>剩余太少就不折腾了。</summary>
         private const long PreemptMinRemain = 128 * 1024;
+
+        /// <summary>
+        /// 动态窃取时，被切分片必须至少这么大（切完两半各 ≥ 此值）。
+        /// 太小就别切了 —— 切碎的握手开销超过收益。
+        /// 【2026-10-24 从原版补回】原值 512KB，与之一致。
+        /// </summary>
+        private const long MinStealBytes = 512 * 1024;
 
         /// <summary>单个分片最多被抢 3 次（全站都慢时防止无限重连）。</summary>
         private const int PreemptMax = 3;
@@ -501,6 +524,57 @@ namespace GeZi.Core.Download
         /// （若直接写死 α，采样一快就等于把平滑削弱了一半，属于隐蔽的行为漂移。）
         /// τ 的物理含义：速度发生阶跃后约 τ 秒追上 63%，约 3τ 秒追上 95%。
         /// </summary>
+        /// <summary>
+        /// 分批开连接（移植 **Gopeed 的 `slowStartController`** 思路，2026-10-24 从原版补回）。
+        ///
+        /// <para>【为什么二开版必须补回来】用户实测「设置 64 并发，大文件却只开起几路，
+        /// 总速度才几百 KB/s，而原版基本能跑满」。逐字对比两个版本的
+        /// <c>SegmentedDownloader.cs</c> 发现：原版有这道闸门，二开版<b>一行都没有</b>
+        /// （<c>SlowStartGate</c> 出现次数：原版 6 处 / 二开版 0 处）。</para>
+        ///
+        /// <para>时间错峰只保证各 worker 的<b>发起</b>时间不同，
+        /// 不保证前一批<b>已经建好连接</b>。若前一批握手慢（TLS 实测可达 1~4 秒），
+        /// 后一批会在它们还没就绪时就涌上来 —— 结果仍是"一大群连接同时处于慢启动、
+        /// 互相争抢带宽"，每个的拥塞窗口都涨不起来（实测「512 比 256 慢」就是这个）。</para>
+        ///
+        /// <para>把 worker 分成若干批；第 k 批在开跑前先等<b>前一批有一半连接就绪</b>
+        /// （或等满超时 —— 避免前一批全军覆没时后面永远不动）。
+        /// "就绪"的定义是<b>首次成功拿到 HTTP 响应</b>，那意味着 TCP+TLS 握手已完成。</para>
+        /// </summary>
+        private sealed class SlowStartGate
+        {
+            private readonly int _batchSize;
+            private int _ready;                    // 已就绪连接数（首次响应成功）
+
+            public SlowStartGate(int total)
+            {
+                // 批大小 = 总数的 1/8，夹在 [4, 64]：太小放行太慢，太大等于没分批。
+                int b = total / 8;
+                if (b < 4) b = 4;
+                if (b > 64) b = 64;
+                _batchSize = b;
+            }
+
+            /// <summary>第 index 个 worker 在开跑前等自己的批次放行。</summary>
+            public async Task WaitTurnAsync(int index, CancellationToken ct)
+            {
+                int batch = index / _batchSize;
+                if (batch == 0) return;            // 第一批直接放行
+
+                // 等前一批的一半就绪；最多 3 秒（前一批全挂时也要放行，否则任务卡死）
+                int need = Math.Max(1, batch * _batchSize / 2);
+                var deadline = DateTime.UtcNow.AddSeconds(3);
+                while (Volatile.Read(ref _ready) < need && DateTime.UtcNow < deadline)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Task.Delay(50, ct).ConfigureAwait(false);
+                }
+            }
+
+            /// <summary>某个连接首次拿到响应时调用（每个 worker 只调一次）。</summary>
+            public void MarkReady() { Interlocked.Increment(ref _ready); }
+        }
+
         private sealed class SpeedMeter
         {
             private readonly double _tau;
@@ -1174,10 +1248,13 @@ namespace GeZi.Core.Download
             // 尾部绝对长度也短得多（最后 1 片只有 582KB 而不是 2.3MB）。
             // ⚠️ 别担心小文件被切碎：下面 bySize 分档仍然生效，片数由 max(bySize, eff×8) 决定，
             //    16384 只是**上限**，只有大文件才够得着。
-            // 单分片下限 512KB（原 256KB）：256KB 的小片只在"文件大到必须
-            // 用 4096 片"时才需要；对中小文件，256KB 会把片切得过碎
-            // （100MB → 400 片），每条连接反复建连，得不偿失。
-            const long MinSegBytes = 512L * 1024;
+            // 单分片下限 1MB。
+            // 【2026-10-24】原来是 512KB，用户实测 256 并发下 3GB 文件被切成
+            // 6097 片 × 0.5MB —— 单连接 2~4KB/s 时下完一片要 2~4 分钟，
+            // worker 全部"忙着磨小片"，界面上就是「只有 49 路在传」且总速度几百 KB/s。
+            // 片大一点能显著减少 Range 请求次数与切片开销；
+            // 尾部塌缩另有「动态窃取」在兜（会把大片切半放回队列），不靠这里切碎。
+            const long MinSegBytes = 1L * 1024 * 1024;
 
             // 文件越大，片可以越大——因为大文件总时长长，单片大一点
             // 也不会显著拖长尾；而小文件必须用小片，否则片数不够分。
@@ -1210,8 +1287,28 @@ namespace GeZi.Core.Download
             else if (total < 256L * 1024 * 1024)      bySize = 16;
             else if (total < 2L * 1024 * 1024 * 1024) bySize = 32;
             else                                       bySize = 64;
-            long wantParts = Math.Max(bySize, (long)eff * 32);
+            // 片数 = max(按大小算的基础值, 有效并发 × 8)，再用两部上限兜住：
+            //   ① capByMinChunk —— 保证单片不低于 1MB；
+            //   ② MaxSegments  —— 元数据硬上限。
+            //
+            // 【2026-10-24 关键修复】原来这里是 `eff * 32` 且**没有 capByMinChunk**，
+            // 结果 256 并发下 3GB 文件被切成 6097 片 × 0.5MB。
+            //
+            // 为什么小片会拖慢（用户实测「256 并发只跑出 49 路、总速度几百 KB/s」）：
+            //   · 每个 worker 领到一片就必须**下完才领下一片**。单连接只有 2~4 KB/s 时，
+            //     下完 0.5MB 要 2~4 分钟 —— 期间它一直"忙着"，但吞吐极低。
+            //   · 6000+ 片 × 每片一次 Range 请求 = 建连/握手开销被放大数倍。
+            // 原版用 `eff * 8` + capByMinChunk 兜住，宁可片大一点。
+            long wantParts = Math.Max(bySize, (long)eff * 8);
             if (wantParts < 1) wantParts = 1;
+
+            // 片数上限①：单片不低于 1MB（与 MinSegBytes 一致）。
+            // 这一条是"别切碎"的硬约束 —— 大文件在低并发时也不该被切成几万片。
+            long capByMinChunk = total / MinSegBytes;
+            if (capByMinChunk < 1) capByMinChunk = 1;
+            if (wantParts > capByMinChunk) wantParts = capByMinChunk;
+
+            // 片数上限②：元数据硬上限
             if (wantParts > MaxSegments) wantParts = MaxSegments;
 
             long seg = (total + wantParts - 1) / wantParts;
@@ -1549,7 +1646,14 @@ namespace GeZi.Core.Download
             // 分片"已完成"标记（仅 mergeMode 使用）：合并线程据此判断能不能安全删掉
             // 某个分片文件 —— 必须等 worker 关闭文件流之后才能删，否则 worker 后续的
             // 写入会落进一个已删除的文件，数据静默丢失。
-            int[] partDone = new int[plan.Parts.Count];
+            //
+            // 【2026-10-24 修：容量必须留出余量】
+            // 动态窃取（SplitLongestPartIfNeeded）会往 plan.Parts **追加**新片 ——
+            // 原来这里按 plan.Parts.Count 精确分配，一旦窃取就会 **数组越界**。
+            // 这正是二开版当初把动态窃取整个删掉的原因（代码被删后只留下注释）。
+            // 原版的做法是留 4 倍余量；这里同样处理，并在追加处判断是否真的还能再加。
+            int partCapacity = Math.Max(plan.Parts.Count, plan.Parts.Count * 4);
+            int[] partDone = new int[partCapacity];
 
             if (mergeMode)
             {
@@ -1703,13 +1807,18 @@ namespace GeZi.Core.Download
             for (int i = mergedCount; i < plan.Parts.Count; i++)
                 queue.Enqueue(i);
 
+            // ---- 动态窃取的配套状态（2026-10-24 从原版补回）----
+            var splitLock = new object();   // 保护 plan.Parts.Add + queue.Enqueue 的原子性
+            int splitCount = 0;             // 累计切分次数（诊断用）
+
             // ---------------- 边下边播：优先分片 ----------------
             // 播放器的 Range 请求会走到 _boostImpl：把覆盖该区间的分片塞进优先队列。
             // 同一片可能同时出现在普通队列和优先队列里，用 claimed 保证只有一个
             // worker 真正去下它（否则两个 worker 会同时写同一个分片文件）。
             var boostQueue = new ConcurrentQueue<int>();
-            var claimed = new int[plan.Parts.Count];   // 0=未认领，1=已认领/已完成
-            var boosted = new int[plan.Parts.Count];   // 同一片只进一次优先队列
+            // 【2026-10-24】claimed/boosted 同样要留出动态窃取追加的余量（见 partDone 的注释）。
+            var claimed = new int[partCapacity];   // 0=未认领，1=已认领/已完成
+            var boosted = new int[partCapacity];   // 同一片只进一次优先队列
             var boostPreemptBox = new long[1];         // 上次为播放抢占的时间（节流）
 
             Func<long, long, int> enqueueBoost = (rawStart, rawEnd) =>
@@ -2166,6 +2275,61 @@ namespace GeZi.Core.Download
                                     string.IsNullOrEmpty(ipNote) ? "" : "，" + ipNote));
                             }
 
+                            // ---------------- 并发健康度自动诊断（2026-10-24 新增）--------------
+                            // 【为什么加】用户实测「256 并发只跑出 164 路，而且 164 路只有 40 KB/s」，
+                            // 光看总数无法判断到底卡在哪。这里把「连接数 / 速度 / 分片 / 限流」
+                            // 四者的关系算清楚，只在**确实异常**时打印一次（每类只报一次，不刷屏）。
+                            //
+                            // 判据（三条互斥，先命中先报）：
+                            //   ① 单连接速度过低  —— 每路 < 20 KB/s：CDN 限单连接，加并发无益
+                            //   ② 连接数上不去    —— 活跃 < 上限 60%：本地排队/建连问题
+                            //   ③ 分片见底        —— 剩余片数 < 并发数：尾部塌缩（动态窃取该介入）
+                            try
+                            {
+                                int act = Volatile.Read(ref activeConns);
+                                int wk = Volatile.Read(ref workerCountBox);
+                                int remainParts = 0;
+                                for (int pi = 0; pi < plan.Parts.Count; pi++)
+                                    if (plan.Parts[pi].W < plan.Parts[pi].E - plan.Parts[pi].S + 1) remainParts++;
+                                long perConn = act > 0 ? (long)(speed / act) : 0;
+
+                                // 只在跑了足够久、且确实有连接时才判断（避开启动爬坡期）
+                                double elapsedSec = (DateTime.UtcNow - taskStart).TotalSeconds;
+                                if (elapsedSec > 20 && act > 0 && wk > 0)
+                                {
+                                    if (perConn > 0 && perConn < 20 * 1024 && !diagSlowConnLogged)
+                                    {
+                                        diagSlowConnLogged = true;
+                                        Log?.Invoke(string.Format(
+                                            "【并发诊断】单连接只有 {0}/s（共 {1} 路，总 {2}/s）。"
+                                            + "这是夸克 CDN 在**限单连接速度**，不是客户端没开够并发 —— "
+                                            + "继续加大并发收益有限（每路都会被限），甚至会因握手开销变大而更慢。"
+                                            + "\n建议：并发降到 32~64 试一次；若总速度反而更高，说明之前是高并发在互相挤。",
+                                            Fmt(perConn), act, Fmt((long)speed)));
+                                    }
+                                    else if (act < wk * 6 / 10 && remainParts >= act && !diagFewConnLogged)
+                                    {
+                                        diagFewConnLogged = true;
+                                        Log?.Invoke(string.Format(
+                                            "【并发诊断】活跃连接只到 {0}/{1}（{2:P0}），但还有 {3} 片未下完 —— "
+                                            + "说明是**本地建连跟不上**，不是没活干。"
+                                            + "\n若同时开着多个任务，请把它们加起来看：{4} 个任务 × {1} 路 = {5} 条连接，"
+                                            + "很可能超出你账号/网络能承受的总量。建议减少同时下载数，或降低单文件并发。",
+                                            act, wk, (double)act / wk, remainParts,
+                                            _parallelTasksHint > 0 ? _parallelTasksHint : 1,
+                                            (_parallelTasksHint > 0 ? _parallelTasksHint : 1) * wk));
+                                    }
+                                    else if (remainParts < act && !diagTailLogged)
+                                    {
+                                        diagTailLogged = true;
+                                        Log?.Invoke(string.Format(
+                                            "【并发诊断】剩余分片只有 {0} 片，少于并发 {1} 路 —— 尾部塌缩，"
+                                            + "速度会自然下降。动态窃取会自动把大片切半补充队列。", remainParts, act));
+                                    }
+                                }
+                            }
+                            catch { /* 诊断失败绝不能影响下载 */ }
+
                             // 结构化快照：给 UI 的诊断面板用（与上面那行日志同源同频）。
                             try
                             {
@@ -2465,21 +2629,45 @@ namespace GeZi.Core.Download
                 // ---- 限流制动 ----
                 // 连接开得多有利于跑满带宽，但也更容易把服务端惹毛（429/503）。
                 // 这里做一个"自动缩缸"：一旦观察到限流类错误，就把并发闸门收窄，
-                // 避免重试风暴把配额彻底耗光。缩缸只缩不放，保证任务能跑完。
+                // 避免重试风暴把配额彻底耗光。
                 var gate = new SemaphoreSlim(workerCount);
                 int throttleHits = 0;
-                int gateLimit = workerCount;
+                // 【2026-10-24 修】软并发目标（从原版补回）。
+                //
+                // 二开版原来在这里用 `gateLimit` + `gate.Wait(0)` 去**偷信号量票**，
+                // 有两个硬伤（原版注释里已经写明，二开版把这段丢了）：
+                //   ① 稳态下 workerCount 张票**全在 worker 手里**，Wait(0) 一张也偷不到
+                //      ⇒ "收窄"是假的、日志在骗人；
+                //   ② 偶尔偷到的票**不还**，而恢复只有 +1 路/30 秒
+                //      ⇒ 票泄漏不可逆，长期反而把并发越压越低 ——
+                //      这正是用户看到的「设置 64、实际只开起几路」。
+                // 现在只改一个软目标，由 worker 在**领片前**自查执行：
+                // 不碰信号量、不持锁阻塞、收放完全对称，而且只影响"新开连接"，
+                // **不掐断正在跑的连接**。
+                int concurrencyTarget = workerCount;
+                // 正在持有分片的 worker 数（软闸门据此判断"在飞是否已达目标"）。
+                int activeWorkers = 0;
+                // 收窄下限：最多收窄到这里（避免把并发压到个位数反而更慢）。
+                // 【2026-10-24】二开版原来是 Math.Max(4, gateLimit*0.7) —— 会一路塌到 4 路，
+                // 且没有去抖，一波风控就能把 64 路砸成 4 路。改回原版的下限 32。
+                int throttleFloor = Math.Min(32, workerCount);
                 object gateLock = new object();
                 // 最近一次被限流的时刻（TickCount）。用于"限流平息后把并发放回去"。
                 long lastThrottleMs = Environment.TickCount;
                 // 连续多久没再被限流就往上加 1 路。取得比较长（30 秒 ≈ 6 个采样轮）
                 // 是有意的：放回去太急会立刻又被限流，来回抖比一直低并发更糟。
                 const int GateRecoverQuietMs = 30000;
+                // 一波风控会同时打回很多个 429/503（几百路并发下尤其明显）。
+                // 若每个 429 都收窄一次，闸门会在几百毫秒内从满档坍塌到下限。
+                // 这里把"收窄动作"限速为最多每 15 秒一次；收窄力度仍是 -30%。
+                // （"最近限流时刻"照常每次刷新，所以回升逻辑不会被去抖影响。）
+                const int ThrottleNarrowDebounceMs = 15000;
+                long lastNarrowMs = 0;
 
                 // ---- 限流平息 → 把并发放回去 ----
                 // 【2026-10-04 用户反馈】「为什么文件下到最后越来越慢」。
                 // 原来 OnThrottled() 是**只缩不放**的：每次被 429/503 砍掉 30%，
-                // 最低砍到 4 路，然后**整个任务余下时间就一直是 4 路** ——
+                // 然后**整个任务余下时间就一直是那个低并发** ——
                 // 于是"前段飞快、后段龟速"，看起来就是越下越慢且再也快不起来。
                 // 缩缸本身是对的（避免重试风暴），但缺了对称的那一半，这里补上。
                 // （必须单独起任务：PreemptSlowChunks 定义在 gate 声明之前，作用域拿不到。）
@@ -2492,13 +2680,12 @@ namespace GeZi.Core.Download
 
                         lock (gateLock)
                         {
-                            if (gateLimit < workerCount
+                            if (concurrencyTarget < workerCount
                                 && Environment.TickCount - lastThrottleMs >= GateRecoverQuietMs)
                             {
-                                gateLimit++;
-                                try { gate.Release(); } catch { }
+                                concurrencyTarget++;   // 软目标 +1，不需要碰信号量
                                 lastThrottleMs = Environment.TickCount;   // 重新计时
-                                Log?.Invoke("限流已平息，下载并发回升到 " + gateLimit
+                                Log?.Invoke("限流已平息，下载并发回升到 " + concurrencyTarget
                                     + " 路（上限 " + workerCount + " 路）。");
                             }
                         }
@@ -2510,38 +2697,32 @@ namespace GeZi.Core.Download
                     lock (gateLock)
                     {
                         throttleHits++;
-                        lastThrottleMs = Environment.TickCount;
-                        // 每次限流把闸门砍掉 30%，最低保留 4 路
-                        int next = Math.Max(4, (int)(gateLimit * 0.7));
-                        int want = gateLimit - next;        // 这次想收掉的票数
-                        if (want <= 0)
+                        long nowThrottleMs = Environment.TickCount;
+                        lastThrottleMs = nowThrottleMs;
+                        // 15 秒窗口内只收窄一次：一波风控只降一档，
+                        // 而不是被几百个 429 各降一档、直接砸到下限。
+                        if (lastNarrowMs != 0 && nowThrottleMs - lastNarrowMs < ThrottleNarrowDebounceMs)
                             return;
-
-                        // 【不要用 gate.Wait()】原实现是 Wait() + Release(差额)，
-                        // 但 Wait() 会**阻塞**直到有一张票可用。而它是在
-                        // lock(gateLock) 里同步调用的，触发时机恰恰是限流时 ——
-                        // 此时票最可能被占满，于是这里会阻塞，还握着 gateLock
-                        // 让别的 worker 排队，属于真实死锁风险。
-                        //
-                        // 改成非阻塞回收：Wait(0) 立即返回，最多收 want 张票。
-                        // 收不满也没关系（说明票正在被使用），gateLimit 仍然下调，
-                        // 后续 worker 释放时按新上限放行，效果一致。
-                        int taken = 0;
-                        while (taken < want && gate.Wait(0))
-                            taken++;
-
-                        // 只把"多出来的"票放回：原来已发出的票里，超出新上限的部分不再续摊。
-                        // 这里不额外 Release —— 因为 gateLimit 已降为 next，
-                        // 而当前信号量计数 = workerCount - (仍被持有的票)，
-                        // 后续按新上限自然收敛。
-                        gateLimit = next;
+                        lastNarrowMs = nowThrottleMs;
+                        // 【2026-10-24 修】不再用 gate.Wait(0) 去"偷票"（理由见上方
+                        // concurrencyTarget 的注释）：只改软目标，由 worker 在领片前自查。
+                        // 好处是收放完全对称、不持锁阻塞、且只影响新开连接，
+                        // **不掐断正在跑的连接**。
+                        int cur = Volatile.Read(ref concurrencyTarget);
+                        int next = Math.Max(throttleFloor, (int)(cur * 0.7));   // 每次砍 30%
+                        if (next >= cur)
+                            return;
+                        Volatile.Write(ref concurrencyTarget, next);
                         Log?.Invoke(string.Format(
                             "检测到服务端限流（第 {0} 次），下载并发自动收窄到 {1} 路以避免触发更严格的风控。",
-                            throttleHits, gateLimit));
+                            throttleHits, next));
                     }
                 }
 
                 var workers = new Task[workerCount];
+                // 分批开连接的闸门（Gopeed slowStartController 思路，2026-10-24 从原版补回）。
+                // 光靠时间错峰不保证前一批已建好连接 —— 见 SlowStartGate 的注释。
+                var slowStartGate = new SlowStartGate(workerCount);
                 for (int w = 0; w < workerCount; w++)
                 {
                     int workerNo = w;
@@ -2553,6 +2734,10 @@ namespace GeZi.Core.Download
                         int bufSize = Math.Max(64 * 1024,
                             Math.Min(QuarkConstants.DownloadChunk, 64 * 1024 * 1024 / Math.Max(1, workerCount)));
                         var buf = new byte[bufSize];
+
+                        // 本 worker 是否已经拿到过首个响应。
+                        // 拿到就意味着 TCP+TLS 握手完成 —— 那一刻通知分批闸门放行下一批。
+                        bool firstResponseSeen = false;
 
                         // 冷启动错峰：多个 worker 同时发起首请求会挤在一起做 TLS 握手，
                         // 不仅拖慢首个字节时间，还更容易触发服务端限流。
@@ -2570,6 +2755,10 @@ namespace GeZi.Core.Download
                             await Task.Delay(TimeSpan.FromMilliseconds(staggerMs), cancelToken).ConfigureAwait(false);
                         }
 
+                        // 时间错峰之后还要等"前一批真的建好连接"（见 SlowStartGate）。
+                        try { await slowStartGate.WaitTurnAsync(workerNo, cancelToken).ConfigureAwait(false); }
+                        catch (OperationCanceledException) { return; }
+
                         while (true)
                         {
                             // 先吃「边下边播」指定的优先分片，再按普通顺序领片。
@@ -2580,6 +2769,19 @@ namespace GeZi.Core.Download
                             if (Interlocked.CompareExchange(ref claimed[idx], 1, 0) != 0)
                                 continue;
 
+                            // ---- 软并发闸门（2026-10-24 从原版补回）----
+                            // 限流缩缸只改 concurrencyTarget，真正"少开连接"靠这里：
+                            // 在飞 worker 数已达目标时，本 worker 先等一下再领片。
+                            // 好处：收放对称、不碰信号量、**不掐断正在跑的连接**。
+                            while (true)
+                            {
+                                int softTarget = Volatile.Read(ref concurrencyTarget);
+                                if (Volatile.Read(ref activeWorkers) < softTarget) break;
+                                try { await Task.Delay(50, cancelToken).ConfigureAwait(false); }
+                                catch (OperationCanceledException) { return; }
+                            }
+                            Interlocked.Increment(ref activeWorkers);
+
                             await gate.WaitAsync(cancelToken).ConfigureAwait(false);
                             bool gateTaken = true;
                             // 片级取消源：抢占只掐这一片，不牵连全局取消语义。
@@ -2587,6 +2789,42 @@ namespace GeZi.Core.Download
                             try
                             {
                                 var part = plan.Parts[idx];
+
+                                // ---- 动态窃取（2026-10-24 从原版补回）----
+                                //
+                                // 【为什么必须有】用户实测「256 并发只跑出 49 路、总速度几百 KB/s，
+                                // 而原版基本能跑满」。逐字对比发现原版有这套机制，二开版**整个删掉了**
+                                // （代码删了、只在合并线程留了一句注释，连方法名都不存在）。
+                                //
+                                // 【它解决什么】"尾部塌缩"：分片数多于并发数时，先前每个 worker
+                                // 领一片大的；跑到后面队列快见底，只剩几条连接在磨最后几个大片，
+                                // 总速度必然崩。做法是把自己手里这条**还没开始下**的大片切一半
+                                // 放回队列，让更多连接参与 —— 于是并发数能一直维持在高位。
+                                //
+                                // ⚠️ 刻意**不掐断正在下载的连接**（那种做法要处理
+                                //    「改边界 vs worker 正读 part.E」的竞态），
+                                //    此刻 worker 刚领到片、还没开始下，天然无竞态。
+                                //
+                                // ⚠️ 追加的新片 idx 排在数组末尾，区间却落在被切那片的后半段。
+                                //    合并线程已改成"按区间覆盖定位下一片"（见那里的注释），
+                                //    所以 idx 顺序不再等于区间顺序也不会拼错。
+                                if (queue.Count < workerCount / 2 && plan.Parts.Count < partCapacity)
+                                {
+                                    long remainHere = (part.E - part.S + 1) - part.W;
+                                    if (remainHere >= 2 * MinStealBytes)
+                                    {
+                                        long mid = part.S + part.W + remainHere / 2;
+                                        long oldEnd = part.E;
+                                        part.E = mid - 1;          // 自己留前半
+                                        lock (splitLock)
+                                        {
+                                            plan.Parts.Add(new PartPlan { S = mid, E = oldEnd, W = 0 });
+                                            queue.Enqueue(plan.Parts.Count - 1);
+                                        }
+                                        Interlocked.Increment(ref splitCount);
+                                    }
+                                }
+
                                 long segSize = part.E - part.S + 1;
                                 if (part.W >= segSize)
                                 {
@@ -2673,15 +2911,32 @@ namespace GeZi.Core.Download
 
                                     bool fatal = false;   // true 表示重试无意义（取消/服务器不支持 Range）
 
-                                    // 本次尝试专用的 I/O 令牌 = 片级取消 + 「暂停立刻掐断」。
-                                    // 只给 SendAsync / ReadAsync 用：写盘仍走 partToken，
-                                    // 避免暂停正好落在写盘中途时把数据写成半截。
+                                    // 本次尝试专用的 I/O 令牌。
+                                    //
+                                    // 【2026-10-24 修：暂停不再掐断连接】
+                                    //
+                                    // 二开版原来把 pause.AbortToken 链进来，暂停瞬间 Cancel 掉
+                                    // 所有在途 ReadAsync → **256 条 TCP 连接全部作废**。
+                                    // 恢复时它们要全部重新建连 + TLS 握手（实测 3~6 秒，
+                                    // 而且新连接又要走一遍慢启动），用户看到的就是
+                                    // 「暂停后再开始，又要重新开始连接」，速度从 0 爬很久。
+                                    //
+                                    // 原版**没有** AbortToken（对比确认：原版 0 处引用），
+                                    // 暂停只靠下面的 pause.WaitIfPausedAsync 卡在读取之前，
+                                    // 连接一直保活，恢复后从断点继续读 —— 几乎立刻满速。
+                                    //
+                                    // 保留 AbortToken 的唯一好处是"暂停响应更快"，但：
+                                    //   · 读盘/读网是流式的，每次循环开头都检查暂停（见下面 2 处
+                                    //     WaitIfPausedAsync），最多多读一个缓冲区（64KB）就会停；
+                                    //   · 而代价是全部连接重建。
+                                    // 所以这里只在**取消**（不是暂停）时掐断，暂停时保持连接。
                                     CancellationTokenSource ioCts = null;
                                     CancellationToken ioTok = partToken;
                                     if (pause != null)
                                     {
-                                        ioCts = CancellationTokenSource.CreateLinkedTokenSource(
-                                            partToken, pause.AbortToken);
+                                        // 仍然建一个链式源，但**不**把 AbortToken 放进去。
+                                        // 保留这个变量是为了让 finally 里的 Dispose 逻辑不变。
+                                        ioCts = CancellationTokenSource.CreateLinkedTokenSource(partToken);
                                         ioTok = ioCts.Token;
                                     }
 
@@ -2691,6 +2946,14 @@ namespace GeZi.Core.Download
                                         using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ioTok).ConfigureAwait(false))
                                         {
                                             int code = (int)resp.StatusCode;
+                                            // 首次拿到成功响应 = TCP+TLS 握手完成 → 放行下一批 worker。
+                                            // （2026-10-24 从原版补回：没有这一步，SlowStartGate 永远等不到
+                                            //  就绪信号，只能靠 3 秒超时兜底，等于错峰失效。）
+                                            if (!firstResponseSeen && (code == 200 || code == 206))
+                                            {
+                                                firstResponseSeen = true;
+                                                slowStartGate.MarkReady();
+                                            }
                                             if (code == 200 && !(reqStart == 0 && part.E >= total - 1))
                                             {
                                                 // 服务器忽略 Range（且不是整文件单段）→ 交给单线程处理
@@ -2871,6 +3134,9 @@ namespace GeZi.Core.Download
                                 {
                                     try { pcts.Dispose(); } catch { }
                                 }
+                                // 软并发闸门的"在飞"计数必须在这里减 ——
+                                // 上面有 continue（分片已完整时），只有 finally 能保证一定执行。
+                                Interlocked.Decrement(ref activeWorkers);
                                 if (gateTaken)
                                     gate.Release();
                             }
@@ -3075,7 +3341,7 @@ namespace GeZi.Core.Download
                         Log?.Invoke(string.Format(
                             "建议: 本次触发了 {0} 次服务端限流，并发被压到 {1} 路。" +
                             "说明 {2} 路超出了你当前网络/账号的承受范围，下次直接选更低的档位会更稳。",
-                            throttleHits, gateLimit, _threads));
+                            throttleHits, Volatile.Read(ref concurrencyTarget), _threads));
                     }
                     else if (avgSpeed > 0)
                     {

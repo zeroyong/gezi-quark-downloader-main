@@ -2035,6 +2035,89 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 设置页「自动调度」勾选变化（2026-10-24 新增）。
+        ///
+        /// <para>【用户需求】「一般设置几个同时下载数，下载速度更能跑满呢，
+        /// 你可以添加一个自动调度的选项，然后自动计算」。</para>
+        ///
+        /// <para>开启后：按 <see cref="GeZi.Core.Download.AutoTuner"/> 算出的组合
+        /// 覆盖「单文件并发」与「同时下载数」两个控件，并把它们**置灰**
+        /// （只读）—— 避免用户看到两个数被改动却以为是程序出错了。
+        /// 关闭后恢复可编辑，值保持当前（不还原旧值，避免"关掉开关数值又跳回去"的困惑）。</para>
+        /// </summary>
+        private void OnAutoTuneChanged(object sender, RoutedEventArgs e)
+        {
+            if (_applyingSettings) return;
+            try
+            {
+                bool on = AutoTuneCheck.IsChecked == true;
+                _settings.AutoTune = on;
+
+                if (on)
+                {
+                    // 文件数未知时用通用最优值；真正开下时会按实际文件数再算一次。
+                    var plan = GeZi.Core.Download.AutoTuner.Compute(0);
+                    ApplyAutoPlan(plan);
+                    Log("已开启自动调度：" + plan.Reason);
+                    Log("  「单文件并发」与「同时下载数」已锁定为自动计算值，手动修改需先关掉这个开关。");
+                }
+                else
+                {
+                    Log("已关闭自动调度：并发与同时任务数改回手动设置。");
+                }
+
+                UpdateAutoTuneUi();
+                SettingsStore.Save(_settings);
+            }
+            catch (Exception ex)
+            {
+                Log("自动调度设置保存失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>把 AutoTuner 的结果写进两个输入控件（不触发保存，由调用方负责）。</summary>
+        private void ApplyAutoPlan(GeZi.Core.Download.AutoTuner.Plan plan)
+        {
+            if (plan == null) return;
+            _settings.Threads = plan.Threads;
+            _settings.ConcurrentTasks = plan.Concurrent;
+
+            // ThreadsBox 是档位下拉（16/32/64/128/256/512），自动算出的 170 这种
+            // 中间值不在档位里 —— 选最接近的档位显示，但 _settings.Threads 保留精确值。
+            // （下拉只是"选择器"，真正下发的是 _settings.Threads。）
+            ThreadsBox.SelectedIndex = PresetToIndex(plan.Threads);
+            ConcurrentBox.Text = plan.Concurrent.ToString();
+        }
+
+        /// <summary>按自动调度开关的状态，刷新控件可用性与提示文案。</summary>
+        private void UpdateAutoTuneUi()
+        {
+            bool on = _settings.AutoTune;
+            if (AutoTuneCheck != null) AutoTuneCheck.IsChecked = on;
+
+            // 单文件并发下拉：自动模式下禁用（值仍由 PresetToIndex 显示最接近档）
+            if (ThreadsBox != null) ThreadsBox.IsEnabled = !on;
+            if (ConcurrentBox != null) ConcurrentBox.IsEnabled = !on;
+
+            if (AutoTuneHint != null)
+            {
+                if (on)
+                {
+                    var plan = GeZi.Core.Download.AutoTuner.Compute(0);
+                    AutoTuneHint.Text = string.Format(
+                        "当前：单文件 {0} 路 × 同时 {1} 个 ≈ {2} 条连接（预算 {3}）",
+                        _settings.Threads, _settings.ConcurrentTasks,
+                        _settings.Threads * _settings.ConcurrentTasks,
+                        GeZi.Core.Download.AutoTuner.Budget);
+                }
+                else
+                {
+                    AutoTuneHint.Text = "手动模式：两个数都由你自己定";
+                }
+            }
+        }
+
+        /// <summary>
         /// 设置页「启动时恢复上次浏览的目录」勾选变化（2026-10-21 新增）。
         /// </summary>
         private void OnRestoreBrowseChanged(object sender, RoutedEventArgs e)
@@ -9600,6 +9683,13 @@ namespace GeZi
             var jobs = new List<DownloadJob>();
             try
             {
+                // 【2026-10-24 新增】续传/恢复同样要走连接预算分配器。
+                // 原来这条路径直接用 _settings.Threads —— 用户实测「7 个任务
+                // 每个都开 256 路 = 1792 条连接」，超出夸克账号配额后
+                // 表现就是「244/256 连接却只跑 1~2 MB/s」。
+                var allocThreads = AllocateThreads(tasks.Select(t => (long)t.Size).ToList());
+                int jIdx = 0;
+
                 foreach (var p in tasks)
                 {
                     try
@@ -9685,7 +9775,12 @@ namespace GeZi
                             Url = url,
                             Dest = dest,
                             Cookie = client.CookieStr,
-                            Threads = _settings.Threads,
+                            // 【2026-10-24 修】原来这里是 `_settings.Threads`（直接 256），
+                            // **绕过了连接预算分配器** —— 用户实测「7 个任务每个都开 256 路
+                            // = 1792 条连接，远超夸克账号配额，结果 244/256 连接却只跑 1~2 MB/s」。
+                            // 恢复/续传路径必须和新任务路径走同一套分配逻辑。
+                            Threads = allocThreads != null && jIdx < allocThreads.Length
+                                ? allocThreads[jIdx] : _settings.Threads,
                             WriteMode = WriteMode.SegmentedFiles,   // 落盘方式唯一化
                             PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
                             Pending = new PendingInfo
@@ -9705,6 +9800,7 @@ namespace GeZi
                         // 免转存任务续传取不到新链（stoken 过期）→ 失败文案要说"需重新解析分享"
                         job.ResumeCannotRefresh = p.FromShare;
                         jobs.Add(job);
+                        jIdx++;
                     }
                     catch (Exception ex)
                     {
@@ -9717,6 +9813,10 @@ namespace GeZi
                     Log("没有任务成功取到直链。");
                     return;
                 }
+
+                // 把分配结果打出来 —— 用户要能一眼看到"这次每个任务到底开了几路"，
+                // 而不是只能从界面上的 244/256 去猜。
+                LogAllocation(allocThreads);
 
                 // 【2026-10-22 诊断】用户实测：取链全部成功（日志有 3 条 [诊断·续传]），
                 // 但**完全没有**「已续传 N 个任务」，也没有任何 [诊断·下载] ——
@@ -10392,6 +10492,9 @@ namespace GeZi
                 TaskUnfinishedFirstCheck.IsChecked = _settings.TaskUnfinishedFirst;
                 // 【2026-10-21】「启动时恢复上次浏览的目录」（默认开）
                 RestoreBrowseCheck.IsChecked = _settings.RestoreBrowseOnStartup;
+                // 【2026-10-24】自动调度：回填勾选 + 若是开启状态，按自动值刷新
+                // 两个输入框并置灰（否则用户会看到"勾开着但还能手改"的矛盾界面）。
+                AutoTuneCheck.IsChecked = _settings.AutoTune;
                 // 外观主题：把配置里的选择回填到三个单选（_applyingSettings 已挡掉 Checked）
                 SyncThemeRadios();
                 // 任务列表排序偏好 → 同步工具栏那颗切换按钮的文案与图标
@@ -10412,6 +10515,11 @@ namespace GeZi
             {
                 _applyingSettings = false;
             }
+            // 自动调度：初始化控件的可用性/提示文案。
+            // 放在 _applyingSettings 复位之后 —— 它内部会改 IsChecked/Text，
+            // 若在保护区间内反而不会被识别为"用户操作"（这里本来也不需要触发保存，
+            // 但保持语义清晰：先回填完，再统一刷新展示状态）。
+            try { UpdateAutoTuneUi(); } catch { }
             // 把「分片目录隐藏」告知核心层（静态开关，只影响外观）
             SegmentedDownloader.HidePartsDir = _settings.HideParts;
             // 把诊断日志接进界面日志框：外部启动是否成功、ShellExecute 返回码多少，
@@ -10745,28 +10853,44 @@ namespace GeZi
         /// 新对象上位，于是"正在跑的那批"用旧限流、"新点的"用新限流 ——
         /// 两个 scheduler 并存，ConcurrentTasks 限流直接失效。
         ///
-        /// 现在的策略：
+        /// 现在的策略（2026-10-24 起）：
         ///   - 空闲时：正常重建（新并发数立即生效）
-        ///   - 下载中：只更新 SettingsStore，并提示"并发数将在下次下载生效"。
-        ///            绝不 Dispose 正在用的对象。
+        ///   - **下载中：也立即新建一个 scheduler 给"新任务"用**，
+        ///     但**不 Dispose 旧的那个** —— 让正在跑的那批自然跑完。
+        ///
+        /// 【为什么这样改】用户实测「设置里改成同时 5 个，保存后日志还是『3 个在跑』」。
+        /// 原来的做法是"下载中只保存、不生效"，从用户角度看就是设置坏了。
+        /// 关键洞察：原来担心的两个事故（Dispose 正在用的 sem / 新旧并存导致限流失效）
+        /// 都源于"Dispose 旧对象"。**只要不 Dispose，它们都不会发生**：
+        ///   · 旧 scheduler 继续用它自己的 sem 跑完手上的任务 → 不会 ObjectDisposed；
+        ///   · 新 scheduler 只管新加进来的任务 → 不存在"两个都在调度同一批"。
+        /// 代价是"过渡期总数可能略微超出 ConcurrentTasks"（旧批次逐渐收尾），
+        /// 但这是**用户明确要求的行为**，而且只持续到旧批跑完。
         /// </summary>
         private void RecreateScheduler()
         {
             // 连接上限现在由 SegmentedDownloader / QuarkSession 各自显式设定，
             // 不再暴露"全局连接预算"给用户（原来的设置项实际不起作用）。
             // NetworkConfig.Apply 仍在调度器构造里以固定值调用一次，兜底全局 DefaultConnectionLimit。
-            if (_batchRunning)
-            {
-                // 正在下载：绝不触碰现有 scheduler，避免上面描述的两种事故。
-                Log("并发数已保存，将在下一批下载生效（当前批次正在运行，不打断）。");
-                return;
-            }
-
-            // 空闲：安全地重建
-            try { _scheduler?.Dispose(); } catch { }
+            var old = _scheduler;
             _scheduler = new DownloadScheduler(_settings.ConcurrentTasks);
             _scheduler.Log = LogFromWorker;
             _scheduler.Diagnostics = OnDiagnostics;
+
+            if (_batchRunning)
+            {
+                // 正在下载：旧的不动（让它跑完手上的），新的接手后续任务。
+                // 旧 scheduler 会在本批自然结束后由 GC 回收 —— 它的 sem 从未被 Dispose，
+                // 因此不会出现"Release 抛 ObjectDisposedException"那类事故。
+                Log(string.Format(
+                    "并发设置已生效：新任务按【同时 {0} 个】排队。"
+                    + "当前批次（最多 {1} 个）会先跑完，不打断。",
+                    _settings.ConcurrentTasks, _settings.ConcurrentTasks));
+                return;
+            }
+
+            // 空闲：旧对象手上没任务，可以安全释放。
+            try { old?.Dispose(); } catch { }
         }
 
         /// <summary>当前是否有下载批次在跑。用于阻止"运行中重建 scheduler"这类危险操作。</summary>

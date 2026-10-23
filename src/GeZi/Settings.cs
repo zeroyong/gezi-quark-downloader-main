@@ -31,6 +31,24 @@ namespace GeZi
         public int Threads { get; set; } = 64;
 
         public int ConcurrentTasks { get; set; } = 3;
+
+        /// <summary>
+        /// 自动调度：让程序按「总连接预算」自动算并发，而不是用户手填两个数。
+        ///
+        /// <para>【2026-10-24 新增，用户需求】「现在速度确实快一点，但是一般设置几个
+        /// 同时下载数，下载速度更能跑满呢，你可以添加一个自动调度的选项，然后自动计算」。</para>
+        ///
+        /// <para>【要解决什么】下载速度取决于 <c>单文件并发 × 同时任务数 = 总连接数</c>，
+        /// 而总连接数受**账号配额**限制（夸克实测 512 为最优总量）。
+        /// 用户 7 个文件各开 256 路 = 1792 条，远超配额后反而只有几百 KB/s。
+        /// 这两个数还存在"此消彼长"关系，手调很容易调到一边高一边空。</para>
+        ///
+        /// <para>开启后：<c>Threads</c> 与 <c>ConcurrentTasks</c> 由
+        /// <c>AutoTuner</c> 依据预算 512 自动配对；关闭后完全按用户手填值走
+        /// （保留手动控制，给想自己调的人）。</para>
+        /// </summary>
+        public bool AutoTune { get; set; } = false;
+
         public string OutDir { get; set; } = "";
         public bool AutoClean { get; set; } = true;
 
