@@ -5037,6 +5037,28 @@ namespace GeZi
 
                 var items = await GetDownloadItemsAsync(files, forceNoSave);
 
+                // 【2026-10-24 新增】自动调度：开下载前按**真实文件数**重算一次。
+                //
+                // 设置页那个「当前：单文件 64 路 × 同时 5 个」只是在文件数未知时
+                // 给的通用值；真正决定速度的是"这一批有几个文件"。所以：
+                //   7 个文件 → 73 路 × 7 个 ≈ 511 条（而不是 64×5=320，只用了 62% 预算）
+                // 用户实测就疑惑「不是 512 左右吗？为什么没有多跑几个任务」——
+                // 就是因为设置页显示的是通用值，与实际批次无关。
+                if (_settings.AutoTune)
+                {
+                    var autoPlan = GeZi.Core.Download.AutoTuner.Compute(items.Count);
+                    if (autoPlan != null && autoPlan.Threads > 0 && autoPlan.Concurrent > 0)
+                    {
+                        _settings.Threads = autoPlan.Threads;
+                        _settings.ConcurrentTasks = autoPlan.Concurrent;
+                        try { SettingsStore.Save(_settings); } catch { }
+                        // 同时任务数变了 → 调度器要按新值重建（空闲时是安全的）
+                        RecreateScheduler();
+                        UpdateAutoTuneUi();
+                        Log("自动调度（本批 " + items.Count + " 个文件）：" + autoPlan.Reason);
+                    }
+                }
+
                 // 连接数按文件大小比例分配（大文件多分、小文件少分，各不低于下限）
                 var alloc = AllocateThreads(items.Select(x => x.Size).ToList());
 
@@ -7174,7 +7196,11 @@ namespace GeZi
                 {
                     t.PauseRequested = false;
                     t.Job.ResumeJob();
-                    t.State = JobState.Downloading;
+                    // 【2026-10-24 修】同 ResumeTask：不能直接标 Downloading。
+                    // ResumeJob() 只清暂停信号，worker 仍需抢调度器并发名额；
+                    // 抢不到时它其实还在排队，界面却显示「下载中」＝ 用户看到的
+                    // 「没开始却显示下载中」。改为排队中，真正开跑时由进度上报改回。
+                    t.State = JobState.Queued;
                     n++;
                 }
                 else if (t.State == JobState.Failed || t.State == JobState.Cancelled)
@@ -7413,34 +7439,46 @@ namespace GeZi
         /// （见 <see cref="IsFinished"/>），于是**失败任务会沉到最底下** ——
         /// 恰恰是最需要用户点重试的那些。</para>
         ///
-        /// <para>三层：</para>
+        /// <para>【2026-10-24 再改：正在下载要单独一层】用户反馈：
+        /// 「正在下载的应该放在前面，现在反而把没下载的放在任务前面」。
+        /// 原来 <c>Downloading</c> 和 <c>Queued</c> 同属第 1 层，于是组内只按
+        /// 时间序排 —— 一个刚点、还排在队尾没开始的文件，会排到正在跑的前面去。</para>
+        ///
+        /// <para>四层（2026-10-24）：</para>
         /// <list type="bullet">
-        /// <item><b>0 = 失败 / 已取消</b>：需要用户处理（重试 / 排查），最该被看到。
-        ///       已取消也算 —— 它同样处于"没下完、可以重来"的状态。</item>
-        /// <item><b>1 = 未完成</b>：下载中 / 排队 / 暂停 / 取消中 —— 正在进行或可继续。</item>
-        /// <item><b>2 = 已完成</b>：只剩记录价值，垫底。</item>
+        /// <item><b>0 = 失败 / 已取消</b>：需要用户处理（重试 / 排查），最该被看到。</item>
+        /// <item><b>1 = 正在下载</b>：正在吃带宽、进度在动，用户最想盯着看。</item>
+        /// <item><b>2 = 排队 / 暂停 / 取消中</b>：还没真正在传。</item>
+        /// <item><b>3 = 已完成</b>：只剩记录价值，垫底。</item>
         /// </list>
         ///
         /// <para>组内仍按用户原有的"新任务在前 / 在后"偏好排（OrderBy 稳定）。</para>
         /// </summary>
         private static int TaskAttentionRank(TaskItem t)
         {
-            if (t == null) return 2;
+            if (t == null) return 4;
             switch (t.State)
             {
-                // 失败 / 已取消：需要用户重试或排查 —— 排最前
+                // ① 失败 / 已取消：需要用户重试或排查 —— 排最前
                 case JobState.Failed:
                 case JobState.Cancelled:
                     return 0;
-                // 未完成：下载中 / 排队 / 暂停 / 取消中
-                case JobState.Queued:
+
+                // ② 正在下载：正在吃带宽、进度在动 —— 用户最想盯着看的那几个
+                //    （2026-10-24 新增独立层：原来与 Queued 混在一起，
+                //     导致"还没开始"的反而排到了"正在跑"的前面）
                 case JobState.Downloading:
+                    return 1;
+
+                // ③ 排队 / 暂停 / 取消中：还没真正在传
+                case JobState.Queued:
                 case JobState.Paused:
                 case JobState.Cancelling:
-                    return 1;
-                // 已完成
-                default:
                     return 2;
+
+                // ④ 已完成
+                default:
+                    return 3;
             }
         }
 
@@ -8613,7 +8651,14 @@ namespace GeZi
 
                 t.PauseRequested = false;   // 先清标志，否则会继续忽略核心的 Downloading
                 t.Job.ResumeJob();
-                t.State = JobState.Downloading;
+                // 【2026-10-24 修】原来这里直接写 `t.State = JobState.Downloading`，
+                // 但 ResumeJob() 只是**取消暂停信号**，worker 还要去抢调度器的并发名额
+                // （scheduler 的 SemaphoreSlim）。抢不到就一直在排队 ——
+                // 此时界面却显示「下载中 / 速度 0」，用户看到的就是
+                // 「明明没开始，却显示正在下载」。
+                // 正确做法：挂牌「排队中」，等调度器真正 start（Report Downloading）再改。
+                // 若它本来就在跑（占着名额），下一帧进度上报就会把它改回 Downloading。
+                t.State = JobState.Queued;
                 Log("已恢复: " + t.Name);
             }
             else if (t.State == JobState.Failed || t.State == JobState.Cancelled)

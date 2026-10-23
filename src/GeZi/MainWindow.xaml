@@ -1560,6 +1560,17 @@
                                                             <Setter Property="Background"
                                                                     Value="{DynamicResource SurfaceSunkenBrush}"/>
                                                             <Style.Triggers>
+                                                                <!-- 【2026-10-24 新增】排队中要和下载中明确区分。
+                                                                     用户反馈：「排队中对应的进度颜色要和下载中区分（现在都是蓝色）」。
+                                                                     原来 Queued 没有任何触发器，落到默认的 PrimaryBrush（靛蓝）——
+                                                                     与「正在下载」一模一样，光看进度条分不出谁在真的传数据。
+                                                                     现在用中性灰（BorderBrushStrong）：一眼能看出"这条还没开始跑"。
+                                                                     放在其它触发器之前不影响优先级 —— WPF 中后匹配的 Trigger 覆盖前面的，
+                                                                     而 State 只可能命中其中之一，故顺序无关。 -->
+                                                                <DataTrigger Binding="{Binding State}" Value="Queued">
+                                                                    <Setter Property="Foreground"
+                                                                            Value="{DynamicResource BorderBrushStrong}"/>
+                                                                </DataTrigger>
                                                                 <DataTrigger Binding="{Binding State}" Value="Completed">
                                                                     <Setter Property="Foreground"
                                                                             Value="{DynamicResource SuccessBrush}"/>

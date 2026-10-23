@@ -50,7 +50,31 @@ namespace GeZi.Core.Download
     /// </summary>
     public static class AutoTuner
     {
-        /// <summary>总连接预算。与 <see cref="ThreadAllocator.DefaultBudget"/> 同源。</summary>
+        /// <summary>
+        /// 总连接预算。与 <see cref="ThreadAllocator.DefaultBudget"/> 同源。
+        ///
+        /// <para><b>【512 是怎么来的｜原版实测记录，2026-10-02，真实直链，4 轮】</b></para>
+        /// <code>
+        /// 1024 档：23.20 MB/s，单连接 23.2 KB/s，出现 AggregateException / 任务未结束
+        ///  512 档：22.33 MB/s，单连接 44.7 KB/s，稳定
+        /// </code>
+        /// <para>结论：1024 只快约 <b>5%</b>，但单连接速度<b>减半</b>（配额被摊薄，已近天花板），
+        /// 且异常率更高 —— 收益不显著、连接数翻倍（路由器 NAT 压力 + 风控风险），
+        /// 故原版<b>维持 512</b>。</para>
+        ///
+        /// <para><b>⚠️ 512 不是"速度最优"，而是"还能正常工作的经验上限"</b>：
+        /// 原版注释明确写了两条 ——</para>
+        /// <list type="bullet">
+        /// <item>「这是"还能正常工作"的经验上限；再往上（1024+）收益趋近于零，
+        ///       而风险（连接超时风暴、整网卡死）急剧上升」</item>
+        /// <item>「多数家宽在 <b>64~128 路</b>就已跑满，继续加只是让首字节更慢、
+        ///       更容易触发服务端限流」</item>
+        /// </list>
+        ///
+        /// <para><b>所以"更多不一定更快"</b>：真正的瓶颈是「账号总连接配额」与
+        /// 「单连接被 CDN 限速」。用户实测印证了两端 ——
+        /// 1792 条连接（远超配额）只有几百 KB/s；而 510 条时能跑到 4~6 MB/s。</para>
+        /// </summary>
         public const int Budget = ThreadAllocator.DefaultBudget;   // 512
 
         /// <summary>单文件并发下限：低于这个值，单个大文件很难跑满。</summary>
@@ -60,13 +84,20 @@ namespace GeZi.Core.Download
         public const int MaxThreads = SegmentedDownloader.MaxRealConcurrency;
 
         /// <summary>
-        /// 自动调度推荐的单文件并发上限。
+        /// 自动调度推荐的单文件并发上限 = 256。
         ///
-        /// <para>为什么不直接给到 <see cref="MaxThreads"/>(512)：
-        /// 原版注释里记着实测结论 —— 「512 不一定比 256 快」，
-        /// 因为连接数过高时每条流都在慢启动、互相争抢，拥塞窗口涨不起来。
-        /// 用户实测也印证：256 路时速度已经很接近上限。
-        /// 所以自动调度把 256 当作"够用的天花板"，超出部分交给多任务并行。</para>
+        /// <para>依据（原版注释 + 实测）：</para>
+        /// <list type="bullet">
+        /// <item>原版记着「<b>512 比 256 慢</b>」这个现象 —— 连接太多时每条流都在慢启动、
+        ///       互相争抢带宽，拥塞窗口涨不起来（现存版本用 <c>SlowStartGate</c> 缓解，
+        ///       但"分批放行"只是让情况不变坏，并不会让 512 反超 256）。</item>
+        /// <item>1024 档实测仅比 512 快 5%，而单连接速度减半 —— 说明配额已近天花板，
+        ///       继续加只是把同一份带宽切得更碎。</item>
+        /// <item>单文件开到 256 路时，单连接配额已被摊到 ~44 KB/s 量级；
+        ///       再翻倍只会更碎，不会更快。</item>
+        /// </list>
+        /// <para>所以自动调度把 256 当作"够用的天花板"，超出预算的部分交给
+        /// <b>多任务并行</b>（多条独立 TCP 流比单文件超多连接更容易跑满总带宽）。</para>
         /// </summary>
         public const int RecommendedMaxThreads = 256;
 
@@ -109,17 +140,23 @@ namespace GeZi.Core.Download
         {
             if (budget < 1) budget = 1;
 
-            // 文件数未知：给通用最优解。
-            // 为什么是 64 路 × 4 个 = 256？这是"保守但够用"的中间值：
-            //   · 64 路是原版默认值，实测能跑满多数家宽；
-            //   · 4 个任务并行既能让总量上去，又不会让磁盘随机写成为瓶颈；
-            //   · 256 只用了 512 预算的一半，给"用户临时点多几个文件"留了余量。
+            // 文件数未知：给一个"不含偏见"的通用解。
+            //
+            // 【2026-10-24 修】原来这里返回 64×4=256，用户实测看到
+            // 「当前：单文件 64 路 × 同时 5 个 ≈ 320 条连接（预算 512）」就疑惑
+            // 「不是 512 左右吗？为什么没有多跑几个任务」。两个问题：
+            //   ① 256 只用了预算一半，看起来"没用满"；
+            //   ② 与 Settings 里的旧值（5 个）不一致，显示自相矛盾。
+            // 现在改成**用满预算**的通用解：64 路 × 8 个 = 512。
+            // 选 64 而不是更大：64 是原版默认值，实测能跑满多数家宽；
+            // 剩下的额度交给"同时任务数"——多流并行比单文件超多连接更容易跑满。
+            // 真正开下载时会按实际文件数再算一次（见 MainWindow 的 AutoTuneForBatch）。
             if (fileCount <= 0)
             {
-                int defThreads = Math.Min(64, budget / 4);
-                defThreads = Clamp(defThreads, MinThreads, MaxThreads);
-                int defConc = Math.Max(MinConcurrent,
-                    Math.Min(MaxConcurrent, Math.Min(4, budget / Math.Max(1, defThreads))));
+                int defThreads = 64;
+                if (defThreads > budget / MaxConcurrent) defThreads = Math.Max(MinThreads, budget / MaxConcurrent);
+                defThreads = Clamp(defThreads, MinThreads, RecommendedMaxThreads);
+                int defConc = Clamp(budget / Math.Max(1, defThreads), MinConcurrent, MaxConcurrent);
                 return new Plan
                 {
                     Threads = defThreads,
