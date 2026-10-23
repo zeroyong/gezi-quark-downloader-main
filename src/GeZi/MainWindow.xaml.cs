@@ -7188,6 +7188,21 @@ namespace GeZi
             int n = 0;
             int retryFailed = 0;
 
+            // 【2026-10-24 关键修复】收集"要重新取链的失败任务"必须**当场记下来**，
+            // 不能事后靠 `State == Queued` 反查。
+            //
+            // 【踩到的坑】上一轮为了修「没开始却显示下载中」，把暂停恢复的状态
+            // 也改成了 Queued（见下面 Paused 分支）。于是后面那句
+            //     if (t.State != JobState.Queued) continue;
+            // 把**暂停恢复的任务也当成了失败重试**一起收集 →
+            // 同一个 task 既走 ResumeJob() 又走 ResumePendingBatchAsync()，
+            // 同一个 Dest 被提交两次 → 第二次撞上 `_activeDests.TryAdd` 失败 →
+            // 界面显示「失败: 已跳过：同一文件正在下载中」，而且因为状态是 Failed，
+            // 点重试又会再走一遍同样的路径 → **永久卡死，无法恢复**。
+            //
+            // 现在改成：只有**真的失败/取消**的才进 retryPending，用局部列表当场收集。
+            var retryTargets = new List<TaskItem>();
+
             foreach (var t in _tasks)
             {
                 if (t.Dormant) continue;   // Dormant 单独处理（见下）
@@ -7200,6 +7215,9 @@ namespace GeZi
                     // ResumeJob() 只清暂停信号，worker 仍需抢调度器并发名额；
                     // 抢不到时它其实还在排队，界面却显示「下载中」＝ 用户看到的
                     // 「没开始却显示下载中」。改为排队中，真正开跑时由进度上报改回。
+                    //
+                    // ⚠️ 注意：这里的 Queued 只是**界面状态**，这条任务**不会**
+                    //    进 retryTargets —— 它走的是"解除暂停"，不是"重新取链"。
                     t.State = JobState.Queued;
                     n++;
                 }
@@ -7213,6 +7231,7 @@ namespace GeZi
                     t.PauseRequested = false;
                     t.Speed = 0;
                     t.State = JobState.Queued;   // 先挂牌「排队中」，RunJobs 会改为「下载中」
+                    retryTargets.Add(t);         // ← 只在这里登记，避免把暂停恢复也混进来
                     retryFailed++;
                 }
             }
@@ -7225,10 +7244,8 @@ namespace GeZi
             // （见 TryFallbackToShareSourceAsync）。分片在磁盘上，新 job 用同一个
             // Dest，自然续传，不用重下。
             var retryPending = new List<PendingTask>();
-            foreach (var t in _tasks)
+            foreach (var t in retryTargets)
             {
-                if (t.Dormant) continue;
-                if (t.State != JobState.Queued) continue;   // 只处理刚被置为 Queued 的
                 var pend = BuildPendingTask(t);
                 if (pend != null) retryPending.Add(pend);
             }
