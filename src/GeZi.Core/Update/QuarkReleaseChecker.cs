@@ -23,6 +23,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using GeZi.Core.Api;
 using GeZi.Core.Models;
+using GeZi.Core.Support;
 
 namespace GeZi.Core.Update
 {
@@ -192,8 +193,15 @@ namespace GeZi.Core.Update
                         found[0].DirFid, ct).ConfigureAwait(false);
                     if (!string.IsNullOrEmpty(notes))
                         found[0].NotesText = notes;
+                    else
+                        Log("夸克源：这次没有取到更新日志，弹窗会显示「去分享页看」");
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    // 不静默：日志读取失败不影响更新本身，但必须能被看见
+                    Log("夸克源：取更新日志这一路抛异常（" + ex.GetType().Name + ": "
+                        + ex.Message + "），更新流程继续");
+                }
 
                 return found[0];
             }
@@ -419,7 +427,13 @@ namespace GeZi.Core.Update
                     }
                     if (hit != null) break;
                 }
-                if (hit == null) return null;
+                if (hit == null)
+                {
+                    // 不静默：让用户在日志里看到"这层目录里确实没有日志文件"
+                    Log("夸克源：安装包所在目录（fid=" + Short(dir) + "）里没有更新日志文件"
+                        + "（找的是 " + string.Join(" / ", NotesFileNames) + "）");
+                    return null;
+                }
 
                 Log("夸克源：找到更新日志「" + hit.Name + "」");
 
@@ -439,7 +453,9 @@ namespace GeZi.Core.Update
                 }
 
                 // 下载正文（几十 KB 以内，直接读成字符串）
-                string text = await DownloadTextAsync(url, ct).ConfigureAwait(false);
+                // ⚠️ 必须传 client.CookieStr（活的那份）—— 见 DownloadTextAsync 的注释
+                string text = await DownloadTextAsync(url, client.CookieStr, ct)
+                    .ConfigureAwait(false);
                 if (!string.IsNullOrEmpty(text))
                     Log("夸克源：更新日志已读取，共 " + text.Length + " 字符");
                 return text;
@@ -452,34 +468,159 @@ namespace GeZi.Core.Update
         }
 
         /// <summary>下载一个文本文件的正文（用于更新日志）。</summary>
-        private static async Task<string> DownloadTextAsync(string url, CancellationToken ct)
+        /// <remarks>
+        /// 【2026-10-24 修：更新日志永远是空的】
+        ///
+        /// <para><b>现象</b>：夸克分享里明明有 <c>更新日志.md</c>，
+        /// 日志也打印了「找到更新日志」，但弹窗里永远显示「去分享页看」。</para>
+        ///
+        /// <para><b>根因（两个 bug 叠加）</b>：</para>
+        /// <list type="number">
+        /// <item><b>没带 Cookie</b> —— 这个方法原来是 <c>new HttpClient()</c> 然后只加了
+        ///       UA 和 Referer，<b>一个 Cookie 都没发</b>。夸克 CDN 的 OAuth 回调直接拒：
+        ///       <c>403 RequestDeniedByCallback / require login [auth not found]</c>
+        ///       （"auth not found" = 压根没收到身份）。</item>
+        /// <item><b>异常被全吞</b> —— 外层 <c>catch { return null; }</c> 什么都不打，
+        ///       所以日志里连"失败"都看不见，只表现为"没有更新日志"。修 bug 时
+        ///       最怕这种静默失败。</item>
+        /// </list>
+        ///
+        /// <para><b>另一个坑（容易再踩）</b>：即使手动加了 <c>Cookie</c> 头，
+        /// <c>HttpClient</c> 默认 <c>UseCookies = true</c> 会让内部的
+        /// <c>CookieContainer</c> 接管这个头并<b>按域过滤</b> —— 直链域是
+        /// <c>dl-pc-sz.pds.quark.cn</c>，与我们设的 <c>.quark.cn</c> 路径规则
+        /// 不一定匹配，于是头被丢掉，服务端还是收不到。实测：同一个链接
+        /// <c>UseCookies=true</c> → 403，<c>UseCookies=false</c> → 200。
+        /// 所以这里必须关掉自动 Cookie 管理。</para>
+        ///
+        /// <para><b>Cookie 用哪一份</b>：必须用 <paramref name="client"/> 的
+        /// <c>CookieStr</c>（活的那份）。<c>Settings.Cookie</c> 是冷启动快照，
+        /// 缺 <c>__sdid</c>、<c>__puus</c> 也是旧的 —— 用它同样 403
+        /// （<c>require login [auth expired]</c>）。</para>
+        /// </remarks>
+        private static async Task<string> DownloadTextAsync(string url, string cookie,
+            CancellationToken ct)
         {
             try
             {
-                using (var http = new System.Net.Http.HttpClient())
+                if (string.IsNullOrEmpty(url)) return null;
+
+                // UseCookies=false 是关键，理由见方法注释第二个坑
+                var handler = new System.Net.Http.HttpClientHandler
+                {
+                    UseCookies = false,
+                    AllowAutoRedirect = true,
+                    AutomaticDecompression = System.Net.DecompressionMethods.None,
+                };
+                // 与下载器同一套代理策略（默认直连，用户显式开启才跟系统代理）
+                GeZi.Core.Support.NetworkOptions.ApplyTo(handler);
+
+                using (var http = new System.Net.Http.HttpClient(handler))
                 {
                     http.Timeout = TimeSpan.FromSeconds(20);
-                    // 埋点：与下载器一致，夸克 CDN 需要常见浏览器头
-                    http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        + "(KHTML, like Gecko) quark-cloud-drive/3.14.2 Chrome/112.0.5615.165 "
-                        + "Electron/24.1.3.8 Safari/537.36 Channel/pckk_other_ch");
-                    http.DefaultRequestHeaders.TryAddWithoutValidation("Referer", "https://pan.quark.cn/");
 
-                    byte[] raw = await http.GetByteArrayAsync(url).ConfigureAwait(false);
-                    if (raw == null || raw.Length == 0) return null;
-                    if (raw.Length > 2 * 1024 * 1024) return null;   // 防御：日志不该这么大
-                    // 优先按 UTF-8 解；失败退回 GB18030（用户可能用记事本存成 ANSI）
-                    try { return new UTF8Encoding(false).GetString(raw); }
-                    catch
+                    using (var req = new System.Net.Http.HttpRequestMessage(
+                        System.Net.Http.HttpMethod.Get, url))
                     {
-                        try { return Encoding.GetEncoding("GB18030").GetString(raw); }
-                        catch { return null; }
+                        // 与 SegmentedDownloader 一致：UA 用下载专用 UA，
+                        // Referer 补上，Cookie 显式下发
+                        req.Headers.TryAddWithoutValidation("User-Agent", QuarkConstants.DlUa);
+                        req.Headers.TryAddWithoutValidation("Referer", QuarkConstants.Referer);
+                        req.Headers.TryAddWithoutValidation("Accept", "*/*");
+                        if (!string.IsNullOrEmpty(cookie))
+                            req.Headers.TryAddWithoutValidation("Cookie", cookie);
+
+                        using (System.Net.Http.HttpResponseMessage resp =
+                            await http.SendAsync(req, ct).ConfigureAwait(false))
+                        {
+                            if (!resp.IsSuccessStatusCode)
+                            {
+                                // 不再静默：把状态码与 CDN 的原文打出来
+                                string body = "";
+                                try
+                                {
+                                    byte[] errRaw = await resp.Content
+                                        .ReadAsByteArrayAsync().ConfigureAwait(false);
+                                    if (errRaw != null && errRaw.Length > 0)
+                                        body = Encoding.UTF8.GetString(
+                                            errRaw, 0, Math.Min(errRaw.Length, 400));
+                                }
+                                catch { }
+                                Log("夸克源：更新日志下载失败 HTTP " + (int)resp.StatusCode
+                                    + " " + resp.StatusCode
+                                    + (string.IsNullOrEmpty(cookie) ? "（未带 Cookie）" : "")
+                                    + (body.Length > 0 ? " | " + body.Replace("\r", " ").Replace("\n", " ") : ""));
+                                return null;
+                            }
+
+                            byte[] raw = await resp.Content
+                                .ReadAsByteArrayAsync().ConfigureAwait(false);
+                            if (raw == null || raw.Length == 0)
+                            {
+                                Log("夸克源：更新日志下载成功但正文为空（CDN 返回 0 字节）");
+                                return null;
+                            }
+                            if (raw.Length > 2 * 1024 * 1024)
+                            {
+                                Log("夸克源：更新日志过大（" + raw.Length + " 字节），放弃读取");
+                                return null;
+                            }
+
+                            string text = DecodeText(raw);
+                            if (text == null)
+                            {
+                                Log("夸克源：更新日志编码无法识别（前 8 字节 "
+                                    + BitConverter.ToString(raw, 0, Math.Min(8, raw.Length)) + "）");
+                                return null;
+                            }
+                            return text;
+                        }
                     }
                 }
             }
+            catch (OperationCanceledException)
+            {
+                Log("夸克源：更新日志下载超时（20 秒）");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                // 原来的 catch 全部吞掉，正是"日志永远为空却查不出原因"的元凶
+                Log("夸克源：更新日志下载异常 " + ex.GetType().Name + ": " + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 把下载到的字节解成文本。
+        /// <para>先按 UTF-8 <b>严格</b>解（<c>throwOnInvalidBytes</c>），失败退回 GB18030
+        /// —— 用户可能用记事本存成 ANSI。</para>
+        /// <para>⚠️ 原来用的是 <c>new UTF8Encoding(false)</c>，它<b>不</b>抛异常，
+        /// 遇到 GBK 内容会解出一堆 U+FFFD 却不报错，于是"失败了也看不出来"。
+        /// 这里改用严格模式，让回退真的能触发。</para>
+        /// </summary>
+        private static string DecodeText(byte[] raw)
+        {
+            // 去掉 UTF-8 BOM
+            int start = 0;
+            if (raw.Length >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF)
+                start = 3;
+
+            try
+            {
+                var strictUtf8 = new UTF8Encoding(false, true);   // throwOnInvalidBytes
+                return strictUtf8.GetString(raw, start, raw.Length - start);
+            }
+            catch (DecoderFallbackException) { }
+            catch (ArgumentException) { }
+
+            try
+            {
+                return Encoding.GetEncoding("GB18030").GetString(raw, start, raw.Length - start);
+            }
             catch { return null; }
         }
+
 
         /// <summary>递归扫分享目录（分享接口没有"全量递归列目录"，只能一层层来）。</summary>
         private async Task ScanAsync(QuarkClient client, string pwdId, string stoken,
