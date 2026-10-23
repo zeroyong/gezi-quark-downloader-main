@@ -4,7 +4,7 @@
 > 多线程分片下载、边下边播、多账号管理、深色模式。
 > 基于 **.NET Framework 4.8 + WPF** 开发，**零 NuGet 依赖、可完全离线构建**。
 >
-> **当前版本：v2.8.4** · [更新日志](#-更新日志) · [下载](https://github.com/zeroyong/gezi-quark-downloader-main/releases)
+> **当前版本：v2.8.5** · [更新日志](#-更新日志) · [下载](https://github.com/zeroyong/gezi-quark-downloader-main/releases)
 
 <p align="center">
   <img src="src/GeZi/Resources/app-logo.png" width="120" alt="鸽子下载">
@@ -81,7 +81,7 @@
 
 ### 方式一：下载发行版（推荐）
 
-1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.8.4-win64.zip` 并解压到任意目录
+1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.8.5-win64.zip` 并解压到任意目录
 2. 双击 `GeZi.exe` 即可运行
 3. 若系统缺少 .NET Framework 4.8，Windows 会弹窗提示，按引导安装即可
 
@@ -145,7 +145,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package.ps1
 | 夸克网盘分享（回退） | `https://pan.quark.cn/s/065af2172c40`（提取码 `VD8m`） | 分享内 `GeZi-vX.Y.Z-win64.zip` |
 
 双源并发检查，取**版本号更高者**；版本相同时优先 GitHub。无论是哪个源，更新都**不会回退到更低版本**。
-当前应用版本号从程序集读取（如 `2.8.4`），更新检测据此判断是否有新版本。
+当前应用版本号从程序集读取（如 `2.8.5`），更新检测据此判断是否有新版本。
 
 > 说明（方案选择）：一键更新采用「解压覆盖 + 外部小脚本接力」的方式 —— 主进程先退出，
 > 再由 `gezi-updater.cmd` 用 `xcopy` 覆盖文件并拉起新版本，避免「程序自我覆盖」的占用冲突。
@@ -206,7 +206,37 @@ GeZi/
 > 每条都写清楚「**原来怎样 → 现在怎样**」，方便对比。完整改动见
 > [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases)。
 
-### v2.8.4（当前）
+### v2.8.5（当前）
+
+**修复：关掉应用再打开，点「继续下载」一直 0 B/s**（用户实测，原版五层全有）
+
+这是**五个串联的 bug** —— 修好一层，下一层才露出来：
+
+| # | 原来 | 现在 |
+|---|---|---|
+| ① | 「已暂停」的任务点 ▶ 只取消暂停信号，**不重新取链**；直链有效期只有 5~10 分钟，跨重启必用死链 → 速度永远 0 | 识别「上次运行恢复出来的任务」，点 ▶ 一律**重新取链再续传** |
+| ② | 老任务缺目录路径信息，重新解析只能在分享根目录空转 → 日志只写「自动重新解析也没有成功」，1 秒就结束（一次请求都没发） | 三层兜底：记录路径 → 目录名推断 → **全分享按 fid 搜索**（fid 在同一分享内不变，比路径可靠） |
+| ③ | 入队时跨线程修改任务列表 → `NotSupportedException`，整个续传**静默中断** | 入队整体切回 UI 线程，并补外层 `catch` 把异常写进日志 |
+| ④ | 启动下载时跨线程改界面 → `InvalidOperationException`，任务停在「排队中」永远不动 | UI 层方法全程 `ConfigureAwait(true)`；`RunJobs` 入口加 `CheckAccess()` 防御 |
+| ⑤ | 入队时进度未预填 → 进度条从 0% 跳到实际位置，看着像从头重下 | 入队时读 `.qmeta` 预填真实进度（与启动恢复同一数据源） |
+
+**修复：一键更新失败 / 更新后不自动重启**
+
+| 问题 | 原来 | 现在 |
+|---|---|---|
+| 🔴 **下载被拒（412）** | 更新流程用「静态 Cookie 快照」新建客户端 → 夸克判为非活跃会话 → 取链成功但下载 412，**连点三次全失败** | **复用主窗口的登录会话**（与手动下载同一条链路），并直接用 `SegmentedDownloader` 下载，不再手写请求 |
+| 🟡 **更新后不自动重启** | `start` 继承了隐藏窗口属性 + 脚本自我删除抢跑 → 程序退出就没了 | 改用 `explorer.exe` 代为拉起 |
+| 🟡 **日志看不出成败** | 日志跨次累积，同一份里既有 `COPY OK` 又有 `COPY PARTIAL-FAILED` | 每次更新先清空，首行写明时间与 pid；重试成功写明确的 `RETRY-OK` |
+| 🟡 **`%TEMP%` 残留** | 删自己正站在里面的目录在 cmd 里不可靠，留下空壳与文件清单 | 改由主程序启动时清理（只删空目录或 12 小时前的） |
+
+**新增**
+- **日志右键菜单**：清空日志 / 复制全部（排查时「清屏 → 复现一次 → 只看新日志」）
+- **更新日志可随包上传**：分享里与安装包同层放一个 `更新日志.md`，检查到新版本时自动读取并展示
+
+**改进**
+- 日志分级：普通用户只看结果，内部细节（扫目录、取链参数）收进「详细」档
+
+### v2.8.4
 
 **修复**
 
