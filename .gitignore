@@ -16,6 +16,14 @@ cookie*.txt
 .claude/
 .cursor/
 
+# ---------- 本机环境修复脚本（与项目无关，只对我这台机器有意义） ----------
+# 修本机 dotnet PATH 用：几台 dotnet 目录里只有 C:\Users\zsm\.dotnet 带 SDK，
+# 而没 SDK 的那两个在 PATH 里优先级更高。换台机器就没意义了，不入库。
+# ⚠️ tools/package.ps1 是正经的项目打包脚本，必须保持入库 —— 所以只忽略下面这几个文件。
+tools/fix-dotnet-path.bat
+tools/revert-dotnet-path.bat
+tools/machine-path-backup.txt
+
 # ---------- 打包产物 ----------
 # dist/ 里是打好包的发布目录，**含有本机的 GeZi.config.xml（登录 Cookie）
 # 与 accounts/（账号档案）** —— 绝不能入库。
