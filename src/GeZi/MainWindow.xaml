@@ -1754,7 +1754,17 @@
                                             FontSize="11" Padding="8,3"
                                             ToolTip="切换日志详细程度：默认只显示日常必要信息，&#10;点此显示全部过程细节（目录加载、连接分配等）"/>
                                 </Grid>
-                                <TextBox x:Name="LogBox" Grid.Row="1" Style="{StaticResource LogTextBox}"/>
+                                <TextBox x:Name="LogBox" Grid.Row="1" Style="{StaticResource LogTextBox}">
+                                    <!-- 【2026-10-22】用户要求「日志要是可以右键全部清除就好了，
+                                         这样方便比对」—— 排查问题时经常要先清屏再复现一次，
+                                         否则新旧日志混在一起很难看出哪几行是这次产生的。 -->
+                                    <TextBox.ContextMenu>
+                                        <ContextMenu>
+                                            <MenuItem Header="清空日志" Click="OnClearLog"/>
+                                            <MenuItem Header="复制全部" Click="OnCopyAllLog"/>
+                                        </ContextMenu>
+                                    </TextBox.ContextMenu>
+                                </TextBox>
                             </Grid>
 
                         <!-- ═══ 底部状态栏（方案 C · 2026-10-21） ═══

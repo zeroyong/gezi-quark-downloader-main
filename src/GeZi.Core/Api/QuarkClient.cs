@@ -561,11 +561,52 @@ namespace GeZi.Core.Api
         /// </summary>
         /// <returns>找到则返回条目（<see cref="QuarkFileEntry.Fid"/> / <see cref="QuarkFileEntry.Token"/>），
         /// 找不到返回 null。</returns>
-        public async Task<QuarkFileEntry> FindShareFileByNameAsync(
+        public Task<QuarkFileEntry> FindShareFileByNameAsync(
             string pwdId, string stoken, string fileName, int maxDirs = 200)
         {
-            if (string.IsNullOrEmpty(pwdId) || string.IsNullOrEmpty(stoken)
-                || string.IsNullOrEmpty(fileName))
+            if (string.IsNullOrEmpty(fileName))
+                return Task.FromResult<QuarkFileEntry>(null);
+            return FindShareFileAsync(pwdId, stoken,
+                e => string.Equals(e.Name, fileName, StringComparison.Ordinal), maxDirs);
+        }
+
+        /// <summary>
+        /// 在分享里**按 fid** 全量定位一个文件（2026-10-22 新增）。
+        ///
+        /// <para>【为什么需要】<c>stoken</c> 过期后要重新取链，必须先拿到该文件的
+        /// **新 share_fid_token**。正常做法是「从进入目录开始沿记录下来的相对路径
+        /// 逐级下钻，到那一层按 fid 找」—— 但 <c>StartFid</c> / <c>ShareRelDir</c>
+        /// 是 2026-10-20 才加的字段，**老任务里是 null**，路径信息等于没有：
+        /// 程序只能在分享根目录找，文件在子目录里 → 永远找不到，
+        /// 日志就是「自动重新解析分享也没有成功」（用户实测）。</para>
+        ///
+        /// <para>【本方法怎么救】<b>fid 在同一个分享内是不变的</b>（改名/移动都不变），
+        /// 所以完全不需要知道路径 —— 从根目录广度优先遍历整个分享，按 fid 找到即可。
+        /// 代价是多个目录的请求，但总比彻底失败强。</para>
+        ///
+        /// <para>⚠️ 深度上限 <paramref name="maxDirs"/>：大分享全量遍历会打很多请求，
+        /// 因此限制遍历的目录数；超限返回 null（视为找不到）。</para>
+        /// </summary>
+        /// <returns>找到则返回条目（带可用的 <see cref="QuarkFileEntry.Token"/>），
+        /// 找不到返回 null。</returns>
+        public Task<QuarkFileEntry> FindShareFileByFidAsync(
+            string pwdId, string stoken, string fid, int maxDirs = 400)
+        {
+            if (string.IsNullOrEmpty(fid))
+                return Task.FromResult<QuarkFileEntry>(null);
+            return FindShareFileAsync(pwdId, stoken,
+                e => string.Equals(e.Fid, fid, StringComparison.Ordinal), maxDirs);
+        }
+
+        /// <summary>
+        /// <see cref="FindShareFileByNameAsync"/> / <see cref="FindShareFileByFidAsync"/>
+        /// 的共同实现：从分享根目录广度优先遍历，返回第一个满足条件且带 token 的文件。
+        /// </summary>
+        /// <param name="maxDirs">最多遍历多少个目录（防止大分享把请求数放大）。</param>
+        private async Task<QuarkFileEntry> FindShareFileAsync(
+            string pwdId, string stoken, Func<QuarkFileEntry, bool> pred, int maxDirs)
+        {
+            if (string.IsNullOrEmpty(pwdId) || string.IsNullOrEmpty(stoken) || pred == null)
                 return null;
 
             var queue = new Queue<string>();
@@ -591,8 +632,7 @@ namespace GeZi.Core.Api
                 foreach (var e in list)
                 {
                     if (e.IsDir) { queue.Enqueue(e.Fid); continue; }
-                    if (!string.IsNullOrEmpty(e.Token)
-                        && string.Equals(e.Name, fileName, StringComparison.Ordinal))
+                    if (!string.IsNullOrEmpty(e.Token) && pred(e))
                         return e;
                 }
             }

@@ -138,6 +138,20 @@ namespace GeZi
             // 放在单实例检查之后：第二个实例不该碰这些文件。
             try { Util.MigrateLegacyProfile(); } catch { }
 
+            // ---------------- 清理上次更新的临时残留（2026-10-23 新增） ----------------
+            // 更新脚本尽力 rd 自己的工作目录，但"删自己正站在里面的目录"在 cmd 里
+            // 不可靠，实测会留下空壳 + gezi_filelist.txt。
+            // 放到后台线程做：它是纯文件操作，不该拖慢启动。
+            try
+            {
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    try { GeZi.Core.Update.UpdateInstaller.CleanupStaleFileList(); } catch { }
+                    try { GeZi.Core.Update.UpdateInstaller.CleanupStaleWorkDirs(); } catch { }
+                });
+            }
+            catch { }
+
             // ---------------- 外观主题 ----------------
             // ⚠️ 必须在构造 MainWindow **之前**应用：否则窗口会先按亮色渲染一帧，
             //    深色模式下用户能明显看到一次"白闪"（尤其是冷启动较慢时）。

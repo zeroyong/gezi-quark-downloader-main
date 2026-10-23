@@ -598,6 +598,25 @@ namespace GeZi.Core.Download
 
             var headers = BuildHeaders();
 
+            // 【2026-10-22 诊断】用户实测"取链成功但速度一直是 0"。
+            // 这里把**实际会发出去的头**打出来（Cookie 只打长度与键名，不打值），
+            // 一眼就能看出是「没带 Cookie」还是「带了但 CDN 不认」。
+            try
+            {
+                var keys = new List<string>();
+                foreach (var kv in headers)
+                {
+                    keys.Add(kv.Key.Equals("Cookie", StringComparison.OrdinalIgnoreCase)
+                        ? "Cookie(" + (kv.Value == null ? 0 : kv.Value.Length) + "字节)"
+                        : kv.Key);
+                }
+                Log?.Invoke("[诊断·下载] 即将下载 host=" + SafeHost(url)
+                    + " 头=" + string.Join(",", keys.ToArray())
+                    + " 线程=" + _threads
+                    + " 写入模式=" + _writeMode);
+            }
+            catch { }
+
             // 对端 IP 诊断：每次任务开始时重置该 host 的统计，并确保采样已挂上。
             // 必须在**第一次请求之前**挂，否则首个连接不会被计入。
             ResetPeerIpTracking(url);
@@ -874,7 +893,26 @@ namespace GeZi.Core.Download
                 using (var req = BuildRequest(HttpMethod.Get, url, h))
                 using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cancel).ConfigureAwait(false))
                 {
-                    if ((int)resp.StatusCode == 206)
+                    // 【2026-10-22 诊断】用户反馈"取链成功但速度一直是 0"，
+                    // 需要看清楚探测阶段服务端到底回了什么 —— 尤其是 412/403 时
+                    // 响应体里那句 reason（Tengine 的 412 只说 precondition failed，
+                    // 而夸克业务层的 JSON 会带 code/message，差别很大）。
+                    int probeCode = (int)resp.StatusCode;
+                    if (probeCode != 200 && probeCode != 206)
+                    {
+                        string body = "";
+                        try
+                        {
+                            body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false) ?? "";
+                        }
+                        catch { }
+                        Log?.Invoke("[诊断·探测] 直链探测 HTTP " + probeCode + " "
+                            + (resp.ReasonPhrase ?? "")
+                            + "｜host=" + SafeHost(url)
+                            + "｜body=" + Trim(body.Replace("\r", " ").Replace("\n", " "), 300));
+                    }
+
+                    if (probeCode == 206)
                     {
                         var cr = resp.Content.Headers.ContentRange;
                         if (cr != null && cr.Length.HasValue)
@@ -885,8 +923,19 @@ namespace GeZi.Core.Download
                         return (cl, false);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log?.Invoke("[诊断·探测] 异常 " + ex.GetType().Name + ": " + ex.Message
+                    + "｜host=" + SafeHost(url));
+            }
             return (-1, false);
+        }
+
+        /// <summary>从直链里取 host（诊断日志用；直链本身很长，不能整条打出来）。</summary>
+        private static string SafeHost(string url)
+        {
+            try { return new Uri(url).Host; }
+            catch { return "?"; }
         }
 
         private HttpRequestMessage BuildRequest(HttpMethod method, string url, Dictionary<string, string> headers)

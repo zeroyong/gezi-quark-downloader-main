@@ -660,7 +660,12 @@ namespace GeZi
         {
             // 下载内核的日志整体算「专业级」：分片规划、连接分配、直链刷新等
             // 每秒可能几十行，默认藏起来，点「详细」才看。
-            EnqueueLog(msg, detail: true);
+            //
+            // 【2026-10-22】例外：以 "[诊断·" 开头的行是排查用的关键结论
+            // （探测失败码、请求头构成等），数量少且只在异常时出现 ——
+            // 若也藏进「详细」，用户按普通模式根本看不到，等于白加。
+            bool detail = !(msg != null && msg.StartsWith("[诊断·", StringComparison.Ordinal));
+            EnqueueLog(msg, detail);
         }
 
         /// <summary>LogBox 保留的最大行数（超出后从头砍）。</summary>
@@ -789,6 +794,64 @@ namespace GeZi
                 RebuildLogBox();
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 右键「清空日志」（2026-10-22 新增）。
+        ///
+        /// <para>【用户需求】「日志要是可以右键全部清除就好了，这样方便比对」——
+        /// 排查问题时经常要"清屏 → 复现一次 → 只看新日志"，
+        /// 否则新旧混在一起，很难分辨哪几行是这次产生的。</para>
+        ///
+        /// <para>【必须同时清两处】<see cref="LogBox"/> 只是**可见子集**，
+        /// 全量历史在 <see cref="_logAll"/> 里（切「详细」时会从它重建）。
+        /// 只清 TextBox 的话，一点「详细」旧日志又全回来了 —— 等于没清。</para>
+        ///
+        /// <para>【队列也要清】<see cref="_logQueue"/> 里可能还压着未刷新的行，
+        /// 不清的话它们会在下一次定时器触发时冒出来。</para>
+        /// </summary>
+        private void OnClearLog(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                // ① 清待刷队列（还没进 LogBox 的行）
+                LogLine _;
+                while (_logQueue.TryDequeue(out _)) { }
+
+                // ② 清全量历史（切「详细」时的重建源）
+                _logAll.Clear();
+
+                // ③ 清可见文本
+                if (LogBox != null) LogBox.Clear();
+
+                // ④ 汇总日志的去重基准也重置 ——
+                //    否则清屏后第一条汇总可能因为"和上一条相同"被跳过，
+                //    用户会以为日志坏了。
+                _lastProgressLog = null;
+
+                // 清屏本身不写日志（写了就白清了）。
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 右键「复制全部」（2026-10-22 新增）：把当前**可见**日志整段复制到剪贴板。
+        ///
+        /// <para>【为什么按可见内容而不是 _logAll】用户复制日志是为了贴给别人看，
+        /// 那些被「详细」模式过滤掉的行贴出去只是噪音。
+        /// 想连细节一起复制，先点「详细 · 开」再复制即可。</para>
+        /// </summary>
+        private void OnCopyAllLog(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (LogBox == null || string.IsNullOrEmpty(LogBox.Text)) return;
+                System.Windows.Clipboard.SetText(LogBox.Text);
+            }
+            catch
+            {
+                // 剪贴板被别的进程占用时会抛 —— 这里静默即可（复制不是关键路径）。
+            }
         }
 
         /// <summary>按当前 <see cref="_logVerbose"/> 从全量历史重建 LogBox 文本。</summary>
@@ -5275,11 +5338,20 @@ namespace GeZi
         {
             if (fromShare)
             {
+                // 【2026-10-22 诊断】正常下载（用户勾选文件按 D 发送）走的是这条路径，
+                // 不是续传的 TryShareDownloadAsync。用户实测"新文件能下、老的续传不行"，
+                // 需要看清这里的入参差异 —— 尤其是 stoken 是不是当前会话那一份。
+                Log("[诊断·批量取链] 分享模式 " + batch.Count + " 个文件"
+                    + " pwdId=" + Short(_pwdId)
+                    + " stoken=" + Short(_stoken)
+                    + " 首个fid=" + Short(batch[0].Fid)
+                    + " 首个token=" + Short(batch[0].Token));
                 return _client.GetShareDownloadAsync(
                     batch.Select(t => t.Fid).ToList(),
                     batch.Select(t => t.Token ?? "").ToList(),
                     _pwdId, _stoken);
             }
+            Log("[诊断·批量取链] 网盘模式 " + batch.Count + " 个文件");
             return _client.GetDownloadAsync(batch.Select(t => t.Fid).ToList());
         }
 
@@ -5306,6 +5378,8 @@ namespace GeZi
                 url = await GetShareLinkWithReResolveAsync(
                     _client, item.Fid, item.Token, _pwdId, _stoken, item.Passcode,
                     item.StartFid, item.ShareRelDir,
+                    // 【2026-10-22】老任务没有 ShareRelDir → 用 RelDir 兜底下钻
+                    item.RelDir, item.Name,
                     (freshStoken, freshToken) =>
                     {
                         _stoken = freshStoken;      // 回填会话级
@@ -5346,11 +5420,17 @@ namespace GeZi
         /// <param name="passcode">提取码；无码分享为空串/null。</param>
         /// <param name="startFid">分享进入目录 fid（普通分享为 "0"）。</param>
         /// <param name="shareRelDir">文件在分享内的完整相对目录（相对 startFid；"" = 进入目录本身）。</param>
+        /// <param name="fallbackRelDir">
+        /// 【2026-10-22】备用下钻路径：<paramref name="shareRelDir"/> 为空时（老任务
+        /// 快照里没有这个字段，实测全是 null）用 <c>GroupName</c> / <c>RelDir</c> 推断。
+        /// </param>
+        /// <param name="fileName">源文件名；路径与 fid 都定位不到时按名字兜底。</param>
         /// <param name="onReResolved">重解析成功时回调，把 (新 stoken, 新 token) 写回调用方记录。</param>
         /// <returns>直链；彻底失败返回 null（调用方按原逻辑提示"需重新解析分享"）。</returns>
         private async Task<string> GetShareLinkWithReResolveAsync(
             QuarkClient client, string fid, string token, string pwdId, string stoken,
             string passcode, string startFid, string shareRelDir,
+            string fallbackRelDir, string fileName,
             Action<string, string> onReResolved, CancellationToken ct)
         {
             if (client == null || string.IsNullOrEmpty(fid) || string.IsNullOrEmpty(pwdId))
@@ -5366,7 +5446,8 @@ namespace GeZi
             // ② 自动重解析：换新 stoken + 新 share_fid_token
             //    （async 方法不能用 out 参数，用 Tuple 回传：Item1 = 新 stoken，Item2 = 新 token）
             var fresh = await TryReResolveShareTokenAsync(
-                client, pwdId, passcode, startFid, shareRelDir, fid, ct).ConfigureAwait(false);
+                client, pwdId, passcode, startFid, shareRelDir, fid,
+                fallbackRelDir, fileName, ct).ConfigureAwait(false);
             if (fresh == null)
             {
                 Log("分享直链获取失败，自动重新解析分享也没有成功（分享可能已被取消、删除或改了提取码）。");
@@ -5383,78 +5464,215 @@ namespace GeZi
             return url;
         }
 
+        /// <summary>
+        /// 取第一个非空字符串（2026-10-22 新增）。
+        /// <para>用于「老任务没有 <c>ShareRelDir</c>，拿 <c>GroupName</c> / <c>RelDir</c> 兜底下钻路径」——
+        /// 这两个字段在 2026-10-20 之前就有，所以老任务里通常是有值的。</para>
+        /// </summary>
+        private static string FirstNonEmpty(params string[] values)
+        {
+            if (values == null) return null;
+            foreach (string v in values)
+                if (!string.IsNullOrWhiteSpace(v))
+                    return v;
+            return null;
+        }
+
         /// <summary>取分享直链；吞掉一切接口异常，失败只返回 null（由上层决定提示文案）。</summary>
         private async Task<string> TryShareDownloadAsync(
             QuarkClient client, string fid, string token, string pwdId, string stoken)
         {
             try
             {
+                // 【2026-10-22 诊断】把入参形态打出来 —— 用户实测"取链成功但 0 B/s"，
+                // 需要区分是「token 本身不对」还是「token 对但 CDN 拒下载」。
+                // 只打长度和前缀，不打完整值（stoken 是敏感凭证）。
+                Log("[诊断·取链] fid=" + Short(fid) + " token=" + Short(token)
+                    + " pwdId=" + Short(pwdId) + " stoken=" + Short(stoken));
+
                 var links = await client.GetShareDownloadAsync(
                     new List<string> { fid },
                     new List<string> { token ?? "" },
                     pwdId, stoken).ConfigureAwait(false);
-                if (links == null) return null;
+                if (links == null)
+                {
+                    Log("[诊断·取链] 接口返回 null");
+                    return null;
+                }
                 var hit = links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
-                return hit == null ? null : hit.DownloadUrl;
+                if (hit == null)
+                {
+                    Log("[诊断·取链] 返回 " + links.Count + " 条，但都没有 DownloadUrl");
+                    return null;
+                }
+                Log("[诊断·取链] 成功，直链 host=" + SafeHostOf(hit.DownloadUrl)
+                    + " 长度=" + hit.DownloadUrl.Length);
+                return hit.DownloadUrl;
             }
             catch (Exception ex)
             {
                 Log("获取分享直链失败: " + ex.Message);
+                // 异常原文里通常带业务码（如 41020 转存文件token校验异常），
+                // 这是判断"该走哪条修复路径"的关键，必须打全。
+                Log("[诊断·取链] 异常类型=" + ex.GetType().Name);
                 return null;
             }
+        }
+
+        /// <summary>日志用：只留前 8 个字符，避免把凭证整条写进日志。</summary>
+        private static string Short(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "(空)";
+            return s.Length <= 8 ? s : s.Substring(0, 8) + "…(" + s.Length + ")";
+        }
+
+        /// <summary>从直链里取 host（直链很长，日志里只打域名）。</summary>
+        private static string SafeHostOf(string url)
+        {
+            try { return new Uri(url).Host; }
+            catch { return "?"; }
         }
 
         /// <summary>
         /// 重新解析分享：申请新 stoken → 从 startFid 起沿 shareRelDir 逐级进目录 →
         /// 在最终目录里**按 fid** 找到目标文件的**新** share_fid_token。
         /// 按 fid 匹配而不是按名字：fid 在分享内不变，比文件名可靠。
+        ///
+        /// <para>【2026-10-22 补强】用户实测：重启后 9 个未完成任务里 8 个救不回来，
+        /// 日志只有一句「自动重新解析分享也没有成功」，且**距离上一次失败只隔 1 秒** ——
+        /// 逐级下钻 + 逐页找文件根本不可能这么快，说明它压根没往下走。</para>
+        ///
+        /// <para>【根因】<c>StartFid</c> / <c>ShareRelDir</c> 是 2026-10-20 才加的字段，
+        /// 老任务的快照里**是 null**。两个都空 → 只能在分享根目录找，
+        /// 而文件在子目录里（实测在 <c>小书屋01</c> / <c>Z 周星驰电影系列合集 98集</c> 下）
+        /// → 永远找不到，每次重启都重复同一个失败。</para>
+        ///
+        /// <para>【现在的三层兜底】</para>
+        /// <list type="number">
+        /// <item>按记录下来的 <c>ShareRelDir</c> 逐级下钻（正常路径）；</item>
+        /// <item><c>ShareRelDir</c> 为空时，用 <c>GroupName</c> / <c>RelDir</c> 兜底下钻
+        ///       （老任务里这两个字段是有值的，实测就是现成的路径线索）；</item>
+        /// <item>都失败 → <b>在分享里按 fid 全量广度优先搜索</b>。
+        ///       fid 在同一分享内不变，所以不需要知道路径就能定位。</item>
+        /// </list>
         /// </summary>
         /// <returns>null = 失败；否则 Item1 = 新 stoken，Item2 = 新 share_fid_token。
         /// 用 Tuple 而不是 out 参数：async 方法不允许 ref/out。</returns>
         private async Task<Tuple<string, string>> TryReResolveShareTokenAsync(
             QuarkClient client, string pwdId, string passcode, string startFid,
-            string shareRelDir, string fid, CancellationToken ct)
+            string shareRelDir, string fid, string fallbackRelDir, string fileName,
+            CancellationToken ct)
         {
             try
             {
                 // ① 重新申请分享凭证（分享取消/改密码都会在这一步失败）
+                Log("[诊断·重解析] 开始 pwdId=" + Short(pwdId) + " passcode="
+                    + (string.IsNullOrEmpty(passcode) ? "(无)" : "(有)")
+                    + " startFid=" + Short(startFid) + " fid=" + Short(fid)
+                    + " ShareRelDir=" + (string.IsNullOrEmpty(shareRelDir) ? "(空)" : shareRelDir)
+                    + " 兜底路径=" + (string.IsNullOrEmpty(fallbackRelDir) ? "(空)" : fallbackRelDir));
+
                 string stoken = await client.GetStokenAsync(pwdId, passcode ?? "").ConfigureAwait(false);
                 if (string.IsNullOrEmpty(stoken))
-                    return null;
-
-                // ② 从进入目录开始，沿完整相对路径逐级下钻。
-                //    名字匹配做两手准备：目录列表里存的是目录原名，而 RelDir 系列
-                //    字段是 SanitizeFileName 规范化过的，原名带非法字符时两者不同。
-                string pdirFid = string.IsNullOrEmpty(startFid) ? "0" : startFid;
-                string rel = (shareRelDir ?? "").Replace('/', '\\').Trim('\\');
-                if (rel.Length > 0)
                 {
-                    foreach (string seg in rel.Split('\\'))
+                    Log("重新解析分享失败：分享凭证申请不到（分享可能已被取消或改了提取码）。");
+                    return null;
+                }
+                Log("[诊断·重解析] 新 stoken 已拿到 " + Short(stoken));
+
+                string pdirFid = string.IsNullOrEmpty(startFid) ? "0" : startFid;
+
+                // ② 逐级下钻：先按记录下来的 ShareRelDir，再退回 GroupName/RelDir 推断。
+                //    ⚠️ 两次尝试都要走，不能因为第一次下钻失败就直接放弃 ——
+                //    老任务的 ShareRelDir 是 null，正好走第二次。
+                string[] candidates = { shareRelDir, fallbackRelDir };
+                foreach (string cand in candidates)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    string rel = (cand ?? "").Replace('/', '\\').Trim('\\');
+                    string cur = pdirFid;
+                    bool ok = true;
+
+                    Log("[诊断·重解析] 尝试路径「" + (rel.Length == 0 ? "(根目录)" : rel) + "」");
+
+                    if (rel.Length > 0)
                     {
-                        ct.ThrowIfCancellationRequested();
-                        if (seg.Length == 0)
-                            continue;
-                        var dir = await FindShareEntryAsync(client, pwdId, stoken, pdirFid,
-                            e => e.IsDir
-                                 && (e.Name == seg || PathUtil.SanitizeFileName(e.Name) == seg),
-                            ct).ConfigureAwait(false);
-                        if (dir == null)
-                            return null;   // 目录被改名/移动/删除 → 按路径找不到了
-                        pdirFid = dir.Fid;
+                        foreach (string seg in rel.Split('\\'))
+                        {
+                            if (seg.Length == 0) continue;
+                            ct.ThrowIfCancellationRequested();
+
+                            // 名字匹配做两手准备：目录列表里存的是目录原名，而 RelDir 系列
+                            // 字段是 SanitizeFileName 规范化过的，原名带非法字符时两者不同。
+                            var dir = await FindShareEntryAsync(client, pwdId, stoken, cur,
+                                e => e.IsDir
+                                     && (e.Name == seg || PathUtil.SanitizeFileName(e.Name) == seg),
+                                ct).ConfigureAwait(false);
+                            if (dir == null)
+                            {
+                                Log("[诊断·重解析] 目录段「" + seg + "」没找到（在 pdirFid="
+                                    + Short(cur) + " 下）");
+                                ok = false;
+                                break;
+                            }
+                            cur = dir.Fid;
+                            Log("[诊断·重解析] 目录段「" + seg + "」→ pdirFid=" + Short(cur));
+                        }
+                    }
+
+                    if (!ok) continue;   // 这条路径走不通，试下一条
+
+                    // ③ 到达目录后按 fid 定位文件，拿它的新 share_fid_token
+                    var file = await FindShareEntryAsync(client, pwdId, stoken, cur,
+                        e => !e.IsDir && e.Fid == fid, ct).ConfigureAwait(false);
+                    if (file != null && !string.IsNullOrEmpty(file.Token))
+                    {
+                        Log("[诊断·重解析] 命中！路径「" + (rel.Length == 0 ? "(根目录)" : rel)
+                            + "」新 token=" + Short(file.Token));
+                        return Tuple.Create(stoken, file.Token);
+                    }
+                    Log("[诊断·重解析] 目录里没有 fid=" + Short(fid) + " 的文件");
+                }
+
+                // ④ 最后兜底：路径信息全都不可用 → 在**整个分享里按 fid 广度优先搜索**。
+                //    fid 在分享内不变，所以不需要知道它在哪一层。
+                //    这比按名字可靠（名字可能被改），但请求数多，只在前面都失败时才走。
+                Log("[诊断·重解析] 路径都失败 → 开始全分享按 fid 搜索（可能要几十秒）…");
+                var byFid = await client.FindShareFileByFidAsync(pwdId, stoken, fid)
+                    .ConfigureAwait(false);
+                if (byFid != null && !string.IsNullOrEmpty(byFid.Token))
+                {
+                    Log("已通过全分享搜索重新定位到源文件（路径信息缺失，按 fid 找到）。");
+                    Log("[诊断·重解析] 全分享搜索命中，新 token=" + Short(byFid.Token));
+                    return Tuple.Create(stoken, byFid.Token);
+                }
+
+                // ⑤ 再按文件名试一次（fid 也可能变了 —— 例如分享者删了重传）
+                if (!string.IsNullOrEmpty(fileName))
+                {
+                    Log("[诊断·重解析] 按 fid 没找到 → 按文件名「" + fileName + "」再试一次…");
+                    var byName = await client.FindShareFileByNameAsync(pwdId, stoken, fileName)
+                        .ConfigureAwait(false);
+                    if (byName != null && !string.IsNullOrEmpty(byName.Token))
+                    {
+                        Log("已通过文件名在分享中重新定位到源文件。");
+                        Log("[诊断·重解析] 按名字命中，新 fid=" + Short(byName.Fid)
+                            + " 新 token=" + Short(byName.Token));
+                        return Tuple.Create(stoken, byName.Token);
                     }
                 }
 
-                // ③ 最终目录里按 fid 定位文件，拿它的新 share_fid_token
-                var file = await FindShareEntryAsync(client, pwdId, stoken, pdirFid,
-                    e => !e.IsDir && e.Fid == fid, ct).ConfigureAwait(false);
-                if (file == null || string.IsNullOrEmpty(file.Token))
-                    return null;
-
-                return Tuple.Create(stoken, file.Token);
+                // 走到这里 = 分享还在（stoken 拿到了），但文件真的找不到了。
+                // 说清楚是哪一种失败，别再让用户猜。
+                Log("重新解析分享失败：已拿到新凭证，但在分享里找不到该文件"
+                    + "（可能已被分享者删除、移动，或分享内容有变动）。");
+                return null;
             }
             catch (Exception ex)
             {
                 Log("自动重新解析分享失败: " + ex.Message);
+                Log("[诊断·重解析] 异常类型=" + ex.GetType().Name);
                 return null;
             }
         }
@@ -5522,6 +5740,55 @@ namespace GeZi
         }
 
         private async void RunJobs(List<DownloadJob> jobs)
+        {
+            // 🚨 【2026-10-22】async void 的异常**不会**被调用方观察到，
+            // 会直接抛到 SynchronizationContext 上（多数情况下等于静默消失）。
+            // 原来 try 从 `await scheduler.RunAllAsync` 才开始 ——
+            // 它之前的 `new Progress<JobUpdate>(OnJobUpdate)`、`_tasks.Sum(...)`
+            // 等语句一旦抛异常，用户看到的就是"点了没反应，日志什么都没有"。
+            // 现在整段包起来，并且**先打一行**确认进来了。
+            try
+            {
+                Log("[诊断·RunJobs] 进入，共 " + (jobs == null ? 0 : jobs.Count) + " 个任务");
+
+                // 🚨 【2026-10-22 关键修复】必须**强制回到 UI 线程**再往下走。
+                //
+                // 【用户实测】续传入队成功后，紧接着：
+                //   InvalidOperationException: 调用线程无法访问此对象，
+                //   因为另一个线程拥有该对象。
+                //   在 UpdatePauseAllButton(Boolean force) 位置 MainWindow.xaml.cs:7046
+                //   在 RunJobsCoreAsync 位置 MainWindow.xaml.cs:5729
+                // → 任务行停在「排队中」，永远不进「下载中」，速度 0。
+                //
+                // 【根因】调用方 ResumePendingBatchAsync 里取链用了
+                // `.ConfigureAwait(false)`，await 之后**已经不在 UI 线程**。
+                // 虽然那里用 `await Dispatcher.InvokeAsync(...)` 切回 UI 线程做了入队，
+                // 但 **await 一个 DispatcherOperation 完成后，并不保证后续代码仍在 UI 线程**
+                // （当调用方本身没有 SynchronizationContext 时，续体回到线程池）。
+                // 于是紧跟着的 `RunJobs(jobs)` 又跑在了线程池线程上，
+                // 而它第一件事就是 `UpdatePauseAllButton` → 直接 SetValue 一个
+                // DependencyProperty → VerifyAccess 抛异常。
+                //
+                // 【修法】在入口处显式检查并切回 UI 线程，而不是依赖调用方的上下文。
+                // 这样无论谁、在哪个线程调用 RunJobs，行为都一致。
+                if (!Dispatcher.CheckAccess())
+                {
+                    Log("[诊断·RunJobs] 当前不在 UI 线程，已切回 UI 线程后继续。");
+                    await Dispatcher.InvokeAsync(() => RunJobs(jobs));
+                    return;
+                }
+
+                await RunJobsCoreAsync(jobs).ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                Log("下载调度出错: " + ex.GetType().Name + ": " + ex.Message);
+                Log("[诊断·RunJobs] 堆栈: " + (ex.StackTrace ?? "").Replace("\r", " ").Replace("\n", " | "));
+            }
+        }
+
+        /// <summary><see cref="RunJobs"/> 的实际实现（异常统一由外层记日志）。</summary>
+        private async Task RunJobsCoreAsync(List<DownloadJob> jobs)
         {
             var progress = new Progress<JobUpdate>(OnJobUpdate);
             // 【关键】把 scheduler 抓到局部变量再 await。
@@ -8175,6 +8442,37 @@ namespace GeZi
 
             if (t.State == JobState.Paused)
             {
+                // 🚨 【2026-10-22 修】重启恢复出来的 Paused 任务**不能直接 ResumeJob**。
+                //
+                // 【用户实测】关了程序 1 分钟再打开，7 个任务停在「已暂停」，
+                // 点 ▶ 之后状态变成「下载中」，但日志一直是
+                // 「下载中：7 个任务（0 个在跑），总速度 0 B/s」——永远下不动。
+                //
+                // 【根因】`ResumeJob()` 只做一件事：取消暂停信号。它**不重新取链**。
+                // 而这些任务的 `Url` 是**上次会话**取到的直链，签名早已过期
+                // （实测 state.json 里 7 条 Url 长度 520~658，全是死链）。
+                // 恢复后 worker 拿死链去请求 → CDN 返回 401/403/412 → 立即失败 →
+                // 表现就是"在跑但速度 0"。
+                //
+                // 【为什么以前没暴露】同一个会话内暂停/恢复是没问题的 ——
+                // 那时直链还活着（TTL 5~10 分钟）。只有**跨重启**才会踩到。
+                //
+                // 【修法】Dormant（= 上次运行恢复出来的行）的 Paused 一律走
+                // 「重新取链 → 续传」，与失败/取消任务同一条路径；
+                // 非 Dormant（本次会话内暂停的）保持原来的 ResumeJob —— 那是对的。
+                if (t.Dormant)
+                {
+                    var pend = BuildPendingTask(t);
+                    if (pend == null)
+                    {
+                        Log("这个任务缺少续传信息，无法继续；请重新解析分享后再下载（分片在，会自然续传）。");
+                        return;
+                    }
+                    Log("正在为「" + t.Name + "」重新取链……（上次会话的直链已过期）");
+                    _ = ResumePendingBatchAsync(new List<PendingTask> { pend });
+                    return;
+                }
+
                 t.PauseRequested = false;   // 先清标志，否则会继续忽略核心的 Downloading
                 t.Job.ResumeJob();
                 t.State = JobState.Downloading;
@@ -9260,11 +9558,22 @@ namespace GeZi
                             url = await GetShareLinkWithReResolveAsync(
                                 client, p.Fid, p.Token, p.PwdId, p.Stoken, p.Passcode,
                                 p.StartFid, p.ShareRelDir,
+                                // 【2026-10-22】老任务没有 ShareRelDir → 用 GroupName/RelDir 兜底下钻
+                                FirstNonEmpty(p.GroupName, p.RelDir), p.Name,
                                 (freshStoken, freshToken) =>
                                 {
                                     p.Stoken = freshStoken;   // 回填到续传记录，后续 job.Pending 用的就是新值
                                     p.Token = freshToken;
-                                }, CancellationToken.None).ConfigureAwait(false);
+                                }, CancellationToken.None).ConfigureAwait(true);
+                                // 🚨 【2026-10-22】必须是 true（回到 UI 线程）。
+                                // 这里原来写的是 false —— 于是 await 之后的代码
+                                // （_tasks.Remove / AddTaskItem / RunJobs）
+                                // 全跑在线程池线程上，改 ObservableCollection 直接抛
+                                // NotSupportedException（CollectionView 跨线程），
+                                // RunJobs 里改 DependencyProperty 再抛 InvalidOperationException。
+                                // 表现为"取链成功但任务停在排队中、速度 0"。
+                                // 本方法是 UI 层方法，本来就该全程在 UI 线程 ——
+                                // 真正耗时的网络请求在 QuarkClient 内部已用 ConfigureAwait(false)。
 
                             // 【2026-10-22】还是拿不到 → 走「转存副本没了就回免转存」的兜底。
                             // 场景：转存路径下 p.Fid 是**中转副本**的 fid，用户把副本删了，
@@ -9272,7 +9581,7 @@ namespace GeZi
                             if (string.IsNullOrEmpty(url))
                             {
                                 url = await TryFallbackToShareSourceAsync(client, p, CancellationToken.None)
-                                    .ConfigureAwait(false);
+                                    .ConfigureAwait(true);
                             }
                         }
                         else
@@ -9293,7 +9602,7 @@ namespace GeZi
                             if (string.IsNullOrEmpty(url))
                             {
                                 url = await TryFallbackToShareSourceAsync(client, p, CancellationToken.None)
-                                    .ConfigureAwait(false);
+                                    .ConfigureAwait(true);
                             }
                         }
 
@@ -9302,6 +9611,15 @@ namespace GeZi
                             Log("[" + p.Name + "] 续传取链失败（分享可能已被取消、删除或改了提取码）。");
                             continue;
                         }
+
+                        // 【2026-10-22 诊断】取到链了，但用户实测"速度一直是 0"。
+                        // 打清 URL 的域名 / 长度 / Cookie 长度 —— 若 CDN 域名是
+                        // dl-pc-zb 而 Cookie 又没带上，就能立刻看出是请求头问题。
+                        Log("[诊断·续传] " + p.Name + " 取链成功"
+                            + " host=" + SafeHostOf(url)
+                            + " urlLen=" + url.Length
+                            + " cookieLen=" + (client.CookieStr == null ? 0 : client.CookieStr.Length)
+                            + " fromShare=" + p.FromShare);
 
                         string dest = p.Dest;
                         try { Directory.CreateDirectory(Path.GetDirectoryName(dest)); } catch { }
@@ -9345,35 +9663,133 @@ namespace GeZi
                     return;
                 }
 
-                foreach (var job in jobs)
+                // 【2026-10-22 诊断】用户实测：取链全部成功（日志有 3 条 [诊断·续传]），
+                // 但**完全没有**「已续传 N 个任务」，也没有任何 [诊断·下载] ——
+                // 说明流程在这之后、RunJobs 之前就断了。把中间状态打出来。
+                Log("[诊断·续传] 取链完成，jobs=" + jobs.Count + " 个，准备入队");
+
+                // 🚨 【2026-10-22 关键修复】入队必须回到 **UI 线程**。
+                //
+                // 【用户实测】点「▶」续传，日志显示取链成功、进入入队，然后：
+                //   NotSupportedException: 该类型的 CollectionView 不支持从调度程序
+                //   线程以外的线程对其 SourceCollection 进行的更改。
+                //   ……在 ResumePendingBatchAsync 位置 MainWindow.xaml.cs:行号 9600
+                // 于是**整个续传流程静默中断** —— 任务不入队、不下载，
+                // 界面只剩「下载中：N 个任务（0 个在跑），总速度 0 B/s」。
+                //
+                // 【根因】本方法里取链那几行用了 `.ConfigureAwait(false)`
+                // （见上面 GetShareLinkWithReResolveAsync / GetDownloadAsync 的调用），
+                // 它让**后续代码不再回到 UI 线程**，而是继续跑在线程池线程上。
+                // 而 `_tasks` 是绑定到 `TaskList.ItemsSource` 的 ObservableCollection，
+                // WPF 的 CollectionView 禁止跨线程改它 —— 一改就抛 NotSupportedException。
+                //
+                // 【为什么以前没暴露】正常下载走的是 `AddTaskItem`（在 UI 事件处理器里
+                // 同步执行，天然在 UI 线程）。只有**续传**这条 async 路径会跨线程。
+                //
+                // 【修法】把"改集合 + 加行 + 启下载"整体切回 UI 线程。
+                // 用 InvokeAsync 而不是 BeginInvoke：要让异常能被外层 catch 到。
+                await Dispatcher.InvokeAsync(() =>
                 {
-                    // 去重：任务页里可能已经有一条同路径的行 ——
-                    //   · "上次恢复出来的占位行"（Dormant）：续传成功后要把它换掉；
-                    //   · "失败/取消的老行"（【2026-10-22】按「失败当暂停」重试时）：
-                    //     也会被新的续传行取代，不能并存两行（否则一个文件显示两次）。
-                    //   · "刚被置为 Queued 等着重试的老行"：【2026-10-22】修。
-                    //     「全部恢复」会把失败任务置成 Queued 再走这条续传路径，
-                    //     如果不把老行清掉，同一个文件会出现**两行**（用户实测：
-                    //     任务列表里同一个文件出现两次，删掉一行另一行还在）。
-                    // 判据：同一 Dest，且那一行**没有在真正下载**。
-                    var stale = _tasks.FirstOrDefault(x => x.Job != null
-                        && string.Equals(x.Job.Dest, job.Dest, StringComparison.OrdinalIgnoreCase)
-                        && (x.Dormant
-                            || x.State == JobState.Failed
-                            || x.State == JobState.Cancelled
-                            || x.State == JobState.Paused
-                            || x.State == JobState.Queued));
-                    if (stale != null)
-                        _tasks.Remove(stale);
-                    AddTaskItem(new TaskItem(job, job.Name));
-                }
-                Log("已续传 " + jobs.Count + " 个任务。");
+                    foreach (var job in jobs)
+                    {
+                        // 去重：任务页里可能已经有一条同路径的行 ——
+                        //   · "上次恢复出来的占位行"（Dormant）：续传成功后要把它换掉；
+                        //   · "失败/取消的老行"：也会被新的续传行取代，不能并存两行。
+                        // 判据：同一 Dest，且那一行**没有在真正下载**。
+                        var stale = _tasks.FirstOrDefault(x => x.Job != null
+                            && string.Equals(x.Job.Dest, job.Dest, StringComparison.OrdinalIgnoreCase)
+                            && (x.Dormant
+                                || x.State == JobState.Failed
+                                || x.State == JobState.Cancelled
+                                || x.State == JobState.Paused
+                                || x.State == JobState.Queued));
+                        if (stale != null)
+                        {
+                            Log("[诊断·续传] 移除旧行: " + (stale.Name ?? "?")
+                                + "（状态=" + stale.State + " Dormant=" + stale.Dormant + "）");
+                            _tasks.Remove(stale);
+                        }
+                        AddTaskItem(new TaskItem(job, job.Name)
+                        {
+                            // 【2026-10-22 修】续传入队时**预填磁盘上的真实进度**。
+                            //
+                            // 【用户实测】续传本身是成功的（分片确实在续），但
+                            // 「进度条会一下从 0 跳到继续下载的位置」—— 看着像从头重下。
+                            //
+                            // 【原因】`new TaskItem(job, name)` 的 Done/Total/Percent
+                            // 初始都是 0，要等**第一次进度上报**（OnJobUpdate）才有值。
+                            // 而续传任务第一次上报前要经历"建连 → 探测 → 规划分片"，
+                            // 中间有几百毫秒到几秒的窗口，这段时间进度条就是 0% ——
+                            // 用户正好看到它，于是以为重新开始了。
+                            //
+                            // 【修法】入队时直接用 `ReadDownloadedBytes` 读 .qmeta，
+                            // 把 Done/Percent 先填成"上次下到哪"。
+                            // 与 RestoreTaskList（6810 行）用的是同一个数据源，口径一致。
+                            Total = job.Pending != null && job.Pending.Size > 0 ? job.Pending.Size : 0,
+                            Done = PrefillDone(job.Dest),
+                            Percent = PrefillPercent(job.Dest,
+                                job.Pending != null ? job.Pending.Size : 0),
+                        });
+                        Log("[诊断·续传] 已入队: " + job.Name
+                            + "（预填进度 " + PrefillPercent(job.Dest,
+                                job.Pending != null ? job.Pending.Size : 0).ToString("F1") + "%）");
+                    }
+                    Log("已续传 " + jobs.Count + " 个任务。");
+                });
+
+                // RunJobs 内部会 new Progress<>（捕获当前 SynchronizationContext），
+                // 必须在 UI 线程调用，否则进度回调不会回到 UI。
+                Log("[诊断·续传] 即将调用 RunJobs(" + jobs.Count + " 个)…");
                 RunJobs(jobs);
+            }
+            catch (Exception ex)
+            {
+                // 🚨 【2026-10-22 修】这个方法是被 `_ = ResumePendingBatchAsync(...)`
+                // fire-and-forget 调用的 —— **没有外层 try** 的话，任何未处理异常
+                // 都会随 Task 一起被丢弃（无人 await → 静默），
+                // 用户看到的就是"点了续传，日志显示取链成功，然后什么都没有"。
+                // 这正是本次实测的现象：3 条 [诊断·续传] 取链成功，
+                // 却**完全没有**「已续传 N 个任务」，也没有任何下载日志。
+                Log("续传流程出错: " + ex.GetType().Name + ": " + ex.Message);
+                Log("[诊断·续传] 堆栈: " + (ex.StackTrace ?? "").Replace("\r", " ").Replace("\n", " | "));
             }
             finally
             {
                 SetBusy(false);
             }
+        }
+
+        /// <summary>
+        /// 读磁盘上已下载的字节数（.qmeta 里的真实进度），用于**续传入队时预填进度条**。
+        ///
+        /// <para>【为什么要预填】续传成功后新建的 TaskItem 初始 Done=0，
+        /// 要等第一次进度上报才有值。而首次上报前要"建连 → 探测 → 规划分片"，
+        /// 中间几百毫秒~几秒进度条一直是 0% —— 用户会以为在从头重下
+        /// （实测反馈："进度条会一下从 0 跳到继续下载的位置"）。</para>
+        ///
+        /// <para>失败一律返回 0：这只是显示优化，绝不能因为它让续传本身失败。</para>
+        /// </summary>
+        private long PrefillDone(string dest)
+        {
+            if (string.IsNullOrEmpty(dest)) return 0;
+            try
+            {
+                return SegmentedDownloader.ReadDownloadedBytes(
+                    dest, string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot);
+            }
+            catch { return 0; }
+        }
+
+        /// <summary>
+        /// 与 <see cref="PrefillDone"/> 配套：把已下字节换算成百分比（0~99.9）。
+        /// 总大小未知（≤0）时返回 0，避免除零。
+        /// </summary>
+        private double PrefillPercent(string dest, long size)
+        {
+            if (size <= 0) return 0;
+            long done = PrefillDone(dest);
+            if (done <= 0) return 0;
+            return Math.Min(99.9, done * 100.0 / size);
         }
 
         /// <summary>给"续传任务"用的重新取链回调（基于 Job 上的 Pending 上下文）。</summary>

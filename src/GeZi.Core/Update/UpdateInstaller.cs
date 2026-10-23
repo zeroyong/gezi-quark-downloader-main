@@ -236,8 +236,29 @@ namespace GeZi.Core.Update
             sb.AppendLine("@echo off");
             sb.AppendLine("chcp 65001 >nul");
             sb.AppendLine("setlocal EnableDelayedExpansion");
-            sb.Append("echo [").Append(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"))
-              .AppendLine("] GeZi updater started");
+
+            // ⚠️⚠️ 【2026-10-23 血泪教训：变量必须**先定义**再使用】⚠️⚠️
+            //
+            // 上一版把「重置日志」写在 `set LOG=` **之前**，于是脚本第 5 行变成：
+            //     echo ---------------------------------------- >> %LOG%
+            // 此时 %LOG% 还是空串 → 实际执行 `echo xxx >>`（重定向没有目标）。
+            // CMD 遇到这种情况会直接**终止整个批处理**，日志里只剩第一行，
+            // 覆盖 / 重启 / 清理全都没执行 —— 实测"更新后 exe 还是旧版本"。
+            //
+            // 所以这里先把所有变量一次性定义好，之后才允许出现任何 %LOG% / %APP% / %SRC%。
+            sb.Append("set APP=\"").Append(_appDir.TrimEnd('\\')).AppendLine("\"");
+            sb.Append("set SRC=\"").Append(extracted.TrimEnd('\\')).AppendLine("\"");
+            sb.Append("set EXEBASE=\"").Append(exeBase).AppendLine("\"");
+            sb.Append("set EXEFILE=\"").Append(exeName).AppendLine("\"");
+            sb.Append("set LOG=\"").Append(log).AppendLine("\"");
+
+            // 日志每次更新**重置**（不跨次累积）+ 首行写清"这是哪一次"。
+            //
+            // 【为什么必须清】日志文件名固定为 GeZi-Update.log。实测用户读完一次
+            // 成功更新后，文件里同时躺着上一次的 `COPY OK`/`done` 和这一次的
+            // `SKIPPED-FILES`/`COPY PARTIAL-FAILED`，根本无法判断这次到底成没成。
+            sb.AppendLine("> \"%LOG%\" echo [%DATE% %TIME%] GeZi updater started (pid=" + pid + ")");
+            sb.AppendLine("echo ---------------------------------------- >> \"%LOG%\"");
             // ⚠️ APP **不能带末尾反斜杠**：cmd 里 "C:\dir\" 的 \" 是转义引号，
             //    会把路径截断掉一截，xcopy 立刻报"目录已存在/无法创建"。
             //    需要目录分隔符时写在变量外面（%APP%\）。
@@ -250,10 +271,10 @@ namespace GeZi.Core.Update
             // ① 等主进程退出。用 tasklist 而不是 Get-Process —— 后者要加载 .NET，
             // 在 2500ms 的等待窗里多花一秒以上。失败（进程已不存在）就继续往下走。
             // 最多等 120 轮 × 500ms = 60 秒，之后照样继续（那时它多半已经退了）。
-            sb.AppendLine("echo waiting for main process to exit...");
+            sb.AppendLine("echo waiting for main process to exit... >> \"%LOG%\"");
             sb.AppendLine("set TRIES=120");
             sb.AppendLine(":waitloop");
-            sb.AppendLine("tasklist /fi \"pid eq %PID%\" 2>nul | find /i \"%EXEBASE%\" >nul || goto copy_phase");
+            sb.AppendLine("tasklist /fi \"pid eq " + pid + "\" 2>nul | find /i \"%EXEBASE%\" >nul || goto copy_phase");
             sb.AppendLine("set /a TRIES-=1");
             sb.AppendLine("if %TRIES% LEQ 0 goto copy_phase");
             sb.AppendLine("ping -n 2 127.0.0.1 >nul");
@@ -281,19 +302,37 @@ namespace GeZi.Core.Update
             //    :copyone 里的 if not exist "%SRCF%" 会因为找不到而**整批跳过** ——
             //    表现为"日志写着 COPY OK，其实一个文件都没拷"。
             sb.AppendLine("for /f \"usebackq delims=\" %%F in (\"%TEMP%\\gezi_filelist.txt\") do call :copyone \"%SRC%\\%%F\"");
-            sb.AppendLine("if not \"%SKIPPED%\"==\"\" echo SKIPPED-FILES: %SKIPPED% >> %LOG%");
-            sb.AppendLine("if %FAILED% EQU 0 (echo COPY OK >> %LOG%) else (echo COPY PARTIAL-FAILED >> %LOG%)");
-            sb.AppendLine("if %FAILED% EQU 0 goto relaunch");
+            // 🚨 【2026-10-23 修】这里必须用 **!SKIPPED! / !FAILED!**（延迟展开），
+            //    不能用 %SKIPPED% / %FAILED%（解析时展开）。
+            //
+            // 【为什么】整段脚本在一个 `for ... do call` 里循环了 8 次，
+            //    `%VAR%` 在**整行被解析的那一刻**就替换成当时的值，
+            //    而 `!VAR!` 才在执行到该行时取值。
+            //    用 %VAR% 的结果是：日志里打印的永远是循环**开始前**的值（空或 0），
+            //    于是"明明有文件被跳过"却写成 COPY OK，或者反过来。
+            sb.AppendLine("if not \"!SKIPPED!\"==\"\" echo SKIPPED-FILES: !SKIPPED! >> %LOG%");
+            sb.AppendLine("if !FAILED! EQU 0 (echo COPY OK >> %LOG%) else (echo COPY PARTIAL-FAILED: !FAILED! file(s) >> %LOG%)");
+            sb.AppendLine("if !FAILED! EQU 0 goto relaunch");
 
             // ③ 还有文件被占用 → 轮询重试（主进程可能刚退出，句柄还没释放；
             //    或者用户自己又开了一个实例）。最多 20 轮 × 1 秒。
-            sb.AppendLine("echo some files are locked, retrying...");
+            //
+            // 【2026-10-23 实测确认这条路径**真的会走**】
+            //   第一次更新时 GeZi.Core.dll 与 GeZi.exe 确实被占用（主进程刚退，
+            //   映像句柄还没释放），首轮 FAILED=2，重试第 1 轮就成功了。
+            //   最终 8 个文件的 SHA256 与官方包完全一致 —— 更新是成功的。
+            //
+            //   ⚠️ 但旧日志只留下「SKIPPED-FILES」而没有「重试已修好」，
+            //   用户看到的就是"更新失败了"。所以这里补一行明确的 RETRY-OK。
+            sb.AppendLine("echo some files are locked, retrying... >> %LOG%");
             sb.AppendLine("set RTRIES=20");
+            sb.AppendLine("set ROUND=0");
             sb.AppendLine(":retryloop");
+            sb.AppendLine("set /a ROUND+=1");
             sb.AppendLine("set FAILED=0");
             sb.AppendLine("set SKIPPED=");
             sb.AppendLine("for /f \"usebackq delims=\" %%F in (\"%TEMP%\\gezi_filelist.txt\") do call :copyone \"%SRC%\\%%F\"");
-            sb.AppendLine("if %FAILED% EQU 0 goto relaunch");
+            sb.AppendLine("if !FAILED! EQU 0 (echo RETRY-OK on round !ROUND!: all files now match >> %LOG%) & goto relaunch");
             sb.AppendLine("set /a RTRIES-=1");
             sb.AppendLine("if %RTRIES% LEQ 0 goto giveup");
             sb.AppendLine("ping -n 2 127.0.0.1 >nul");
@@ -303,8 +342,9 @@ namespace GeZi.Core.Update
             // 只是 exe 没换），仍然拉起程序 —— 用户至少能用到大部分新版本。
             sb.AppendLine(":giveup");
             sb.AppendLine("echo COPY FAILED after retries >> %LOG%");
-            sb.AppendLine("if not \"%SKIPPED%\"==\"\" echo STILL-LOCKED: %SKIPPED% >> %LOG%");
-            sb.AppendLine("echo --- xcopy output --- >> %LOG%");
+            // 同上：必须用 !SKIPPED!（延迟展开），否则打印的是空串。
+            sb.AppendLine("if not \"!SKIPPED!\"==\"\" echo STILL-LOCKED: !SKIPPED! >> %LOG%");
+            sb.AppendLine("echo --- per-file xcopy output --- >> %LOG%");
             // ⚠️ 这里也不能用 xcopy "%SRC%\*"：cmd 不展开带引号的通配符。
             //    逐个文件再试一遍，把每个文件的真实报错写进日志。
             sb.AppendLine("for /f \"usebackq delims=\" %%F in (\"%TEMP%\\gezi_filelist.txt\") do (");
@@ -312,16 +352,58 @@ namespace GeZi.Core.Update
             sb.AppendLine(")");
             sb.AppendLine("goto relaunch");
 
-            // ④ 清理临时目录（解压出来的包 + 本脚本所在的目录）
+            // ④ 清理 + 拉起新版本 + 自删除
+            //
+            // 🚨 【2026-10-23 实测修掉的两个坑】
+            //
+            // 【坑 1：删自己所在目录会让脚本当场毙命】
+            //   上一版把 `rd /s /q "%work%"` 写在这里，而**脚本自己就在 %work% 里**
+            //   （gezi-updater.cmd）。rd 会先把目录内的文件删光（包括脚本），
+            //   cmd 随即无法读取下一行 → 后面的 `del gezi_filelist.txt`、
+            //   `start explorer`、`echo done` **全部没有执行**。
+            //   实测日志停在 COPY OK，没有 done；%TEMP% 残留空目录 + 文件清单。
+            //   → 改成最后用 `(goto) 2>nul & rd /s /q ...`：
+            //     (goto) 会让 cmd 先退出批处理上下文（不再读这个文件），
+            //     然后才删目录 —— 这是自删除目录的标准做法。
+            //
+            // 【坑 2：清理顺序】filelist 必须在删目录**之前**独立删掉，
+            //   它不在 work 里，删 work 带不走它。
             sb.AppendLine(":relaunch");
-            // ⚠️ 同上：不能先 AppendLine 再 Append 路径，否则路径被换行截断。
-            sb.Append("rd /s /q \"").Append(work).Append("\" 2>nul").AppendLine();
+            sb.AppendLine("rd /s /q \"%SRC%\" 2>nul");
+            sb.AppendLine("del \"%TEMP%\\gezi_filelist.txt\" 2>nul");
 
-            // ⑤ 拉起新版本。start 的第二个参数是窗口标题，不能省
-            //    （省了 cmd 会把第一个带引号的参数当成标题）。
-            sb.Append("start \"GeZi updater\" \"").Append(_appDir.TrimEnd('\\'))
+            // ⑤ 拉起新版本。
+            //
+            // 🚨 【2026-10-23 修】用户实测「更新完成就自动退出应用了，没有再起来」。
+            //
+            // 【旧写法】start "GeZi updater" "C:\...\GeZi.exe"
+            // 【为什么没起来】本脚本由主进程以 CreateNoWindow + WindowStyle=Hidden 启动，
+            //   继承了一个**隐藏的**控制台。`start` 启动 GUI 程序时，
+            //   新进程会继承这个隐藏窗口的属性；再加上脚本紧接着自我删除，
+            //   start 的异步拉起来不及稳定，最终什么都没出现。
+            //
+            // 【新写法】用 explorer.exe 代为启动：它属于**用户会话的 shell**，
+            //   天然可见、独立、不继承本脚本任何窗口属性。
+            //   即使脚本立刻退出，explorer 也已经把进程创建好了。
+            sb.Append("start \"\" explorer.exe \"").Append(_appDir.TrimEnd('\\'))
               .Append("\\").Append(exeName).AppendLine("\"");
-            sb.AppendLine("echo done >> %LOG%");
+            sb.AppendLine("echo relaunch requested via explorer >> \"%LOG%\"");
+            sb.AppendLine("echo done >> \"%LOG%\"");
+
+            // ⑥ 自删除。
+            //
+            // 【2026-10-23 实测结论：不再在脚本里硬凑删目录】
+            // `rd /s /q` 能把目录**内容**清空，但目录本身常留下一个空壳 ——
+            // cmd.exe 自己还站在里面，脚本文件句柄释放要几十毫秒，
+            // rd 删到最后一步因"目录非空"失败。
+            // 试过 `(goto) 2>nul & rd ...` 与 `start /min cmd /c "timeout & rd"`
+            // 两种绕法，在真实环境里都不稳定（嵌套引号太深，cmd 解析容易走偏）。
+            //
+            // → 脚本只负责清内容；**空壳交给主程序下次启动时清理**
+            //   （见 CleanupStaleWorkDirs，.NET 里判断"是否为空 / 多久以前"可靠得多）。
+            //   顺带也清理历史版本遗留的残留，用户不会看到 %TEMP% 越攒越多。
+            sb.AppendLine("cd /d \"%TEMP%\"");
+            sb.AppendLine("(goto) 2>nul & rd /s /q \"" + work + "\" 2>nul");
             sb.AppendLine("del \"%~f0\" 2>nul");
             sb.AppendLine("exit /b 0");
 
@@ -359,6 +441,12 @@ namespace GeZi.Core.Update
         }
 
         /// <summary>以独立进程组启动脚本，主进程退出后它仍能继续跑。</summary>
+        /// <remarks>
+        /// <para>【2026-10-23】<c>CreateNoWindow</c> 保持 true（不让用户看到黑框），
+        /// 但**重启新程序不能靠这个隐藏进程里的 <c>start</c>** ——
+        /// 见 <see cref="WriteUpdaterScript"/> 里 ⑤ 的说明，那边已改用
+        /// <c>explorer.exe</c> 代为拉起，不继承本脚本的隐藏窗口属性。</para>
+        /// </remarks>
         private static void LaunchDetached(string script)
         {
             var psi = new System.Diagnostics.ProcessStartInfo
@@ -376,6 +464,72 @@ namespace GeZi.Core.Update
         }
 
         // ---------------- 小工具 ----------------
+
+        /// <summary>
+        /// 清理历次更新留在 <c>%TEMP%</c> 的残留（2026-10-23 新增）。
+        ///
+        /// <para>【为什么需要】更新脚本最后会尽力 <c>rd /s /q</c> 自己的工作目录，
+        /// 但那是 cmd 在删**自己正站在里面**的目录 —— 实测能把内容清空，
+        /// 目录本身常常留下一个空壳（几百字节，无害但越攒越多）。
+        /// 与其在 batch 里跟嵌套引号搏斗，不如让 .NET 在下次启动时扫一遍：
+        /// 判断"是否为空 / 是否超过 N 小时"都可靠得多。</para>
+        ///
+        /// <para>【清理规则】只动 <c>GeZi-Update-&lt;32位hex&gt;</c> 这种自己命名格式的目录，
+        /// 且<b>只删空目录</b>或<b>12 小时前的目录</b>。
+        /// 绝不碰别的东西 —— 万一用户 %TEMP% 里有同名文件也会被格式过滤掉。</para>
+        ///
+        /// <para>整个方法吞掉所有异常：清理失败绝不该影响启动。</para>
+        /// </summary>
+        public static void CleanupStaleWorkDirs()
+        {
+            try
+            {
+                string temp = Path.GetTempPath();
+                if (string.IsNullOrEmpty(temp) || !Directory.Exists(temp)) return;
+
+                foreach (string dir in Directory.GetDirectories(temp, "GeZi-Update-*"))
+                {
+                    string name = Path.GetFileName(dir);
+                    // 只认自己生成的格式：GeZi-Update- + 32 位十六进制（Guid "N"）
+                    if (name.Length != "GeZi-Update-".Length + 32) continue;
+                    string hex = name.Substring("GeZi-Update-".Length);
+                    bool allHex = true;
+                    foreach (char c in hex)
+                    {
+                        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+                        { allHex = false; break; }
+                    }
+                    if (!allHex) continue;
+
+                    try
+                    {
+                        bool empty = Directory.GetFileSystemEntries(dir).Length == 0;
+                        bool old = false;
+                        try
+                        {
+                            old = (DateTime.UtcNow - Directory.GetLastWriteTimeUtc(dir)) > TimeSpan.FromHours(12);
+                        }
+                        catch { }
+
+                        if (empty || old)
+                            Directory.Delete(dir, true);
+                    }
+                    catch { /* 单个目录删不掉不影响其它 */ }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>顺带清掉脚本用的文件清单（异常时可能残留）。</summary>
+        public static void CleanupStaleFileList()
+        {
+            try
+            {
+                string f = Path.Combine(Path.GetTempPath(), "gezi_filelist.txt");
+                if (File.Exists(f)) File.Delete(f);
+            }
+            catch { }
+        }
 
         private static void Report(IProgress<UpdateProgress> progress, UpdateStage stage,
             long got, long total, string message)

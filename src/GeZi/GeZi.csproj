@@ -11,18 +11,30 @@
     <RootNamespace>GeZi</RootNamespace>
     <Product>鸽子下载自用版</Product>
     <AssemblyTitle>鸽子下载自用版</AssemblyTitle>
-    <!-- 【2026-10-22】版本号升到 2.8.4。
+    <!-- 【2026-10-23】版本号升到 2.8.5。
          版本号从程序集读（关于页 / 设置页 / 更新检查都用它），不要在别处手写一份。
          2.8.2：数据目录统一到 %LOCALAPPDATA%\鸽子下载\（解决"换目录启动任务不见了"），
                 打包不再携带用户数据。
          2.8.3：修复「一键更新」覆盖失败（下载成功但重启仍是旧版本）。
          2.8.4：① 修复「已收起分组名」用 '\u0001' 做分隔符导致整份 config.xml
                   变成非法 XML（表现为 Cookie 丢失、主题回亮色）；
-                ② 修复「全部收起」拿不全分组、以及按钮方向与实际状态不同步；
-                ③ 修复失败任务点行内 ▶ 只提示「不可恢复」而无反应
+               ② 修复「全部收起」拿不全分组、以及按钮方向与实际状态不同步；
+               ③ 修复失败任务点行内 ▶ 只提示「不可恢复」而无反应
                   （失败态落进 ResumeTask 的 else 分支）；
-                ④ 全局 ToolTip 改用主题令牌，暗色主题下不再弹刺眼的纯白方块。 -->
-    <Version>2.8.4</Version>
+               ④ 全局 ToolTip 改用主题令牌，暗色主题下不再弹刺眼的纯白方块。
+         2.8.5：① 修复「关掉应用再打开，点继续下载一直 0 B/s」（用户实测）。
+                  这是五个串联 bug，原版五层全有：
+                  · Paused 任务点 ▶ 只 ResumeJob()，不重新取链 → 跨重启必用死链；
+                  · 老任务缺 StartFid/ShareRelDir → 重解析在根目录空转、1 秒就失败；
+                  · _tasks.Remove 跨线程 → NotSupportedException，续传静默中断；
+                  · RunJobs 跨线程改依赖属性 → InvalidOperationException，停在「排队中」；
+                  · 进度条从 0 跳变 → 入队时改读 .qmeta 预填真实进度。
+               ② 修复「一键更新」三处：
+                  · 日志跨次累积，同一份里既有 COPY OK 又有 PARTIAL-FAILED，无法判断成败；
+                  · 更新后程序不再自动重启（隐藏窗口继承 + 自我删除抢跑）；
+                  · %TEMP% 残留 GeZi-Update-* 空壳与 gezi_filelist.txt（改由启动时清理）。
+               ③ 日志框支持右键「清空日志 / 复制全部」，方便复现问题时清屏比对。 -->
+    <Version>2.8.5</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <StartupObject>GeZi.App</StartupObject>
     <!-- 【2026-10-03】应用图标：exe 文件图标 + 任务栏/Alt-Tab 图标。
