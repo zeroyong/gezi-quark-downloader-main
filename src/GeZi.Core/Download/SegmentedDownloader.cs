@@ -161,6 +161,16 @@ namespace GeZi.Core.Download
         /// </summary>
         private int _lastRemainParts;
 
+        /// <summary>
+        /// 上一次运行时的实际并发路数（0 = 未知）。
+        ///
+        /// <para>【2026-10-24 新增】主循环判断"收尾阶段"要用它算收尾上限
+        /// （见 <see cref="PreemptEndgameDivisor"/>）：收尾上限是**相对并发**的，
+        /// 只剩 6 片在 238 路下已是极尾，但在 8 路下还不算。
+        /// 主循环拿不到 AttemptAsync 内部的 workerCount，故用字段桥接。</para>
+        /// </summary>
+        private int _lastWorkerCount;
+
         /// <summary>动态刷新上限的**封顶值**（见 <see cref="ComputeMaxLinkRefreshes"/>）。</summary>
         private const int MaxLinkRefreshesCap = 60;
 
@@ -333,6 +343,40 @@ namespace GeZi.Core.Download
         /// 总速度，此时重连握手（~0.5s）远比继续等便宜。
         /// </summary>
         private const int PreemptEndgameInflight = 3;
+
+        /// <summary>
+        /// 【2026-10-24 新增】收尾判定之二：在飞路数相对总并发"很少"时也算收尾。
+        ///
+        /// <para>🚨 用户实测（248MB 视频，102 路并发，卡在最后 97KB）：</para>
+        /// <code>
+        ///   auddk_77 @KBJSVIP.mp4   1/102 连接   0 B/s   99.9% 剩 50 秒
+        /// </code>
+        /// <para>只剩 1 路在飞，虽然满足 ≤3 的绝对判据，但**换链后 _lastRemainParts 立刻清零**，
+        /// 且 412 过期时 worker 各自 break 退出、无人再领片 —— 两者叠加就是死循环。</para>
+        ///
+        /// <para>判据取"在飞 ≤ max(3, 并发/8)，且不超过 32"：既要真的很少（相对总量），
+        /// 又要避免低并发用户被误判（32 路时阈值 4，仍很严）。</para>
+        /// </summary>
+        private const int PreemptEndgameDivisor = 8;
+        private const int PreemptEndgameInflightMax = 32;
+
+        /// <summary>
+        /// 【2026-10-24 新增】"慢速爬行"阈值（字节/秒）。
+        ///
+        /// <para>低于此值且落在收尾阶段时，认为这几片被 CDN 调度到了坏节点。
+        /// 取 16KB/s 的依据：健康单连接实测 40~80KB/s，
+        /// 用户实测坏节点是 12.97KB/s 与 94 B/s —— 都远低于此线。</para>
+        /// <para>⚠️ 不能设太高：正常收尾时剩 1~2 片、每路 30KB/s 是健康的，
+        /// 若定到 64KB/s 会把正常收尾判成故障，反复换链反而更慢。</para>
+        /// </summary>
+        private const double CrawlBps = 16 * 1024;
+
+        /// <summary>
+        /// 【2026-10-24 新增】慢速爬行要持续多久才判定"该换链"（秒）。
+        /// <para>20 秒：既要躲开"分片刚好在换片/建连"的瞬时低谷，
+        /// 又不能等太久 —— 实测那次要磨 11 分钟，20 秒介入收益极大。</para>
+        /// </summary>
+        private const int CrawlSeconds = 20;
 
         /// <summary>收尾阶段的最低年龄门槛。</summary>
         private const long PreemptEndgameMinAgeMs = 3_000;
@@ -743,13 +787,20 @@ namespace GeZi.Core.Download
                 // 下载途中偶发卡顿就换链会把请求量放大。而收尾阶段（只剩极少数
                 // 分片在磨）换链成本极低、收益极大 —— 换一条链就换了节点。
                 //
-                // 「收尾阶段」的判据用 _lastRemainParts：它在看门狗判定停滞时被填入
-                // （见 reporter 里那段）。0 = 未知/不是停滞，按"不是收尾"处理。
+                // 「收尾阶段」的判据用 _lastRemainParts：它在看门狗判定停滞 /
+                // 慢速爬行时被填入。0 = 未知/不是收尾，按"不是收尾"处理。
                 //
                 // ⚠️ 不能用 msg 里是否含 "stalled" 来判断 —— 失败消息实际是
                 //    「网络停滞已中止（已保留断点…）」，并不含英文 stalled。
-                //    改成看 _lastRemainParts 更可靠，也更贴合语义（"还剩几片"）。
-                bool tailStall = _lastRemainParts > 0 && _lastRemainParts <= 4;
+                //
+                // 【2026-10-24 第二次修：阈值为啥不能再写死 4】
+                // 收尾判据已改成"≤ max(3, 并发/8) 且 ≤32"（见 PreemptEndgameDivisor），
+                // 这里若仍写死 4，就会出现：crawl 在"剩 6 片"时正确触发，
+                // 但这里判 tailStall=false → **不换链** → 白中止一次，下次还是同一条死链。
+                // 判据必须与抢占/爬行统一，否则三处各说各话。
+                int tailLimit = Math.Min(PreemptEndgameInflightMax,
+                    Math.Max(PreemptEndgameInflight, _lastWorkerCount / PreemptEndgameDivisor));
+                bool tailStall = _lastRemainParts > 0 && _lastRemainParts <= tailLimit;
 
                 if (LinkRefresher == null || refreshed >= maxRefreshes)
                     break;
@@ -2010,7 +2061,7 @@ namespace GeZi.Core.Download
             /// 用"平均值的一半"而不是绝对值，是为了自适应：整站都快时门槛自动抬高，
             /// 不会因为绝对下限太低而误伤；整站都慢时由 12KB/s 兜底，不至于全都判慢。
             /// </summary>
-            void PreemptSlowChunks(double speedBps)
+            void PreemptSlowChunks(double speedBps, int totalWorkers)
             {
                 int inflight = 0;
                 for (int i = 0; i < wCurPart.Length; i++)
@@ -2030,7 +2081,14 @@ namespace GeZi.Core.Download
 
                 // 收尾阶段：在飞很少时，那几路的速度就是用户看到的总速度，
                 // 此时重连握手（~0.5s）远比继续干等便宜 —— 放宽年龄与剩余门槛。
-                bool endgame = inflight <= PreemptEndgameInflight;
+                //
+                // 【2026-10-24 改：判据从"绝对 ≤3"改成"相对总量也很少"】
+                // 只判绝对 ≤3 会让「剩 5~6 片」这种最常见收尾形态**两个好处都拿不到**，
+                // 尤其拿不到「跳过整体限速判定」—— 于是 5 路慢片被当成全局限速，
+                // 一次都不抢，只能干等 45 秒看门狗中止。用户实测就是 6/238 路、12KB/s。
+                int endgameLimit = Math.Min(PreemptEndgameInflightMax,
+                    Math.Max(PreemptEndgameInflight, totalWorkers / PreemptEndgameDivisor));
+                bool endgame = inflight <= endgameLimit;
                 long minAge = endgame ? PreemptEndgameMinAgeMs : PreemptMinAgeMs;
                 long nowMs = NowMs();
 
@@ -2210,6 +2268,15 @@ namespace GeZi.Core.Download
                 long lastProgressBytes = 0;
                 int stalledFlag = 0;
 
+                /// <summary>
+                /// 1 = 本次中止是"收尾阶段速度过低"（慢速爬行）而非"零字节停滞"。
+                /// <para>两者都置 <c>stalledFlag=1</c> 走同一条保留断点、交给上层换链的路径，
+                /// 但最终给用户的失败说明必须区分开。</para>
+                /// </summary>
+                int crawlFlag = 0;
+                // 慢速爬行计时（Environment.TickCount 毫秒，0 = 未在爬行）
+                long lastCrawlMs = 0;
+
                 // 诊断用：当前有多少条连接正真在传数据。
                 // 速度上不去时，问题无非两种：
                 //   a) 连接数够但每条都很慢  → 服务端/CDN 限速，客户端无解
@@ -2286,7 +2353,7 @@ namespace GeZi.Core.Download
                         if (!draining && (now - lastPreempt).TotalSeconds >= PreemptTickSec)
                         {
                             lastPreempt = now;
-                            try { PreemptSlowChunks(speed); }
+                            try { PreemptSlowChunks(speed, Volatile.Read(ref workerCountBox)); }
                             catch { /* 抢占失败绝不能影响下载本身 */ }
                         }
 
@@ -2446,6 +2513,76 @@ namespace GeZi.Core.Download
                             // 必须真的掐断令牌：否则卡在 ReadAsync 上的 worker
                             // 会一直等到 TCP 超时，界面继续假死。
                             try { watchdog.Cancel(); } catch { }
+                        }
+
+                        // ---- 【2026-10-24 新增】慢速爬行检测 ----
+                        //
+                        // 【要解决什么】用户实测两次：
+                        //   · 238 路并发：6/238 连接  12.97 KB/s  98.7%
+                        //   · 102 路并发：1/102 连接      0 B/s  99.9%（最后 97KB）
+                        // 进度条在动（或刚好卡在 0 但没满 45 秒）→ 上面的停滞看门狗不触发；
+                        // 而抢占也救不了：夸克把同一 URL 稳定调度到同一节点，
+                        // 重连多少次都还是慢的。**唯一有效手段是换直链**。
+                        //
+                        // 【判据】收尾阶段 + 速度低于阈值 + 持续够久：
+                        //   · 收尾阶段：剩余分片 ≤ endgameLimit（与抢占同一判据）
+                        //   · 速度阈值：CrawlBps（16KB/s）
+                        //   · 持续：CrawlSeconds（20 秒），避开"刚好在换片"的瞬时低谷
+                        //
+                        // ⚠️ 这段**必须独立于上面的 if/else-if 链**：慢速爬行的定义就是
+                        //    "有进展但极慢"，而上面 `d > lastProgressBytes` 一旦成立
+                        //    就已刷新 lastAdvance 并跳过整个 else 分支 ——
+                        //    接在 else-if 后面等于永不生效（这个坑我踩过一次）。
+                        if (!draining
+                            && Interlocked.CompareExchange(ref stalledFlag, 0, 0) == 0
+                            && (pause == null || !pause.IsPaused))
+                        {
+                            int remainForCrawl = 0;
+                            try
+                            {
+                                for (int pi = 0; pi < plan.Parts.Count; pi++)
+                                    if (plan.Parts[pi].W < plan.Parts[pi].E - plan.Parts[pi].S + 1)
+                                        remainForCrawl++;
+                            }
+                            catch { remainForCrawl = int.MaxValue; }
+
+                            int wkForCrawl = Volatile.Read(ref workerCountBox);
+                            int crawlEndgameLimit = Math.Min(PreemptEndgameInflightMax,
+                                Math.Max(PreemptEndgameInflight, wkForCrawl / PreemptEndgameDivisor));
+
+                            // 必须有分片在飞才算"在磨"：remainForCrawl==0 是正常完成，
+                            // 不能拿速度低去中止（那会被当成"收尾阶段速度过低"误杀）。
+                            bool crawling = remainForCrawl > 0
+                                && remainForCrawl <= crawlEndgameLimit
+                                && speed < CrawlBps;
+
+                            if (crawling)
+                            {
+                                if (lastCrawlMs == 0)
+                                {
+                                    lastCrawlMs = Environment.TickCount;
+                                }
+                                else if (Environment.TickCount - lastCrawlMs >= CrawlSeconds * 1000
+                                         && Interlocked.CompareExchange(ref stalledFlag, 1, 0) == 0)
+                                {
+                                    _lastRemainParts = remainForCrawl;
+                                    Interlocked.Exchange(ref crawlFlag, 1);
+                                    Log?.Invoke(string.Format(
+                                        "收尾阶段速度过低: 只剩 {0} 片，但速度只有 {1}/s 已持续 {2} 秒。"
+                                        + "这是夸克 CDN 把这几片调度到了慢节点（与你的网络无关）—— "
+                                        + "正在换一条新直链以避开它，已下载部分全部保留，换链后自动续传。",
+                                        remainForCrawl, Fmt((long)speed), CrawlSeconds));
+                                    AddError("crawl: 收尾阶段速度过低");
+                                    Interlocked.Exchange(ref cancelled, 1);
+                                    lastAdvance = now;
+                                    lastCrawlMs = 0;
+                                    try { watchdog.Cancel(); } catch { }
+                                }
+                            }
+                            else
+                            {
+                                lastCrawlMs = 0;
+                            }
                         }
 
                         if ((now - lastSave).TotalSeconds >= 1.0)
@@ -2676,6 +2813,8 @@ namespace GeZi.Core.Download
                 int requested = Math.Min(_threads, plan.Parts.Count);
                 int workerCount = Math.Min(requested, MaxRealConcurrency);
                 Volatile.Write(ref workerCountBox, workerCount);
+                // 桥接给主循环：它要用"实际并发"算收尾上限（见 _lastWorkerCount 注释）。
+                _lastWorkerCount = workerCount;
 
                 if (_threads > MaxRealConcurrency)
                 {
@@ -3022,7 +3161,32 @@ namespace GeZi.Core.Download
                                             if (code != 200 && code != 206)
                                             {
                                                 // 5xx / 429 值得重试，其余 4xx 重试无意义
-                                                lastErr = "HTTP " + code + " " + resp.ReasonPhrase;
+                                                lastErr = "HTTP " + code + " " + resp.ReasonPhrase
+                                                    + (code == 412 ? "（直链签名已过期）" : "");
+
+                                                // 【2026-10-24 关键修复】签名过期必须**立刻收兵**，
+                                                // 不能只让当前 worker break 掉。
+                                                //
+                                                // 【为什么这是根因】夸克直链带时效签名，过期后
+                                                // 整条链上的**所有**请求都返回 401/403/412。
+                                                // 原来的行为：
+                                                //   ① 本 worker `fatal=true; break;` → 退出重试循环
+                                                //   ② 走到循环外 `AddError(lastErr); return;` → 该 worker 结束
+                                                //   ③ 其余 worker 各自同样失败退出
+                                                //   ④ **全部** worker 退出后，主循环才看到 msg 去换链
+                                                // 这不仅浪费了 4 次退避重试（每次 500ms×2^n，共约 7 秒），
+                                                // 更致命的是：每个 worker 都已 `return`（不再领片），
+                                                // 若此时剩余分片很少（实测只剩 1 片 97KB），
+                                                // 就会出现「1/102 连接、0 B/s」卡死 —— 用户反馈的正是这个。
+                                                //
+                                                // 现在的做法：置 cancelled + 掐断 watchdog，
+                                                // 让**所有** worker 立刻停下，主循环马上拿到 msg 去换链。
+                                                // 分片进度全在 .qmeta 里，换链后从断点续传，一字节不重下。
+                                                if (IsSignatureExpired(lastErr))
+                                                {
+                                                    try { watchdog.Cancel(); } catch { }
+                                                }
+
                                                 if (code == 429 || code == 503)
                                                     OnThrottled();   // 服务端明确限流：收窄并发闸门
                                                 fatal = !IsTransientStatus(code);
@@ -3247,7 +3411,14 @@ namespace GeZi.Core.Download
                         //   同样必须保留进度 —— 这部分以前会误删，属真实缺陷。
                         if (stalledFlag != 0)
                         {
-                            return (false, "网络停滞已中止（已保留断点，降低线程数后重试可续传）");
+                            // crawlFlag=1 与 stalledFlag=1 走同一条"保留断点、交给上层换链"
+                            // 的路径，但对用户的说明必须区分：
+                            //  · 停滞   = 一个字节都不动（45 秒）
+                            //  · 慢速爬行 = 在动但极慢（20 秒 < 16KB/s）
+                            // 混用措辞会让用户以为"又卡死了"，而实际是"太慢，被主动放弃换链"。
+                            return (false, crawlFlag != 0
+                                ? "收尾阶段速度过低已中止（已保留断点，换新直链后自动续传）"
+                                : "网络停滞已中止（已保留断点，降低线程数后重试可续传）");
                         }
                         if (userCancelled == 0)
                         {
