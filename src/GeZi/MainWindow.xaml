@@ -2376,6 +2376,40 @@
                                         </WrapPanel>
                                         <TextBlock Style="{StaticResource ProseText}"
                                                    Text="GeZi 不内置播放器（内置会让安装包大几十 MB）。推荐 VLC：它能直接打开本程序提供的本地 HTTP 串流，边下边播不依赖「播放器是否容忍半截文件」。VLC 装在非常规目录时，用「选择 VLC 位置…」指定一次即可（路径会记住）；「重新检测」会清除手动路径并重新自动查找。"/>
+
+                                        <!-- 【2026-10-24 新增】下载完成后用哪个播放器。
+                                             用户需求：「视频文件下载完成后使用 PotPlayer 播放（先检测对应位置），
+                                             点文件右侧的播放按钮使用 PotPlayer 打开；如果是正在下载的才用 VLC」。
+                                             为什么下载中不用它：下载中依赖播放器的文件共享模式
+                                             （VLC 的 FileShare.ReadWrite 与写盘互不干扰），
+                                             且 PotPlayer 在窗口失焦时会明显卡顿（2026-10-20 实测）。 -->
+                                        <Border BorderThickness="0,1,0,0"
+                                                BorderBrush="{DynamicResource BorderBrush}"
+                                                Margin="0,12,0,0" Padding="0,12,0,0">
+                                            <StackPanel>
+                                                <TextBlock Text="下载完成后播放器"
+                                                           Style="{StaticResource SectionLabel}"
+                                                           Margin="0,0,0,6"/>
+                                                <TextBlock x:Name="DonePlayerStatusText" TextWrapping="Wrap"
+                                                           Style="{StaticResource ProseText}"
+                                                           Margin="0,0,0,8"/>
+                                                <WrapPanel>
+                                                    <Button x:Name="PickDonePlayerBtn" Content="选择播放器位置…"
+                                                            Click="OnPickDonePlayer"
+                                                            Style="{StaticResource SecondaryButton}"
+                                                            Margin="0,0,8,6"
+                                                            ToolTip="绿色版 PotPlayer 或装在非常规目录时，手动指定 exe。"/>
+                                                    <Button x:Name="RecheckDonePlayerBtn" Content="重新检测"
+                                                            Click="OnRecheckDonePlayer"
+                                                            Style="{StaticResource SecondaryButton}"
+                                                            Margin="0,0,8,6"
+                                                            ToolTip="清除手动路径，重新自动查找 PotPlayer。"/>
+                                                </WrapPanel>
+                                                <TextBlock Style="{StaticResource TertiaryText}"
+                                                           FontSize="11" TextWrapping="Wrap"
+                                                           Text="下载完成后点「播放」用这个播放器打开；正在下载中的文件仍走 VLC（它不会影响写盘）。留空则自动探测 PotPlayer，没装就交给系统默认程序。"/>
+                                            </StackPanel>
+                                        </Border>
                                     </StackPanel>
                                 </Border>
                             </Grid>

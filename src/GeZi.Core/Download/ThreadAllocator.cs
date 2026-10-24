@@ -47,13 +47,33 @@ namespace GeZi.Core.Download
 
         /// <summary>
         /// 小文件（小于 <see cref="SmallFileThreshold"/>）的连接数封顶。
-        /// 【用户要求】小文件没必要按设置里的单文件并发来开，5 路一般就足够，
-        /// 开太多只会增加建连/握手开销、还可能把账号总连接额度占满拖累大文件。
+        ///
+        /// <para>【2026-10-24 改：5 → 16】用户反馈「为什么 50 多 MB 的最大连接数只有 5，
+        /// 改成 64，尽可能利用带宽」。</para>
+        ///
+        /// <para>原来的 5 路是早期定的「小文件没必要开太多」，但实测发现两个问题：</para>
+        /// <list type="bullet">
+        /// <item>50MB 在今天的网速下**根本不算小**（千兆宽带 8 秒就能下完），
+        ///       5 路完全跑不满；</item>
+        /// <item>更糟的是它造成了**断崖**：49.9MB 给 5 路、50.1MB 给 64 路，
+        ///       同一个文件夹里两个大小相近的文件速度差十几倍，用户会以为程序有 bug。</item>
+        /// </list>
+        ///
+        /// <para>现在改成：<b>小文件也给 16 路</b>（够跑满多数家宽），
+        /// 并且阈值以上不再断崖 —— 见 <see cref="Allocate"/> 里的渐变逻辑。
+        /// 保留一个下限而不是完全放开，是因为几百个几 KB 的文件各开 64 路
+        /// 会把账号总连接额度占满（夸克按账号限制），反而拖累真正需要带宽的大文件。</para>
         /// </summary>
-        public const int SmallFileCap = 5;
+        public const int SmallFileCap = 16;
 
-        /// <summary>小于此值的文件视为「小文件」，连接数封顶到 <see cref="SmallFileCap"/>。</summary>
-        public const long SmallFileThreshold = 50L * 1024 * 1024;   // 50MB
+        /// <summary>
+        /// 小于此值的文件视为「小文件」，连接数按渐变曲线收敛到 <see cref="SmallFileCap"/>。
+        ///
+        /// <para>【2026-10-24】阈值从 50MB 提到 128MB。原因：用户实测 50 多 MB 的文件
+        /// 被卡在 5 路；而 50~128MB 这个区间在挂机下载场景里很常见（短剧、MV、单集视频），
+        /// 完全值得给足并发。</para>
+        /// </summary>
+        public const long SmallFileThreshold = 128L * 1024 * 1024;   // 128MB
 
         /// <summary>
         /// 按大小比例分配线程数，返回与入参等长的数组。
@@ -92,16 +112,53 @@ namespace GeZi.Core.Download
             var result = new int[n];
             if (n == 0) return result;
 
-            // 小文件特例：无论单文件还是多文件，只要 < SmallFileThreshold，
-            // 连接数封顶到 SmallFileCap（仍不低于 minPerFile）。用户原话：
-            // 「对于小于 50MB 的文件没必要按设置里的来，5 个线程一般就足够了」。
-            // 这样小文件不会被开 512 路连接去抢几片数据（光握手就亏），
-            // 也能把账号总连接额度留给真正需要的大文件。
-            bool SmallFileCapHit(long size) => size > 0 && size < SmallFileThreshold;
+            // 连接数上限按文件大小**渐变**，不再断崖。
+            //
+            // 【2026-10-24 改】原来是一个硬阈值：
+            //     size < 50MB  → 封顶 5 路
+            //     size >= 50MB → 直接给满 cap（常见 64~256 路）
+            // 后果是两个**大小几乎相同**的文件速度差十几倍（49.9MB vs 50.1MB）。
+            // 用户看到的是"这个 50 多 MB 的只有 5 个连接，那个 60MB 的却有 64 个" ——
+            // 完全无法理解，只会认为程序有 bug。
+            //
+            // 现在改成渐进收敛：越小给得越少，但不是一刀切。
+            //   公式：cap = Min + (Max - Min) × (size / Threshold)^0.5
+            //   · 平方根让曲线在靠近阈值时快速抬升（10MB 就给到约 0.28 的系数），
+            //     避免"小文件全被压在下限"；
+            //   · 达到 Threshold（128MB）后就是完整 cap，再往上不变。
+            //
+            // 仍然保留下限 floor（SmallFileCap 的一半）：几 KB 的 epub 各开几十路
+            // 纯属浪费握手，还会占满账号额度拖累大文件。
+            long floorBytes = 4L * 1024 * 1024;          // 4MB 以下一律给 floor 值
+            int floorConns = Math.Max(minPerFile, Math.Min(cap, SmallFileCap / 2));
+
             int CapFor(long size)
             {
-                int c = SmallFileCapHit(size) ? Math.Min(cap, SmallFileCap) : cap;
+                int c;
+                if (size <= 0)
+                {
+                    // 大小未知：给一个保守值（不能因为"不知道多大"就开满）
+                    c = Math.Min(cap, SmallFileCap);
+                }
+                else if (size <= floorBytes)
+                {
+                    c = floorConns;
+                }
+                else if (size >= SmallFileThreshold)
+                {
+                    c = cap;                              // 够大 → 给满
+                }
+                else
+                {
+                    // 在 [floorBytes, Threshold] 之间按平方根渐变
+                    double t = (double)(size - floorBytes) / (SmallFileThreshold - floorBytes);
+                    if (t < 0) t = 0;
+                    if (t > 1) t = 1;
+                    double k = Math.Sqrt(t);              // 0 → 1，前段抬升更快
+                    c = (int)Math.Round(floorConns + (cap - floorConns) * k);
+                }
                 if (c < minPerFile) c = minPerFile;
+                if (c > cap) c = cap;
                 return c;
             }
 

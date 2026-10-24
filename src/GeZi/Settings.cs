@@ -78,6 +78,22 @@ namespace GeZi
         public bool AskBeforeSave { get; set; } = true;
 
         /// <summary>
+        /// 「下载完成后」播放视频用的播放器路径（2026-10-24 新增）。
+        ///
+        /// <para>【用户需求】「视频文件下载完成后使用 PotPlayer 播放（先检测对应位置），
+        /// 也就是点文件右侧的播放按钮使用 PotPlayer 打开；如果是正在下载的才用 VLC」。</para>
+        ///
+        /// <para>留空 = 自动探测 PotPlayer（常见安装路径）。
+        /// 填了就用填的那个 —— 绿色版/装在非常规目录时的唯一办法。</para>
+        ///
+        /// <para><b>为什么下载中不用它</b>：下载中要靠播放器的"文件共享模式"——
+        /// VLC 用 <c>FileShare.ReadWrite</c> 打开，与写盘互不干扰；
+        /// PotPlayer 在窗口失焦时还会明显卡顿（用户 2026-10-20 实测）。
+        /// 所以"下载中"固定走 VLC，"已完成"才用这里配置的播放器。</para>
+        /// </summary>
+        public string DoneVideoPlayerPath { get; set; } = "";
+
+        /// <summary>
         /// 分片落盘方式。**已唯一化为 SegmentedFiles（独立分片 + 边合并）**。
         ///
         /// <para>【2026-10-20】原来还有 SharedFile（多 worker 各自 seek 写同一目标文件）：

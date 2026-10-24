@@ -132,6 +132,24 @@ namespace GeZi
 
         // ---------------- 文件 ----------------
 
+        /// <summary>
+        /// 用**指定的**播放器打开本地文件（2026-10-24 新增）。
+        ///
+        /// <para>【为什么单独一个入口】<see cref="OpenFile"/> 只会用
+        /// <see cref="PlayerLocator.Find"/> 探测到的那个（= VLC）。
+        /// 而用户要求「下载完成后用 PotPlayer 播放」—— 需要能把
+        /// "用哪个播放器"作为参数传进来。</para>
+        /// </summary>
+        public static bool OpenFileWith(PlayerLocator.Player player, string file)
+        {
+            if (player == null || string.IsNullOrEmpty(player.ExePath)) return false;
+            if (string.IsNullOrWhiteSpace(file) || !File.Exists(file)) return false;
+            // 同 OpenFile：交给外部程序前必须规范化分隔符，
+            // 否则 `C:/…` 会被某些播放器当成 URL 协议头。
+            try { file = Path.GetFullPath(file); } catch { }
+            return LaunchPlayer(player, file);
+        }
+
         /// <summary>打开本地文件：优先用探测到的播放器（边下边播需要它宽容的共享模式）。</summary>
         public static bool OpenFile(string file)
         {

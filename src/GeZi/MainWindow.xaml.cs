@@ -9489,7 +9489,7 @@ namespace GeZi
                 return;
             }
 
-            // 还没下完就点播放：优先走「本地 HTTP 串流 + PotPlayer/VLC」。
+            // 还没下完就点播放：优先走「本地 HTTP 串流 + VLC」。
             // 旧做法是直接把半截文件交给播放器：它读到当前 EOF 就停，MP4 索引在
             // 尾部时更是直接判损坏 —— 用户看到的往往是一句"无法播放此文件"。
             if (item.State != JobState.Completed)
@@ -9502,6 +9502,27 @@ namespace GeZi
                     + "拼出来的前缀，若视频索引在文件末尾，播放器会提示「无法播放此文件」—— "
                     + "这属于正常现象，等进度更多（或下完）再试即可。",
                     Util.FormatSize(curSize), Util.FormatSize(item.Total)));
+            }
+
+            // ---- 【2026-10-24 新增】已完成的视频：优先用用户配置的播放器（默认 PotPlayer）----
+            //
+            // 【用户需求】「视频文件下载完成后使用 PotPlayer 播放（先检测对应位置），
+            //  点文件右侧的播放按钮使用 PotPlayer 打开；如果是正在下载的才用 VLC」。
+            //
+            // 【为什么下载中不用 PotPlayer】下载中依赖播放器的文件共享模式
+            // （VLC 的 FileShare.ReadWrite 与写盘互不干扰），而且 PotPlayer
+            // 在窗口失焦时会明显卡顿（2026-10-20 实测）。已完成则没有并发写入问题。
+            //
+            // 探测失败（没装 PotPlayer）→ 静默回退到原来的行为（系统默认程序 / VLC），
+            // 不给用户弹框 —— 没装是常态，弹框只会烦人。
+            if (item.State == JobState.Completed)
+            {
+                var donePlayer = ResolveDoneVideoPlayer();
+                if (donePlayer != null && ShellLaunch.OpenFileWith(donePlayer, dest))
+                {
+                    Log("已用 " + donePlayer.Name + " 打开：" + System.IO.Path.GetFileName(dest));
+                    return;
+                }
             }
 
             try
@@ -9626,6 +9647,43 @@ namespace GeZi
 
             Log("边下边播已启动（" + player.Name + "）：" + url);
             return true;
+        }
+
+        /// <summary>
+        /// 取「下载完成后播放视频」要用的播放器（2026-10-24 新增）。
+        ///
+        /// <para>顺序：设置里手填的路径 → 自动探测 PotPlayer → 都没找到返回 null
+        /// （调用方回退到系统默认程序）。</para>
+        ///
+        /// <para>为什么不回退到 VLC：已完成文件的播放交给系统默认程序更符合直觉
+        /// —— 用户装了 PotPlayer 就用它，没装就用系统关联的那个。
+        /// 强行用 VLC 反而会让"我明明设置的是系统默认播放器"的人困惑。</para>
+        /// </summary>
+        private PlayerLocator.Player ResolveDoneVideoPlayer()
+        {
+            try
+            {
+                // 设置里的路径（由 SettingsDoneVideoPlayerPath 与之同步）
+                string custom = _settings == null ? null : _settings.DoneVideoPlayerPath;
+                if (!string.IsNullOrWhiteSpace(custom) && System.IO.File.Exists(custom))
+                {
+                    return new PlayerLocator.Player
+                    {
+                        Name = "自定义播放器",
+                        ExePath = custom,
+                        Recommended = true,
+                    };
+                }
+            }
+            catch { }
+
+            try
+            {
+                // 自动探测 PotPlayer（FindPotPlayer 内部也会看 PreferredPotPlayerPath）
+                return PlayerLocator.FindPotPlayer();
+            }
+            catch { }
+            return null;
         }
 
         /// <summary>「定位」：在资源管理器中**选中**该文件；还没写盘就打开所在目录。</summary>
@@ -10817,6 +10875,90 @@ namespace GeZi
             }
         }
 
+        // ---------------- 下载完成后的播放器（2026-10-24 新增） ----------------
+        //
+        // 【用户需求】「视频文件下载完成后使用 PotPlayer 播放（先检测对应位置）——
+        //  点文件右侧的播放按钮，用 PotPlayer 打开；如果是正在下载的才使用 VLC。
+        //  当然用户也可以在设置自定义」。
+        //
+        // 与「边下边播用 VLC」那套是**两回事**，不要混：
+        //   · 下载中 → 必须 VLC（文件共享模式宽容，不会干扰写盘）
+        //   · 已完成 → 用这里配置的（默认自动探测 PotPlayer，找不到交给系统默认程序）
+
+        /// <summary>刷新「下载完成后播放器」那一栏的状态文案。</summary>
+        private void RefreshDonePlayerStatus()
+        {
+            if (DonePlayerStatusText == null) return;
+            try
+            {
+                string custom = _settings == null ? null : _settings.DoneVideoPlayerPath;
+                if (!string.IsNullOrWhiteSpace(custom) && System.IO.File.Exists(custom))
+                {
+                    DonePlayerStatusText.Text = "✓ 已指定：" + custom;
+                    return;
+                }
+                if (!string.IsNullOrWhiteSpace(custom))
+                {
+                    DonePlayerStatusText.Text = "⚠ 指定的文件不存在（" + custom
+                        + "），当前按自动探测处理。";
+                    return;
+                }
+
+                var p = PlayerLocator.FindPotPlayer();
+                DonePlayerStatusText.Text = p != null
+                    ? "✓ 已检测到 PotPlayer：" + p.ExePath
+                    : "未检测到 PotPlayer —— 下载完成的文件会交给系统默认程序打开。"
+                      + "装在非常规目录时用「选择播放器位置…」指定一次即可。";
+            }
+            catch (Exception ex)
+            {
+                DonePlayerStatusText.Text = "检测失败: " + ex.Message;
+            }
+        }
+
+        /// <summary>「选择播放器位置…」：手动指定下载完成后用的播放器（绿色版 PotPlayer 等）。</summary>
+        private void OnPickDonePlayer(object sender, RoutedEventArgs e)
+        {
+            var dlg = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = "选择下载完成后播放视频的播放器",
+                Filter = "PotPlayer (PotPlayerMini64.exe)|PotPlayerMini64.exe|"
+                       + "PotPlayer 32 位 (PotPlayerMini.exe)|PotPlayerMini.exe|"
+                       + "可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*",
+                CheckFileExists = true,
+                Multiselect = false,
+            };
+            if (dlg.ShowDialog(this) != true) return;
+
+            string path = dlg.FileName;
+            _settings.DoneVideoPlayerPath = path;
+            SettingsStore.Save(_settings);
+            PlayerLocator.PreferredPotPlayerPath = path;
+            RefreshDonePlayerStatus();
+            Log("已指定「下载完成后播放器」：" + path
+                + "（正在下载中的文件仍用 VLC 播放）");
+        }
+
+        /// <summary>「重新检测」：清掉手动路径，回到自动探测 PotPlayer。</summary>
+        private void OnRecheckDonePlayer(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(_settings.DoneVideoPlayerPath))
+                {
+                    _settings.DoneVideoPlayerPath = "";
+                    SettingsStore.Save(_settings);
+                    Log("已清除手动指定的完成播放器路径，改为自动检测 PotPlayer。");
+                }
+                PlayerLocator.PreferredPotPlayerPath = null;
+                RefreshDonePlayerStatus();
+            }
+            catch (Exception ex)
+            {
+                Log("重新检测完成播放器失败: " + ex.Message);
+            }
+        }
+
         // ---------------- 设置 ----------------
 
         /// <summary>
@@ -10942,8 +11084,12 @@ namespace GeZi
             LocalStreamServer.Log = Log;
             // 手动指定的 VLC 路径优先于自动探测（便携版可能在任何目录）
             PlayerLocator.PreferredPath = _settings.VlcPath;
+            // 【2026-10-24】「下载完成后播放器」的手动路径（留空则自动探测 PotPlayer）
+            PlayerLocator.PreferredPotPlayerPath = _settings.DoneVideoPlayerPath;
             // 探测本机播放器，供设置页展示 + 「打开」按钮选用
             RefreshPlayerStatus();
+            // 完成播放器那一栏的状态文案（下载中仍用 VLC，这个是给"已完成"用的）
+            try { RefreshDonePlayerStatus(); } catch { }
         }
 
         /// <summary>

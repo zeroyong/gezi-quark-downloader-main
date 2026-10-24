@@ -1,4 +1,4 @@
-﻿// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
+// GeZi —— 夸克网盘下载器 (Quark netdisk downloader)
 // Copyright (C) 2026  Yi Yuan
 //
 // This program is free software: you can redistribute it and/or modify
@@ -21,31 +21,46 @@ using Microsoft.Win32;
 namespace GeZi
 {
     /// <summary>
-    /// 本机播放器探测（**只管 VLC**）。
+    /// 本机播放器探测（VLC / PotPlayer）。
     ///
-    /// 为什么需要它：边下边播依赖**外部播放器**打开一个"还没下完"的文件。
-    /// 而能否播得起来，除了格式之外还取决于播放器的**文件共享模式** ——
-    /// VLC 用 <c>FileShare.ReadWrite</c> 打开，与我们写盘互不干扰；
-    /// 部分播放器只要只读共享，会让我们后续写盘失败。
+    /// <para>【2026-10-24 改：支持 PotPlayer】用户需求：</para>
+    /// <list type="bullet">
+    /// <item>「视频文件下载完成后使用 PotPlayer 播放（先检测对应位置）——
+    ///       点文件右侧的播放按钮，用 PotPlayer 打开」</item>
+    /// <item>「如果是正在下载的，才使用 VLC」</item>
+    /// <item>「用户也可以在设置自定义」</item>
+    /// </list>
     ///
-    /// 🚨 【2026-10-04 用户要求】**不探测 mpv / PotPlayer**。
-    ///   原因：全项目只对 VLC 做过参数适配（`ShellLaunch` 里给 VLC 加
-    ///   `--started-from-file`，与资源管理器右键行为对齐；其它播放器不认这个参数），
-    ///   用其它播放器可能出现行为不一致的 bug → 索性**只认 VLC**，
-    ///   不给用户"还能用 mpv"的预期。
-    ///   （2026-10-20 曾短暂加入 PotPlayer 用于串流，但用户实测 PotPlayer
-    ///    在窗口失焦时明显卡顿，已按要求回退为只认 VLC。）
+    /// <para><b>为什么"下完了用 PotPlayer、下载中用 VLC"</b>：</para>
+    /// <list type="bullet">
+    /// <item><b>下载中</b>要靠"文件共享模式"——VLC 用
+    ///       <c>FileShare.ReadWrite</c> 打开，与我们写盘互不干扰；
+    ///       部分播放器只允许只读共享，会让我们后续写盘失败。所以下载中必须 VLC。</item>
+    /// <item><b>已完成</b>的文件不再有并发写入，PotPlayer 的兼容性和画质更好，
+    ///       用它更合适。</item>
+    /// </list>
     ///
-    /// 探测顺序：注册表 App Paths → 常见安装目录 → PATH。
-    /// 全部失败返回 null，由调用方回退到"系统默认程序"。
+    /// <para>探测顺序：注册表 App Paths → 常见安装目录 → PATH。
+    /// 两种播放器各查一遍，任一缺失不影响另一个。</para>
     /// </summary>
     internal static class PlayerLocator
     {
         internal sealed class Player
         {
-            public string Name;      // 显示名
+            public string Name;      // 显示名（VLC / PotPlayer）
             public string ExePath;   // 可执行文件完整路径
-            public bool Recommended; // 保留字段（现在恒为 true，只探测 VLC）
+            public bool Recommended; // 保留字段
+
+            /// <summary>是不是 VLC（决定是否要加 --started-from-file 等专属参数）。</summary>
+            public bool IsVlc
+            {
+                get
+                {
+                    return !string.IsNullOrEmpty(ExePath)
+                        && Path.GetFileName(ExePath)
+                            .IndexOf("vlc", StringComparison.OrdinalIgnoreCase) >= 0;
+                }
+            }
         }
 
         /// <summary>
@@ -54,7 +69,15 @@ namespace GeZi
         /// </summary>
         public static string PreferredPath { get; set; }
 
-        /// <summary>探测 VLC。没找到返回 null。</summary>
+        /// <summary>
+        /// 用户手动指定的 PotPlayer 路径（设置页"完成后播放器"那一栏）。
+        /// 留空则自动探测。见 <see cref="FindPotPlayer"/>。
+        /// </summary>
+        public static string PreferredPotPlayerPath { get; set; }
+
+        // ---------------- 两种播放器 ----------------
+
+        /// <summary>探测 VLC（**下载中**用它，因为它的文件共享模式最宽容）。没找到返回 null。</summary>
         public static Player Find()
         {
             string preferred = PreferredPath;
@@ -75,12 +98,65 @@ namespace GeZi
             return FindVlc();
         }
 
-        /// <summary>VLC —— 唯一支持的播放器：格式全，且以 FileShare.ReadWrite 打开文件。</summary>
+        /// <summary>VLC —— 格式全，且以 FileShare.ReadWrite 打开文件（下载中必须用它）。</summary>
         public static Player FindVlc()
         {
             string p = Probe("vlc.exe", "VideoLAN\\VLC\\vlc.exe",
                              "VideoLAN\\VLC\\vlc.exe");
             return p == null ? null : new Player { Name = "VLC", ExePath = p, Recommended = true };
+        }
+
+        /// <summary>
+        /// 探测 PotPlayer（**下载完成后**优先用它）。
+        ///
+        /// <para>安装位置很杂，这几个都见过：</para>
+        /// <list type="bullet">
+        /// <item><c>%ProgramFiles%\DAUM\PotPlayer\PotPlayerMini64.exe</c>（官方 64 位安装）</item>
+        /// <item><c>%ProgramFiles%\DAUM\PotPlayer\PotPlayerMini.exe</c>（32 位）</item>
+        /// <item><c>%ProgramFiles(x86)%\DAUM\PotPlayer\PotPlayerMini.exe</c></item>
+        /// <item>绿色版解压到任意目录（只能靠用户手填或 PATH）</item>
+        /// </list>
+        /// <para>注意可执行文件名是 <c>PotPlayerMini64.exe</c> / <c>PotPlayerMini.exe</c>，
+        /// 不是 PotPlayer.exe —— 主程序 <c>PotPlayer.exe</c> 只是个启动器。</para>
+        /// </summary>
+        public static Player FindPotPlayer()
+        {
+            // ① 用户手填优先（绿色版/自定义目录只能靠这个）
+            string preferred = PreferredPotPlayerPath;
+            if (!string.IsNullOrWhiteSpace(preferred))
+            {
+                try
+                {
+                    if (File.Exists(preferred))
+                        return new Player
+                        {
+                            Name = "PotPlayer",
+                            ExePath = Path.GetFullPath(preferred),
+                            Recommended = true,
+                        };
+                }
+                catch { }
+            }
+
+            // ② 依次试三个 exe 名（64 位优先）
+            string[] exeNames = { "PotPlayerMini64.exe", "PotPlayerMini.exe", "PotPlayer.exe" };
+            string[] relPaths =
+            {
+                "DAUM\\PotPlayer\\PotPlayerMini64.exe",
+                "DAUM\\PotPlayer\\PotPlayerMini.exe",
+                "PotPlayer\\PotPlayerMini64.exe",
+                "PotPlayer\\PotPlayerMini.exe",
+            };
+
+            foreach (var exe in exeNames)
+            {
+                string p = exe == "PotPlayerMini64.exe" ? Probe(exe, relPaths[0], relPaths[2])
+                         : exe == "PotPlayerMini.exe" ? Probe(exe, relPaths[1], relPaths[3])
+                         : Probe(exe, "DAUM\\PotPlayer\\PotPlayer.exe", "DAUM\\PotPlayer\\PotPlayer.exe");
+                if (p != null)
+                    return new Player { Name = "PotPlayer", ExePath = p, Recommended = true };
+            }
+            return null;
         }
 
         /// <summary>
