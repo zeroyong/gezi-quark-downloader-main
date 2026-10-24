@@ -4,7 +4,7 @@
 > 多线程分片下载、边下边播、多账号管理、深色模式。
 > 基于 **.NET Framework 4.8 + WPF** 开发，**零 NuGet 依赖、可完全离线构建**。
 >
-> **当前版本：v2.8.7** · [更新日志](#-更新日志) · [下载](https://github.com/zeroyong/gezi-quark-downloader-main/releases)
+> **当前版本：v2.8.8** · [更新日志](#-更新日志) · [下载](https://github.com/zeroyong/gezi-quark-downloader-main/releases)
 
 <p align="center">
   <img src="src/GeZi/Resources/app-logo.png" width="120" alt="鸽子下载">
@@ -81,7 +81,7 @@
 
 ### 方式一：下载发行版（推荐）
 
-1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.8.7-win64.zip` 并解压到任意目录
+1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.8.8-win64.zip` 并解压到任意目录
 2. 双击 `GeZi.exe` 即可运行
 3. 若系统缺少 .NET Framework 4.8，Windows 会弹窗提示，按引导安装即可
 
@@ -145,7 +145,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package.ps1
 | 夸克网盘分享（回退） | `https://pan.quark.cn/s/065af2172c40`（提取码 `VD8m`） | 分享内 `GeZi-vX.Y.Z-win64.zip` |
 
 双源并发检查，取**版本号更高者**；版本相同时优先 GitHub。无论是哪个源，更新都**不会回退到更低版本**。
-当前应用版本号从程序集读取（如 `2.8.7`），更新检测据此判断是否有新版本。
+当前应用版本号从程序集读取（如 `2.8.8`），更新检测据此判断是否有新版本。
 
 > 说明（方案选择）：一键更新采用「解压覆盖 + 外部小脚本接力」的方式 —— 主进程先退出，
 > 再由 `gezi-updater.cmd` 用 `xcopy` 覆盖文件并拉起新版本，避免「程序自我覆盖」的占用冲突。
@@ -206,7 +206,60 @@ GeZi/
 > 每条都写清楚「**原来怎样 → 现在怎样**」，方便对比。完整改动见
 > [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases)。
 
-### v2.8.7（当前）
+### v2.8.8（当前）
+
+**新增：在默认浏览器里「边下边播」**
+
+右键任意视频任务 →「在浏览器中播放」，或直接点任务行的「播放」按钮。未下载 / 已暂停 / 失败 / 上次运行留下的任务会**自动开始下载**，然后在浏览器里边下边播。
+
+复用的是给 VLC 用的那套 `LocalStreamServer`（它早已把"正在增长的目标文件"变成支持 `Range` 的 HTTP 地址），所以：
+
+| 设计决定 | 理由 |
+|---|---|
+| 播放页与流同端口 | 浏览器只认同源，跨端口就要处理 `CORS` 与范围头暴露 |
+| 不做任何转码 | 浏览器原生支持 mp4/webm 增量播放，行为与 VLC 一致 |
+| 页面写成独立 `.html` 资源 | 写成 C# verbatim 字符串要给每个引号写 `""`，实测编出一串 `CS1003/CS1010`，且页面没法用浏览器直接调试 |
+| 已完成仍走本地播放器 | `DownloadScheduler` 在下载结束的 `finally` 里把 `GetStreamMap` 置 `null`，已完成任务没有流视图；而本地文件已完整，PotPlayer 零等待且支持所有编码 |
+
+**限制**：浏览器能否播放取决于编码。MP4 + H.264 都能播；H.265/HEVC、AVI、WMV、RMVB 多数播不了，页面会显示具体原因并引导用「播放文件」走本地播放器。
+
+**修复：下到最后剩几十 KB 卡死，暂停恢复也没用**
+
+用户实测：248MB 视频卡在 99.9%，显示 `1/102 连接`、`0 B/s`。查磁盘发现 497 片里 **496 片完整**，只剩 `idx=443` 一片缺 **97KB**。
+
+直接请求那个缺口的 `Range` → **HTTP 412**。直链签名早已过期，而「恢复」走的是 `job.Url`，还是同一条死链。
+
+五处叠加缺陷：
+
+| # | 缺陷 |
+|---|---|
+| ① | `412` 只让单个 worker 退出，要等**所有** worker 都失败，主循环才去换链。只剩 1 片时退出的 worker 已无人领片 |
+| ② | 只有 45 秒「零字节」才换链 —— 97KB 在缓慢爬行时永不触发 |
+| ③ | `tailStall` 阈值写死 `≤4`，与收尾判据不一致 → 白中止一次但不换链 |
+| ④ | 暂停→恢复会重置 `lastAdvance`，越点越不可能触发停滞判定 |
+| ⑤ | `.qmeta` 的 `W` 与磁盘不一致时（缓冲未落盘，实测差 48KB），续传定位会落错 |
+
+修法：
+
+- `412/401/403` 立即 `cancel` watchdog → 全局收兵，主循环马上换链，不再各自耗完 4 次退避
+- `tailStall` 改用动态阈值 `min(32, max(3, 并发/8))`
+- 新增「慢速爬行」检测：收尾阶段 + 速度 `<16KB/s` + 持续 **20 秒** → 换链
+- 收尾判据从绝对 `≤3` 改为相对 `max(3, 并发/8)` 且 `≤32`，不再漏掉「剩 5~6 片」这种最常见的收尾形态
+
+实测收尾上限：`32→4, 64→8, 102→12, 128→16, 238→29, 256→32`。
+
+**修复：浏览器播放页一直提示「正在连接下载器，准备播放…」**
+
+两个 bug 叠加：
+
+- **前端**：`ovLoad` 遮罩从未被单独移除（原代码只在 `ovWait` 显示时才调 `hideOverlays`）。一旦 `<video>` 拿不到数据 → `loadedmetadata` 不触发 → 遮罩永远挂着
+- **服务端**：声明了 `Content-Length` 却发一半就断（`canGrow=false` 时直接 `break`）→ 浏览器判定响应被截断，立刻重发 `Range`，形成无限重试
+
+修法是拆出 `hideLoading()` 只撤那一层（原来的 `hideOverlays` 一刀切会把「无法播放」的错误遮罩也清掉），以及改用 `Response.Abort()` 让页面能显示准确原因。
+
+---
+
+### v2.8.7
 
 **修复：点「恢复全部」后有几个文件永远无法恢复**（2.8.6 引入的回归）
 
