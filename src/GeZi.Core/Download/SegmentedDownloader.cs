@@ -151,6 +151,16 @@ namespace GeZi.Core.Download
         /// </summary>
         private const int MaxLinkRefreshes = 5;
 
+        /// <summary>
+        /// 上一次运行结束时还剩多少分片没下完（0 = 未知）。
+        ///
+        /// <para>【2026-10-24 新增】用于判定"这次失败是不是发生在收尾阶段"。
+        /// 收尾阶段（只剩 ≤4 片）的停滞几乎都是 CDN 把这几片调度到了慢节点，
+        /// 正确的处理不是傻等或反复重试同一链接，而是**换一条直链**换节点。
+        /// 见主循环里 tailStall 那段注释。</para>
+        /// </summary>
+        private int _lastRemainParts;
+
         /// <summary>动态刷新上限的**封顶值**（见 <see cref="ComputeMaxLinkRefreshes"/>）。</summary>
         private const int MaxLinkRefreshesCap = 60;
 
@@ -717,8 +727,44 @@ namespace GeZi.Core.Download
                 // 需要 24+ 次刷新，固定 5 次会在中途耗尽，表现就是"卡在 99%"。
                 int maxRefreshes = ComputeMaxLinkRefreshes(_lastProbedTotal);
 
-                if (LinkRefresher == null || refreshed >= maxRefreshes || !IsSignatureExpired(msg))
+                // 【2026-10-24 修：收尾阶段停滞也换链】
+                //
+                // 【用户实测】一个 97MB 的视频下到 99.0%（101.7MB / 102.7MB），
+                // 只剩**最后一片 953KB** 时卡死：点恢复只显示 1/97 连接、速度恒为 0，
+                // 45 秒后被看门狗判停滞、任务失败，再恢复又是同样结果 —— 死循环。
+                //
+                // 【根因】原来这里只在 `IsSignatureExpired(msg)` 时才换链。
+                // 而停滞失败的消息是「网络停滞已中止（已保留断点…）」，
+                // **不属于签名过期**，于是永远用同一条直链重试 ——
+                // 而夸克 CDN 会把同一个 URL 稳定地调度到同一个慢节点上，
+                // 重试多少次都是 0 B/s。
+                //
+                // 【为什么只在收尾阶段换】换链要发一次取链请求（含重新申请 stoken），
+                // 下载途中偶发卡顿就换链会把请求量放大。而收尾阶段（只剩极少数
+                // 分片在磨）换链成本极低、收益极大 —— 换一条链就换了节点。
+                //
+                // 「收尾阶段」的判据用 _lastRemainParts：它在看门狗判定停滞时被填入
+                // （见 reporter 里那段）。0 = 未知/不是停滞，按"不是收尾"处理。
+                //
+                // ⚠️ 不能用 msg 里是否含 "stalled" 来判断 —— 失败消息实际是
+                //    「网络停滞已中止（已保留断点…）」，并不含英文 stalled。
+                //    改成看 _lastRemainParts 更可靠，也更贴合语义（"还剩几片"）。
+                bool tailStall = _lastRemainParts > 0 && _lastRemainParts <= 4;
+
+                if (LinkRefresher == null || refreshed >= maxRefreshes)
                     break;
+                if (!IsSignatureExpired(msg) && !tailStall)
+                    break;
+
+                if (tailStall)
+                {
+                    Log?.Invoke(string.Format(
+                        "收尾阶段停滞（只剩 {0} 片），正在换一条新直链以避开慢节点 —— "
+                        + "重试同一链接大概率还是同一个节点。",
+                        _lastRemainParts));
+                    // 换链后重置，避免下一轮把普通失败也当成尾部停滞
+                    _lastRemainParts = 0;
+                }
 
                 refreshed++;
                 cancel.ThrowIfCancellationRequested();
@@ -2372,6 +2418,19 @@ namespace GeZi.Core.Download
                         else if ((now - lastAdvance).TotalSeconds >= StalledSeconds
                                  && Interlocked.CompareExchange(ref stalledFlag, 1, 0) == 0)
                         {
+                            // 【2026-10-24】记下"当时还剩几片"，供上层判断是否该换链。
+                            // 收尾阶段（剩 ≤4 片）的停滞 = CDN 把这几片调度到了慢节点，
+                            // 换一条直链就换了节点；而反复重试同一链接必然还是它。
+                            try
+                            {
+                                int remainNow = 0;
+                                for (int pi = 0; pi < plan.Parts.Count; pi++)
+                                    if (plan.Parts[pi].W < plan.Parts[pi].E - plan.Parts[pi].S + 1)
+                                        remainNow++;
+                                _lastRemainParts = remainNow;
+                            }
+                            catch { }
+
                             Log?.Invoke(string.Format(
                                 "下载停滞: 已 {0} 秒没有任何数据写入，主动中止本任务。" +
                                 "若是【收尾阶段】（剩余分片很少，日志里有「收尾阶段」字样）出现：" +
