@@ -404,11 +404,37 @@ namespace GeZi
                     // 没有可发的新数据
                     bool complete = SafeBool(entry.IsComplete);
                     bool canGrow = SafeBool(entry.CanGrow);
-                    if (complete || !canGrow) break;
+
+                    // 【2026-10-24 修：不能"声明了 Content-Length 却发一半就断"】
+                    //
+                    // 实测用户场景：任务处于 Paused，进度 API 报 canGrow=false。
+                    // 原代码这里直接 `break` → 响应体只写了已读到的字节就关闭，
+                    // 而响应头早已声明 Content-Length = end-start+1（整个文件），
+                    // 于是浏览器认为**响应被截断**，立刻重发 Range 请求：
+                    //   请求 → 拿到一小段 → 断 → 重试 → 再拿到同一小段 → 再断…
+                    // 表现为播放页一直停在"正在连接下载器，准备播放…"，永远不动。
+                    //
+                    // 正确处理分两种：
+                    //  · 已经写完请求区间 → 正常结束（这是完好的响应）；
+                    //  · 中途没了数据但任务不会再长 → 必须**明确让它失败**，
+                    //    不能假装成功。办法是把连接掐掉并记日志，
+                    //    浏览器会收到网络错误（而非"长度不符"），
+                    //    再由页面的 error 处理器给出"下载已停止"的明确提示。
+                    if (complete) break;              // 数据齐了，正常收尾
+                    if (!canGrow)
+                    {
+                        Log?.Invoke("边下边播：任务已停止且数据不足（" + FmtBytes(pos - start)
+                            + " / " + FmtBytes(end - start + 1) + "），结束本次串流。");
+                        // 主动中止响应：不给浏览器一个"长度不符"的假成功，
+                        // 而是让它走 error 分支，页面才能显示准确原因。
+                        try { ctx.Response.Abort(); } catch { }
+                        return;
+                    }
                     if (waitedMs >= IdleLimitMs)
                     {
                         Log?.Invoke("边下边播：连续 " + (IdleLimitMs / 1000) + " 秒没有新数据，结束本次串流。");
-                        break;
+                        try { ctx.Response.Abort(); } catch { }
+                        return;
                     }
 
                     try { Task.Delay(PollMs, token).Wait(token); }
@@ -424,6 +450,16 @@ namespace GeZi
         {
             try { entry.Boost?.Invoke(start, end); }
             catch { }
+        }
+
+        /// <summary>日志用的紧凑字节格式化。</summary>
+        private static string FmtBytes(long b)
+        {
+            if (b < 0) b = 0;
+            if (b < 1024) return b + " B";
+            double x = b; string[] u = { "KB", "MB", "GB" }; int i = -1;
+            do { x /= 1024; i++; } while (x >= 1024 && i < u.Length - 1);
+            return x.ToString(x < 10 ? "0.0" : "0") + " " + u[i];
         }
 
         /// <summary>解析单段 Range；非法/超出范围返回 false（调用方回 416）。</summary>

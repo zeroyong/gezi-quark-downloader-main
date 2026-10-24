@@ -131,8 +131,15 @@
     ovErr.classList.remove('show');
   }
 
+  // 只撤"正在连接"这一层遮罩，不动"等待数据"和"无法播放"。
+  // 【2026-10-24 修】原来是 `hideOverlays()` 一刀切，结果 poll() 每轮都会把
+  // 「无法播放」的错误遮罩也一起清掉，用户看不到原因。
+  function hideLoading(){
+    ovLoad.classList.remove('show');
+  }
+
   // ---- 进度轮询：只做显示，不参与播放决策 ----
-  var timer = null, lastDone = -1, lastT = 0, sawData = false;
+  var timer = null, lastDone = -1, lastT = 0, sawData = false, loadDeadline = 0;
 
   function poll(){
     if(!API) return;
@@ -162,7 +169,7 @@
           badge.textContent = '下载已停止（只能播放已下载部分）';
           badge.className = 'badge warn';
         } else if(st === 'Paused'){
-          badge.textContent = '已暂停（当前部分可继续播放）';
+          badge.textContent = '已暂停（继续下载才能边下边播）';
           badge.className = 'badge warn';
         } else {
           badge.textContent = '边下边播中';
@@ -170,11 +177,52 @@
         }
 
         if(done > 0) sawData = true;
-        if(sawData && ovWait.classList.contains('show')){ hideOverlays(); }
+
+        // 【2026-10-24 关键修复】"正在连接下载器"这层遮罩必须能自己消失。
+        //
+        // 原来的逻辑是：只有 ovWait 显示时才 hideOverlays()，
+        // 而 ovLoad 从未被单独处理 —— 一旦 <video> 拿不到数据
+        // （loadedmetadata 不触发），这层遮罩就**永远挂着**，
+        // 用户看到的就是一直"正在连接下载器，准备播放…"（本次实测）。
+        //
+        // 现在：只要轮询拿到合法进度（done>0 或 state 非空），
+        // 就说明服务端连得上、任务信息也读到了 → 撤掉"正在连接"。
+        // 剩下的是浏览器与流之间的缓冲，由 waiting/playing 事件接管。
+        var gotInfo = (total > 0) || (st !== '');
+        if(gotInfo) hideLoading();
+
+        // 暂停/停止的任务：把"等数据"的遮罩换成明确说明，别让用户干等。
+        // canGrow === false 表示下载器不会再往里写，等下去没有意义。
+        if(d.canGrow === false && st !== 'Completed' && !v.duration){
+          ovWait.classList.add('show');
+          var wm = document.getElementById('waitMsg');
+          if(wm){
+            if(st === 'Paused'){
+              wm.innerHTML = '任务当前处于<b>暂停</b>状态，只有已下载的部分能播放。<br>'
+                           + '回到 GeZi 点「继续」（或右键「恢复」）即可边下边播。';
+            } else if(st === 'Failed' || st === 'Cancelled'){
+              wm.innerHTML = '任务已停止，只有已下载的部分能播放。<br>'
+                           + '回到 GeZi 点「重试」可继续下载。';
+            } else {
+              wm.innerHTML = '下载器当前没有写入新数据。<br>'
+                           + '回到 GeZi 确认任务在「下载中」，或右键「恢复」。';
+            }
+          }
+        }
 
         if(st === 'Completed' && timer){ clearInterval(timer); timer = null; }
       })
-      .catch(function(){ /* 轮询失败不影响播放 */ });
+      .catch(function(){
+        // 轮询失败（服务端已退出 / token 失效）→ 说明这个页面没用了，
+        // 给出明确提示，而不是让"正在连接"一直转圈。
+        if(!sawData){
+          hideLoading();
+          ovWait.classList.add('show');
+          var wm2 = document.getElementById('waitMsg');
+          if(wm2) wm2.innerHTML = '连不上下载器（GeZi 可能已退出，或这个播放页已过期）。<br>'
+                                + '回到 GeZi 重新点一次「播放」即可。';
+        }
+      });
   }
 
   // ---- 视频事件 ----
@@ -185,7 +233,7 @@
     v.play().catch(function(){ /* 自动播放可能被浏览器拦，用户点一下即可 */ });
   });
 
-  v.addEventListener('canplay', function(){ hideOverlays(); });
+  v.addEventListener('canplay', function(){ hideLoading(); });
 
   // 卡在缓冲：多半是播放位置的数据还没下到。给出解释而不是黑屏。
   var stallTimer = null;
@@ -197,10 +245,13 @@
   });
   v.addEventListener('playing', function(){
     clearTimeout(stallTimer);
-    ovWait.classList.remove('show');
     hideOverlays();
   });
-  v.addEventListener('timeupdate', function(){ clearTimeout(stallTimer); });
+  v.addEventListener('timeupdate', function(){
+    clearTimeout(stallTimer);
+    // 已经开始播了就撤掉所有遮罩（除了错误）
+    if(v.currentTime > 0){ hideLoading(); ovWait.classList.remove('show'); }
+  });
 
   v.addEventListener('error', function(){
     var e = v.error;
@@ -211,6 +262,7 @@
     else if(code === 2) msg = '读取视频数据时网络中断（code 2），下载器可能已停止。';
     errMsg.textContent = msg;
     clearTimeout(stallTimer);
+    ovLoad.classList.remove('show');
     ovWait.classList.remove('show');
     ovErr.classList.add('show');
     badge.textContent = '浏览器无法播放';
