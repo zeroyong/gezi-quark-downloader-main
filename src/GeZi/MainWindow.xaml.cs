@@ -8833,6 +8833,13 @@ namespace GeZi
                 bool isVideo = MediaProbe.IsVideo(dest);
                 TaskOpenMenuItem.Header = isVideo ? "播放文件" : "打开文件";
 
+                // 「在浏览器中播放」只对视频有意义，且必须真的能拿到流视图
+                // （Dormant 的任务也能点 —— 会先提示恢复下载）。
+                if (TaskBrowserPlayMenuItem != null)
+                    TaskBrowserPlayMenuItem.Visibility = isVideo
+                        ? System.Windows.Visibility.Visible
+                        : System.Windows.Visibility.Collapsed;
+
                 // 「重试」只在任务终态（失败/已取消，含网络停滞中止）出现：
                 // 这类任务分片还在，重新入队即可续传，不需要重新解析分享。
                 if (TaskRetryMenuItem != null)
@@ -8852,6 +8859,25 @@ namespace GeZi
         private void OnTaskResume(object sender, RoutedEventArgs e)
         {
             foreach (var t in TasksFromMenu(sender)) ResumeTask(t);
+        }
+
+        /// <summary>
+        /// 任务右键「在浏览器中播放」：用默认浏览器打开自建播放页，边下边播。
+        /// 见 <see cref="TryBrowserPlayback"/>。
+        /// </summary>
+        private void OnTaskBrowserPlay(object sender, RoutedEventArgs e)
+        {
+            var item = (sender as System.Windows.Controls.MenuItem)?.Tag as TaskItem
+                       ?? TaskFromMenu(sender);
+            if (item == null)
+            {
+                var list = TasksFromMenu(sender);
+                if (list.Count == 0) return;
+                item = list[0];
+            }
+
+            try { TryBrowserPlayback(item); }
+            catch (Exception ex) { Log("浏览器播放失败: " + ex.Message); }
         }
 
         /// <summary>
@@ -9427,13 +9453,41 @@ namespace GeZi
             string dest = item?.Job?.Dest;
             if (string.IsNullOrEmpty(dest)) return;
 
+            bool isVideo = MediaProbe.IsVideo(dest);
+
+            // 【2026-10-24 修】视频不能在这里就被 File.Exists 挡住。
+            //
+            // 旧代码在文件还没写盘（0 字节 / 尚未创建）时直接 return，
+            // 于是「下载中但刚开始」或「暂停/失败」的视频点播放**毫无反应** ——
+            // 而这正是用户要求修的场景：「如果没下载，就继续开始下载」。
+            //
+            // 现在的顺序：
+            //   · 视频 + 还没下完 → 浏览器边下边播（会自动开始下载）
+            //   · 视频 + 已完成   → 本地播放器（PotPlayer），体验最好且零等待
+            //   · 非视频          → 系统默认程序（半截文件没有意义，所以要求真的存在）
+            //
+            // ⚠️ 为什么已完成的不走浏览器：`GetStreamMap` 在下载结束的 finally 里
+            //    就被置 null 了（见 DownloadScheduler），已完成任务根本没有流视图可发布。
+            //    而本地文件已经完整，直接用 PotPlayer 播是最优解 —— 这也符合用户
+            //    之前提的「下载完成后使用 PotPlayer 播放」。
+            if (isVideo && item.State != JobState.Completed)
+            {
+                // 【用户要求】「点击播放按钮（如果是视频格式）直接打开浏览器播放，
+                // 如果没下载，就继续开始下载」。
+                //
+                // 为什么不在这里回退到本地播放器：用户明确要"直接打开浏览器"。
+                // 浏览器播不了的格式（H.265/AVI/RMVB）会在页面上明确提示，
+                // 并引导用户用右键「播放文件」走本地播放器 —— 那条路仍然完整保留。
+                if (TryBrowserPlayback(item))
+                    return;
+                // 极端情况（本地服务起不来）才继续往下走旧路径。
+            }
+
             if (!System.IO.File.Exists(dest))
             {
                 Log("文件还没写盘，暂时打不开：" + dest);
                 return;
             }
-
-            bool isVideo = MediaProbe.IsVideo(dest);
 
             long curSize = 0;
             try { curSize = new System.IO.FileInfo(dest).Length; } catch { }
@@ -9467,6 +9521,10 @@ namespace GeZi
             }
 
             // ---- 以下都是视频 ----
+
+            // 视频的浏览器播放已在函数开头处理（见上面那段说明）。
+            // 走到这里说明 TryBrowserPlayback 返回了 false（本地服务起不来），
+            // 于是回退到下面的本地播放器路径。
 
             // 【2026-10-04 用户反馈】「在软件内点播放无法播放这个文件，但从下载目录里
             //  右键用播放器打开又能看」。
@@ -9647,6 +9705,237 @@ namespace GeZi
 
             Log("边下边播已启动（" + player.Name + "）：" + url);
             return true;
+        }
+
+        /// <summary>
+        /// 在**默认浏览器**里播放这个视频（正在下载 / 已完成都行）。
+        ///
+        /// <para>【用户需求】「能不能在下载视频过程中，比如右键文件夹 弹出一键播放选项，
+        /// 然后你可以在默认浏览器打开一个播放器界面，然后加载并播放正在下载的视频」。</para>
+        ///
+        /// <para>【实现路径】复用既有的 <see cref="LocalStreamServer"/>：它已经把
+        /// "正在增长的目标文件"变成标准 HTTP 视频地址（Range + 边下边播 + 优先分片）。
+        /// 这里只需再发一个带 &lt;video&gt; 的播放页，然后 <see cref="ShellLaunch.OpenUrl"/>
+        /// 交给默认浏览器 —— 浏览器自动做增量播放、硬件解码、字幕、画中画、全屏。</para>
+        ///
+        /// <para>【与 VLC 那条路的区别】VLC 路要求本机装了 VLC；浏览器路**零外部依赖**，
+        /// 且能在任何设备上打开（同一台机器）。代价是浏览器只支持 mp4/webm 这类
+        /// 现代容器与 H.264 编码，H.265/AVI 播不了 —— 页面上会明确提示并引导用本地播放器。</para>
+        /// </summary>
+        /// <returns>true = 已处理（含"已明确告知无法播放"），false = 未处理（可回退）。</returns>
+        private bool TryBrowserPlayback(TaskItem item)
+        {
+            string dest = item?.Job?.Dest;
+            if (string.IsNullOrEmpty(dest)) return false;
+
+            if (!MediaProbe.IsVideo(dest))
+            {
+                AppDialog.Show(this,
+                    "这个文件不是视频，没法在浏览器里播放。\n\n用「打开文件」交给系统默认程序即可。",
+                    "浏览器播放");
+                return true;
+            }
+
+            // ---- 【2026-10-24 改：没下载就直接开始下载，不再只弹框让用户手动点】----
+            //
+            // 【用户要求】「点击播放按钮（如果是视频格式）直接打开浏览器播放，
+            // 如果没下载，就继续开始下载」。
+            // 原实现只弹一句「现在恢复吗？」，用户还得再点一次 —— 多此一举。
+            //
+            // ⚠️ 顺序很重要：必须**先**触发下载，再去等流视图。反过来的话
+            //    刚点恢复时 GetStreamMap 还是 null，会被判成"取不到流"而失败。
+            bool startedNow = false;
+
+            if (item.State == JobState.Paused || item.Dormant
+                || item.State == JobState.Failed || item.State == JobState.Cancelled)
+            {
+                if (item.State == JobState.Paused)
+                    Log("任务已暂停，正在恢复并准备边下边播：" + item.Name);
+                else if (item.Dormant)
+                    Log("任务来自上次运行，正在重新取链并准备边下边播：" + item.Name);
+                else
+                    Log("任务已停止，正在重试并准备边下边播：" + item.Name);
+
+                try { ResumeTask(item); }
+                catch (Exception ex) { Log("恢复下载失败: " + ex.Message); }
+                startedNow = true;
+            }
+
+            // ⚠️ 已完成的视频**没有流视图**：DownloadScheduler 在下载结束的 finally 里
+            //    把 GetStreamMap 置 null 了。所以已完成的任务不能"边下边播"，
+            //    只能直接播本地文件。这里明确告知并引导，而不是让他看着"取不到流"发懵。
+            if (item.State == JobState.Completed && !startedNow)
+            {
+                Log("任务已完成，没有流视图；请直接用「播放文件」打开：" + item.Name);
+                AppDialog.Show(this,
+                    "这个视频已经下载完成，不需要边下边播。\n\n"
+                    + "直接点「播放文件」会用本地播放器（PotPlayer）打开，体验更好。",
+                    "已下载完成");
+                return true;
+            }
+
+            // 流视图由调度器在**真正开跑**时挂上；刚点恢复时它是 null。
+            // 这里给最多 8 秒缓冲（跨重启的重新取链要发几次接口，比同会话恢复慢）。
+            var map = WaitForStreamMap(item, startedNow ? 8000 : 0);
+            if (map == null)
+            {
+                // 已经开始下载但还没写盘 —— 这不是错误，把播放页先开出来，
+                // 页面上的进度条会自己轮询，等数据到了就能播。
+                if (startedNow)
+                {
+                    // 已经触发下载但 8 秒内还没挂上流视图：不弹框、不失败，
+                    // 明确告诉用户"正在开始"，然后让浏览器等到数据。
+                    // 这里返回 false 会落到旧的本地播放器路径（更糟：可能没装 VLC）。
+                    // 所以给一条清晰提示并保留断点，用户可再点一次。
+                    Log("下载已启动，但流视图还没就绪（可能还在排队或重新取链）：" + item.Name);
+                    AppDialog.Show(this,
+                        "已开始下载，但下载器还没准备好串流。\n\n"
+                        + "常见原因是：任务在排队（同时下载数已满）、或上次运行的任务正在重新取链。\n"
+                        + "稍等几秒后再点一次「播放」即可。",
+                        "浏览器播放");
+                    return true;
+                }
+                Log("下载器还没开始写盘，暂时无法边下边播：" + item.Name);
+                return false;
+            }
+
+            // MP4 的 moov 常在文件尾部：先主动把最后 16MB 提成优先分片，
+            // 浏览器一请求元数据就能马上拿到，不用干等顺序下载到那儿。
+            if (MediaProbe.IsMp4Family(dest) && !MediaProbe.IsMp4IndexAvailable(dest)
+                && item.Job.BoostRange != null && item.Total > 0)
+            {
+                long tailStart = Math.Max(0, item.Total - 16L * 1024 * 1024);
+                item.Job.BoostRange(tailStart, item.Total - 1);
+                Log("MP4 索引在文件尾部，已优先下载最后 16MB。");
+            }
+
+            // 进度回调：给播放页轮询用。全部读 TaskItem 的公开状态，
+            // 不碰下载器内部字段 —— UI 线程安全、也不会与下载线程竞争。
+            Func<string> progressJson = () =>
+            {
+                try
+                {
+                    string st = item.State.ToString();
+                    bool canGrow = item.State == JobState.Downloading
+                                || item.State == JobState.Queued;
+                    return string.Format(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        "{{\"done\":{0},\"total\":{1},\"speed\":{2},\"state\":\"{3}\",\"canGrow\":{4}}}",
+                        item.Done, item.Total, (long)item.Speed, st,
+                        canGrow ? "true" : "false");
+                }
+                catch { return "{}"; }
+            };
+
+            string streamUrl = LocalStreamServer.Instance.Publish(
+                map.Total, map.Dest, map.ReadAt,
+                () => item.State == JobState.Completed,
+                () => item.State == JobState.Downloading || item.State == JobState.Queued,
+                (s, e) =>
+                {
+                    try
+                    {
+                        var boost = item.Job == null ? null : item.Job.BoostRange;
+                        return boost != null && boost(s, e);
+                    }
+                    catch { return false; }
+                },
+                progressJson);
+
+            if (string.IsNullOrEmpty(streamUrl))
+            {
+                Log("本地播放服务启动失败（端口被占用？）。");
+                AppDialog.Show(this,
+                    "无法启动本地播放服务。\n\n常见原因：防火墙拦截了本程序的回环监听，"
+                    + "或端口全被占用。可以换用「播放文件」走本地播放器。",
+                    "浏览器播放");
+                return true;
+            }
+
+            // 进度 API 与流同一个 token：把 /stream/<token>/... 换成 /progress/<token>
+            string apiUrl = null;
+            try
+            {
+                var u = new Uri(streamUrl);
+                var segs = u.AbsolutePath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                if (segs.Length >= 2)
+                    apiUrl = u.GetLeftPart(UriPartial.Authority) + "/progress/" + segs[1];
+            }
+            catch { }
+
+            string html = BrowserPlayerPage.Build(
+                streamUrl, System.IO.Path.GetFileName(dest), map.Total,
+                item.State == JobState.Completed, apiUrl);
+
+            string pageUrl = LocalStreamServer.Instance.PublishPlayerPage(html);
+            if (string.IsNullOrEmpty(pageUrl))
+            {
+                Log("播放页发布失败。");
+                return true;
+            }
+
+            if (!ShellLaunch.OpenUrl(pageUrl))
+            {
+                Log("打开默认浏览器失败，请手动访问：" + pageUrl);
+                AppDialog.Show(this,
+                    "没能自动打开浏览器，请手动复制这个地址访问：\n\n" + pageUrl,
+                    "浏览器播放");
+                return true;
+            }
+
+            Log("已在默认浏览器打开播放页：" + pageUrl);
+            return true;
+        }
+
+        /// <summary>
+        /// 等下载器挂上流视图（<see cref="DownloadJob.GetStreamMap"/> 变为非 null）。
+        ///
+        /// <para>【为什么需要等】<c>GetStreamMap</c> 由调度器在**任务真正开跑**时才挂上。
+        /// 用户点「播放」时若任务还没开始（暂停/失败/上次运行留下的），
+        /// 我们刚触发 ResumeTask，此刻它必然还是 null —— 不等就取不到流。</para>
+        ///
+        /// <para>【为什么要泵消息】这是在 UI 线程上调用的。直接 Thread.Sleep 会冻结界面，
+        /// 而且 ResumeTask 的续传流程（跨重启要发好几次网络接口）需要 UI 线程继续处理
+        /// 消息才能推进 —— 睡死就是死锁。所以用 Dispatcher 的帧回调边等边让出。</para>
+        ///
+        /// <para>⚠️ 上限 8 秒：跨重启的「重新取链」比同会话恢复慢得多。
+        /// 超时不算失败 —— 调用方会把播放页先开出来，页面自己轮询等数据。</para>
+        /// </summary>
+        private StreamMap WaitForStreamMap(TaskItem item, int timeoutMs)
+        {
+            var read = new Func<StreamMap>(() =>
+            {
+                try
+                {
+                    return item.Job != null && item.Job.GetStreamMap != null
+                        ? item.Job.GetStreamMap() : null;
+                }
+                catch { return null; }
+            });
+
+            var first = read();
+            if (first != null || timeoutMs <= 0) return first;
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                // 让出 UI 线程一小段时间（Task.Delay 的续体回到当前同步上下文）。
+                // 用 DoEvents 风格的帧回调，保证 ResumePendingBatchAsync 里的
+                // await 续体能继续执行（它们都回到 UI 线程）。
+                var frame = new System.Windows.Threading.DispatcherFrame();
+                var timer = new System.Windows.Threading.DispatcherTimer(
+                    TimeSpan.FromMilliseconds(120),
+                    System.Windows.Threading.DispatcherPriority.Background,
+                    (s, e) => { frame.Continue = false; },
+                    Dispatcher);
+                timer.Start();
+                try { System.Windows.Threading.Dispatcher.PushFrame(frame); }
+                finally { timer.Stop(); }
+
+                var m = read();
+                if (m != null) return m;
+            }
+            return read();
         }
 
         /// <summary>

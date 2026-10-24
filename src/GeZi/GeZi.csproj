@@ -99,6 +99,12 @@
     <!-- 赞赏码（2026-10-09 用户提供的新图：「躬行小舟」的赞赏码，
          取代原来从 Flet 版 APP_REWARD_LG_B64 解出来的那份） -->
     <Resource Include="Resources\reward-xiaozhou.png" />
+    <!-- 【2026-10-24】浏览器播放页模板。
+         作为 EmbeddedResource 而不是 Resource：
+         Resource 走 WPF 的 pack:// URI，取原始文本要绕 ResourceManager 的 BAML 流；
+         EmbeddedResource 直接 GetManifestResourceStream 读字符串，最直白。
+         资源名 = 根命名空间 + 目录 + 文件名 → GeZi.Resources.player.html -->
+    <EmbeddedResource Include="Resources\player.html" />
   </ItemGroup>
 
   <ItemGroup>

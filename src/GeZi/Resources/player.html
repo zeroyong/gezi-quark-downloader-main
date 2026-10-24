@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__ — 鸽子播放</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --fg:#e6e9ef; --muted:#9aa3b2; --accent:#4c8dff; --ok:#3ecf8e; --warn:#ffb020; --err:#ff5c5c;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:radial-gradient(1200px 600px at 50% -10%, #1b2130 0%, var(--bg) 60%);
+    color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+    display:flex;align-items:center;justify-content:center;padding:20px;
+  }
+  .wrap{width:min(1100px,100%)}
+  .head{display:flex;align-items:baseline;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+  .head h1{font-size:15px;font-weight:600;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:200px}
+  .badge{font-size:12px;padding:2px 9px;border-radius:999px;background:var(--panel2);border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+  .badge.live{color:var(--ok);border-color:#245c44}
+  .badge.done{color:var(--accent);border-color:#28406e}
+  .badge.warn{color:var(--warn);border-color:#5c4a1f}
+  .stage{position:relative;background:#000;border:1px solid var(--line);border-radius:12px;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.45)}
+  video{display:block;width:100%;max-height:calc(100vh - 250px);background:#000}
+  .overlay{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:28px;text-align:center;background:rgba(10,12,16,.93)}
+  .overlay.show{display:flex}
+  .overlay h2{margin:0;font-size:16px;color:var(--err)}
+  .overlay p{margin:0;color:var(--muted);max-width:640px}
+  .spinner{width:30px;height:30px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .bar{height:44px;display:flex;align-items:center;gap:14px;margin-top:12px;padding:0 14px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+  .track{position:relative;flex:1;height:6px;background:#242a35;border-radius:999px;overflow:hidden;min-width:80px}
+  .fill{position:absolute;top:0;bottom:0;left:0;width:0;background:linear-gradient(90deg,var(--accent),#6aa6ff);border-radius:999px;transition:width .35s ease}
+  .num{font-variant-numeric:tabular-nums;color:var(--muted);font-size:12.5px;white-space:nowrap}
+  .num b{color:var(--fg);font-weight:600}
+  .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 13px;font-size:13px;cursor:pointer;transition:.15s}
+  button:hover{background:#252a35;border-color:#3a4152}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{background:#3d7de6}
+  .hint{color:var(--muted);font-size:12px;margin-top:9px;line-height:1.7}
+  .hint b{color:var(--fg);font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">
+    <h1 id="title" title="__TITLE__">__TITLE__</h1>
+    <span class="badge" id="badge">正在加载…</span>
+  </div>
+
+  <div class="stage">
+    <video id="v" controls playsinline preload="metadata" autoplay></video>
+
+    <div class="overlay show" id="ovLoad">
+      <div class="spinner"></div>
+      <p>正在连接下载器，准备播放…</p>
+    </div>
+
+    <div class="overlay" id="ovWait">
+      <div class="spinner"></div>
+      <h2 style="color:var(--warn)">等待数据</h2>
+      <p id="waitMsg">播放位置的数据还没下载到，下载器正在优先补齐这一段。通常几秒内就会继续。</p>
+      <button onclick="location.reload()">重新加载</button>
+    </div>
+
+    <div class="overlay" id="ovErr">
+      <h2>这个视频在当前浏览器里播不了</h2>
+      <p id="errMsg">浏览器只支持部分视频编码。</p>
+      <p style="text-align:left">
+        · <b>H.265 / HEVC</b> 编码的 MP4 —— Chrome / Edge 默认不支持<br>
+        · <b>AVI / WMV / RMVB / FLV</b> 等老容器 —— 浏览器基本都不支持<br>
+        · 也可能是播放位置的数据还没下到（可以等一会儿再点重试）
+      </p>
+      <p>数据本身没问题，用本地播放器（PotPlayer / VLC）一定能播。</p>
+      <div class="actions" style="justify-content:center">
+        <button class="primary" onclick="location.reload()">重试</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="bar">
+    <div class="track"><div class="fill" id="fill"></div></div>
+    <div class="num" id="num">— / __TOTAL__</div>
+  </div>
+
+  <div class="actions">
+    <button id="btnPip" title="小窗播放">画中画</button>
+    <button id="btnFull" title="全屏">全屏</button>
+    <button id="btnReload">刷新</button>
+  </div>
+
+  <div class="hint" id="hint">
+    <b>边下边播</b>：播放时会自动把接下来要看的这段优先下载。
+    拖动进度条可以跳到任意位置，下载器会优先补齐那一段。
+  </div>
+</div>
+
+<script>
+(function(){
+  var STREAM  = __STREAM__;
+  var API     = __API__;
+  var NAME    = __NAME__;
+  var IS_DONE = __ISDONE__;
+
+  var v       = document.getElementById('v');
+  var badge   = document.getElementById('badge');
+  var ovLoad  = document.getElementById('ovLoad');
+  var ovWait  = document.getElementById('ovWait');
+  var ovErr   = document.getElementById('ovErr');
+  var fill    = document.getElementById('fill');
+  var num     = document.getElementById('num');
+  var hint    = document.getElementById('hint');
+  var errMsg  = document.getElementById('errMsg');
+
+  function fmt(n){
+    if(n === null || n === undefined || isNaN(n) || n < 0) return '—';
+    if(n < 1024) return n + ' B';
+    var u = ['KB','MB','GB','TB'], i = -1, x = n;
+    do { x /= 1024; i++; } while (x >= 1024 && i < u.length - 1);
+    return (x < 10 ? x.toFixed(2) : (x < 100 ? x.toFixed(1) : Math.round(x))) + ' ' + u[i];
+  }
+
+  function hideOverlays(){
+    ovLoad.classList.remove('show');
+    ovWait.classList.remove('show');
+    ovErr.classList.remove('show');
+  }
+
+  // ---- 进度轮询：只做显示，不参与播放决策 ----
+  var timer = null, lastDone = -1, lastT = 0, sawData = false;
+
+  function poll(){
+    if(!API) return;
+    fetch(API, {cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        var done = d.done || 0, total = d.total || 0;
+        var pct = total > 0 ? Math.min(100, done * 100 / total) : 0;
+        fill.style.width = pct.toFixed(2) + '%';
+
+        var sp = '';
+        var now = Date.now();
+        if(lastDone >= 0 && now > lastT){
+          var bps = (done - lastDone) * 1000 / (now - lastT);
+          if(bps > 1) sp = ' · ' + fmt(bps) + '/s';
+        }
+        lastDone = done; lastT = now;
+
+        num.innerHTML = '<b>' + fmt(done) + '</b> / ' + fmt(total)
+                      + ' · ' + pct.toFixed(1) + '%' + sp;
+
+        var st = d.state || '';
+        if(st === 'Completed'){
+          badge.textContent = '已下载完成';
+          badge.className = 'badge done';
+        } else if(st === 'Failed' || st === 'Cancelled'){
+          badge.textContent = '下载已停止（只能播放已下载部分）';
+          badge.className = 'badge warn';
+        } else if(st === 'Paused'){
+          badge.textContent = '已暂停（当前部分可继续播放）';
+          badge.className = 'badge warn';
+        } else {
+          badge.textContent = '边下边播中';
+          badge.className = 'badge live';
+        }
+
+        if(done > 0) sawData = true;
+        if(sawData && ovWait.classList.contains('show')){ hideOverlays(); }
+
+        if(st === 'Completed' && timer){ clearInterval(timer); timer = null; }
+      })
+      .catch(function(){ /* 轮询失败不影响播放 */ });
+  }
+
+  // ---- 视频事件 ----
+  v.addEventListener('loadedmetadata', function(){
+    hideOverlays();
+    badge.textContent = IS_DONE ? '已下载完成' : '边下边播中';
+    badge.className = IS_DONE ? 'badge done' : 'badge live';
+    v.play().catch(function(){ /* 自动播放可能被浏览器拦，用户点一下即可 */ });
+  });
+
+  v.addEventListener('canplay', function(){ hideOverlays(); });
+
+  // 卡在缓冲：多半是播放位置的数据还没下到。给出解释而不是黑屏。
+  var stallTimer = null;
+  v.addEventListener('waiting', function(){
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(function(){
+      if(!v.paused){ ovWait.classList.add('show'); }
+    }, 2500);
+  });
+  v.addEventListener('playing', function(){
+    clearTimeout(stallTimer);
+    ovWait.classList.remove('show');
+    hideOverlays();
+  });
+  v.addEventListener('timeupdate', function(){ clearTimeout(stallTimer); });
+
+  v.addEventListener('error', function(){
+    var e = v.error;
+    var code = e ? e.code : 0;
+    var msg = '浏览器无法解码这个视频流（code ' + code + '）。';
+    if(code === 4)      msg = '浏览器不支持这个视频的容器或编码（code 4，最常见：H.265/HEVC 或 AVI/RMVB）。';
+    else if(code === 3) msg = '解码失败（code 3），通常是编码不被支持。';
+    else if(code === 2) msg = '读取视频数据时网络中断（code 2），下载器可能已停止。';
+    errMsg.textContent = msg;
+    clearTimeout(stallTimer);
+    ovWait.classList.remove('show');
+    ovErr.classList.add('show');
+    badge.textContent = '浏览器无法播放';
+    badge.className = 'badge warn';
+    hint.innerHTML = '<b>提示</b>：在 GeZi 里右键这个任务 →「播放文件」，'
+                   + '会用本地播放器（PotPlayer / VLC）打开，那个能播所有格式。';
+  });
+
+  // ---- 按钮 ----
+  document.getElementById('btnPip').onclick = function(){
+    if(document.pictureInPictureElement) document.exitPictureInPicture();
+    else if(v.requestPictureInPicture) v.requestPictureInPicture().catch(function(){});
+  };
+  document.getElementById('btnFull').onclick = function(){
+    if(v.requestFullscreen) v.requestFullscreen();
+    else if(v.webkitEnterFullscreen) v.webkitEnterFullscreen();
+  };
+  document.getElementById('btnReload').onclick = function(){ location.reload(); };
+
+  // 容器预检：只能查容器类型，查不了编码。查不了就照常播，让 video 自己报错。
+  try{
+    var ext = (NAME.split('.').pop() || '').toLowerCase();
+    var mime = { mp4:'video/mp4', m4v:'video/mp4', webm:'video/webm', ogv:'video/ogg',
+                 mov:'video/mp4', mkv:'video/x-matroska', ts:'video/mp2t' }[ext];
+    if(mime && v.canPlayType && v.canPlayType(mime) === ''){
+      badge.textContent = '容器可能不支持';
+      badge.className = 'badge warn';
+    }
+  }catch(e){}
+
+  v.src = STREAM;
+  if(API){ poll(); timer = setInterval(poll, 1000); }
+  else {
+    badge.textContent = IS_DONE ? '已下载完成' : '播放中';
+    badge.className = 'badge done';
+  }
+
+  window.addEventListener('beforeunload', function(){ if(timer) clearInterval(timer); });
+})();
+</script>
+</body>
+</html>

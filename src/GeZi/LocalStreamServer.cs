@@ -1,8 +1,9 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -38,6 +39,8 @@ namespace GeZi
             public Func<bool> CanGrow;
             /// <summary>把某段字节涉及的分片提到队首（播放器 seek / 读尾部索引时用）。</summary>
             public Func<long, long, bool> Boost;
+            /// <summary>给播放页用的进度快照（JSON 片段，null = 不提供）。</summary>
+            public Func<string> ProgressJson;
         }
 
         private const int ReadBufSize = 128 * 1024;
@@ -52,6 +55,15 @@ namespace GeZi
         private readonly object _gate = new object();
         private readonly Dictionary<string, Entry> _entries =
             new Dictionary<string, Entry>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// 自建播放页（token → HTML）。与流**共用同一个端口**：
+        /// 浏览器只认同源，跨端口就要处理 CORS；同源则一行都不用写。
+        /// 见 <see cref="PublishPlayerPage"/>。
+        /// </summary>
+        private readonly Dictionary<string, string> _pages =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+
         private readonly CancellationTokenSource _shutdown = new CancellationTokenSource();
 
         private HttpListener _listener;
@@ -64,7 +76,8 @@ namespace GeZi
         public string Publish(long total, string dest,
                               Func<long, byte[], int, int> readAt,
                               Func<bool> isComplete, Func<bool> canGrow,
-                              Func<long, long, bool> boost)
+                              Func<long, long, bool> boost,
+                              Func<string> progressJson = null)
         {
             if (total <= 0 || readAt == null || string.IsNullOrEmpty(dest)) return null;
             if (!EnsureStarted()) return null;
@@ -80,12 +93,33 @@ namespace GeZi
                     IsComplete = isComplete ?? (() => true),
                     CanGrow = canGrow ?? (() => false),
                     Boost = boost,
+                    ProgressJson = progressJson,
                 };
             }
 
             // 路径里带上原文件名（只为让播放器看到 .mkv/.mp4 扩展名，据此选分离器）
             string name = Uri.EscapeDataString(Path.GetFileName(dest) ?? "video");
             return "http://127.0.0.1:" + _port + "/stream/" + token + "/" + name;
+        }
+
+        /// <summary>
+        /// 取某个流的进度 JSON（供播放页轮询）。未登记或没有回调时返回 null。
+        /// <para>URL 形如 <c>http://127.0.0.1:端口/stream/&lt;token&gt;/文件名</c>。</para>
+        /// </summary>
+        public string ProgressJsonFor(string streamUrl)
+        {
+            if (string.IsNullOrEmpty(streamUrl)) return null;
+            try
+            {
+                var uri = new Uri(streamUrl);
+                var segs = uri.AbsolutePath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                if (segs.Length < 2) return null;
+                Entry e;
+                lock (_gate) _entries.TryGetValue(segs[1], out e);
+                if (e == null || e.ProgressJson == null) return null;
+                return e.ProgressJson();
+            }
+            catch { return null; }
         }
 
         /// <summary>移除登记项（任务被删除时调用，避免字典无限增长）。</summary>
@@ -102,6 +136,42 @@ namespace GeZi
                 }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 把一个自建播放页登记成可在浏览器打开的 URL。
+        ///
+        /// <para>【为什么需要】用户希望「右键 → 一键播放，在默认浏览器里打开一个播放器界面，
+        /// 直接播放正在下载的视频」。浏览器本来就能播 mp4/webm，而
+        /// <see cref="Publish"/> 已经把"正在增长的文件"变成了标准 HTTP 地址 ——
+        /// 所以这里只需要再发一个 HTML 页面把 &lt;video&gt; 指过去。</para>
+        ///
+        /// <para>⚠️ 页面必须与流**同源**（同端口）：否则 &lt;video&gt; 的跨源 Range 请求
+        /// 要额外处理 CORS 与范围头暴露，得不偿失。</para>
+        /// </summary>
+        /// <param name="html">页面 HTML。</param>
+        /// <returns>可达的 URL；服务启动失败返回 null。</returns>
+        public string PublishPlayerPage(string html)
+        {
+            if (string.IsNullOrEmpty(html)) return null;
+            if (!EnsureStarted()) return null;
+
+            string token = Guid.NewGuid().ToString("N");
+            lock (_gate) _pages[token] = html;
+            return "http://127.0.0.1:" + _port + "/play/" + token;
+        }
+
+        /// <summary>本服务的基地址（如 <c>http://127.0.0.1:12345</c>），未启动返回 null。</summary>
+        public string BaseUrl
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    if (_listener == null || !_listener.IsListening || _port <= 0) return null;
+                    return "http://127.0.0.1:" + _port;
+                }
+            }
         }
 
         private bool EnsureStarted()
@@ -199,6 +269,46 @@ namespace GeZi
             }
 
             var segs = req.Url.AbsolutePath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+
+            // ---- 自建播放页：GET /play/<token> ----
+            // 与流同源（同端口），页面里的 <video> 直接指 /stream/<token>/<name> 即可。
+            if (segs.Length >= 2 && segs[0] == "play")
+            {
+                string html;
+                lock (_gate) _pages.TryGetValue(segs[1], out html);
+                if (html == null)
+                {
+                    res.StatusCode = (int)HttpStatusCode.NotFound;
+                    return;
+                }
+                var bytes = Encoding.UTF8.GetBytes(html);
+                res.StatusCode = (int)HttpStatusCode.OK;
+                res.ContentType = "text/html; charset=utf-8";
+                res.AddHeader("Cache-Control", "no-store");
+                res.ContentLength64 = bytes.Length;
+                if (!string.Equals(req.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase))
+                    res.OutputStream.Write(bytes, 0, bytes.Length);
+                return;
+            }
+
+            // ---- 进度查询：GET /progress/<token> ----
+            // 播放页每秒轮询一次，用来显示"已下载 / 总大小 / 速度"。
+            // 与 /stream/ 共用同一个 token（同一个 Entry），不必再维护第二张表。
+            if (segs.Length >= 2 && segs[0] == "progress")
+            {
+                Entry pe;
+                lock (_gate) _entries.TryGetValue(segs[1], out pe);
+                string json = (pe == null || pe.ProgressJson == null) ? "{}" : pe.ProgressJson();
+                var jb = Encoding.UTF8.GetBytes(json ?? "{}");
+                res.StatusCode = (int)HttpStatusCode.OK;
+                res.ContentType = "application/json; charset=utf-8";
+                res.AddHeader("Cache-Control", "no-store");
+                res.ContentLength64 = jb.Length;
+                if (!string.Equals(req.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase))
+                    res.OutputStream.Write(jb, 0, jb.Length);
+                return;
+            }
+
             if (segs.Length < 2 || segs[0] != "stream")
             {
                 res.StatusCode = (int)HttpStatusCode.NotFound;
@@ -395,7 +505,7 @@ namespace GeZi
         {
             try { _shutdown.Cancel(); } catch { }
             try { if (_listener != null) { _listener.Stop(); _listener.Close(); } } catch { }
-            lock (_gate) _entries.Clear();
+            lock (_gate) { _entries.Clear(); _pages.Clear(); }
         }
     }
 }

@@ -1387,6 +1387,13 @@
                                              由 Opened 事件在弹出前改写（见 OnTaskMenuOpened）。 -->
                                         <MenuItem x:Name="TaskOpenMenuItem" Header="播放文件"
                                                   Click="OnOpenTaskFile"/>
+                                        <!-- 【2026-10-24 新增】在默认浏览器里播放：
+                                             复用 LocalStreamServer，把"正在增长的文件"变成 HTTP 视频地址，
+                                             浏览器原生增量播放。零外部依赖（不需要装 VLC）。
+                                             只在视频任务上显示，由 OnTaskMenuOpened 控制。 -->
+                                        <MenuItem x:Name="TaskBrowserPlayMenuItem" Header="在浏览器中播放"
+                                                  ToolTip="用默认浏览器打开一个播放器界面，正在下载的视频可以边下边播。&#x0a;浏览器只支持 MP4(H.264)/WebM 等现代格式；H.265、AVI、RMVB 请用「播放文件」。"
+                                                  Click="OnTaskBrowserPlay"/>
                                         <MenuItem Header="在资源管理器中定位" Click="OnLocateTaskFile"/>
                                         <Separator Style="{StaticResource MenuSeparator}"/>
                                         <MenuItem Header="删除本地文件…" Click="OnTaskDeleteLocal"/>
@@ -1493,11 +1500,15 @@
                                                             <Setter Property="ToolTip"
                                                                     Value="用系统默认程序打开该文件。"/>
                                                             <Style.Triggers>
-                                                                <!-- 视频 → 「播放」（VLC） -->
+                                                                <!-- 【2026-10-24 改】视频 → 「播放」直接在默认浏览器打开。
+                                                                     没下载/暂停/失败时会**自动开始下载**，再边下边播；
+                                                                     页面自己等数据，不需要用户先等进度涨起来。
+                                                                     浏览器播不了的格式（H.265/AVI/RMVB）页面会明确提示，
+                                                                     并可用右键「播放文件」走本地播放器（PotPlayer/VLC）。 -->
                                                                 <DataTrigger Binding="{Binding CanPlay}" Value="True">
                                                                     <Setter Property="Content" Value="播放"/>
                                                                     <Setter Property="ToolTip"
-                                                                            Value="用 VLC 播放；未下完时会边下边播，跳转进度会优先下载对应分片。"/>
+                                                                            Value="在默认浏览器里播放（边下边播）。&#x0a;未下载/已暂停会自动开始下载。&#x0a;若浏览器不支持该编码（H.265、AVI 等），请右键用「播放文件」走本地播放器。"/>
                                                                 </DataTrigger>
                                                             </Style.Triggers>
                                                         </Style>
