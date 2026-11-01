@@ -171,11 +171,78 @@ namespace GeZi.Core.Download
         /// </summary>
         private int _lastWorkerCount;
 
+        /// <summary>
+        /// 【2026-10-25 新增】后台预取任务换出来的**最新直链**。
+        ///
+        /// <para>用途：当 worker 仍然撞上 403（预取没赶上、或新链也立刻被限）时，
+        /// 外层主循环要换链 —— 如果这时再用自己手里的旧 `url` 去对比/重试，
+        /// 就会白白多取一次链（预取刚取过的还热着）。有了这个字段，
+        /// 外层可以优先采用它，省掉一次接口调用。</para>
+        /// <para>由 <c>RunSegmentedAsync</c> 在预取成功时写入；外层读后即可清空。</para>
+        /// </summary>
+        private volatile string _prefetchedUrl;
+
         /// <summary>动态刷新上限的**封顶值**（见 <see cref="ComputeMaxLinkRefreshes"/>）。</summary>
         private const int MaxLinkRefreshesCap = 60;
 
         /// <summary>直链的保守 TTL（秒）。夸克实测 5~10 分钟，按 5 分钟估最坏情况。</summary>
         private const int LinkTtlSeconds = 300;
+
+        /// <summary>
+        /// 【2026-10-25 新增】提前换链的时机：用到 TTL 的这个比例就去预取新链。
+        ///
+        /// <para>取 0.5（= 150 秒）而不是 0.9：夸克直链的**实际**存活时间波动很大
+        /// （实测 5~10 分钟，也可能更短），留一半余量才来得及。
+        /// 预取是"提前备好"而不是"过期补救"，所以宁可早一点。</para>
+        /// </summary>
+        private const double PrefetchAtTtlRatio = 0.5;
+
+        /// <summary>
+        /// 【2026-10-25 新增】两次预取之间的最短间隔（秒），防止接口被刷爆。
+        /// </summary>
+        private const int PrefetchMinIntervalSec = 60;
+
+        /// <summary>
+        /// 【2026-10-25 新增】预取轮询周期（秒）。只是"看看该不该换"，不换就白跑一次判断。
+        /// </summary>
+        private const int PrefetchTickSec = 5;
+
+        /// <summary>
+        /// 【2026-10-25 新增】worker 领不到片时最多等多久（毫秒）才放弃退出。
+        ///
+        /// <para>【为什么需要"等"而不是立刻退出】见 worker 循环里那段长注释：
+        /// 队列空 ≠ 活干完。收尾阶段剩几十片时，先领到片的 worker 在磨，
+        /// 队列暂时空；若其余 worker 立刻回家，一旦那些片被抢占/切分放回队列，
+        /// **就再没人接**——实测并发会从 256 塌到 62 再到个位数。</para>
+        ///
+        /// <para>取 60 秒：足够覆盖"某一片慢、被抢占后重新入队"的周期
+        /// （抢占冷却最长 10 秒、慢速爬行判定 20 秒），又不至于让真的卡死
+        /// 的任务无限期挂着 —— 超时后仍由停滞看门狗给结论并换链。</para>
+        /// </summary>
+        private const int WorkerIdleGiveUpMs = 60_000;
+
+        /// <summary>
+        /// 【2026-10-25 新增】可热切换的直链持有盒。
+        ///
+        /// <para>【要解决什么】用户实测：669MB 的文件下到 665MB（99.3%）时
+        /// 连接数从 240 骤降到 4、速度 0 B/s，最终测出直链返回 **403** ——
+        /// 签名已过期。而原来的自愈只在"所有 worker 都因 403 退出之后"
+        /// 才由外层换链，中间白白卡了几分钟；更糟的是此时若只剩少数分片，
+        /// worker 已经全部 `return`，没有人再去领片，形成"看着在下载、其实死了"。</para>
+        ///
+        /// <para>【为什么用盒子】worker 是闭包捕获参数的，`string url` 一旦捕获
+        /// 就没法从外面改。改成读这个盒子后，预取任务可以在**不中断任何连接**的
+        /// 前提下把新链放进来，下一次建连自然就用新链 —— 真正做到"热切换"。</para>
+        /// </summary>
+        private sealed class LinkBox
+        {
+            /// <summary>当前可用的直链（volatile：由预取任务写、多个 worker 并发读）。</summary>
+            public volatile string Url;
+            /// <summary>这条链是什么时候拿到的（UTC ticks，用 Interlocked 读写）。</summary>
+            public long IssuedTicks;
+            /// <summary>已换过几次（区分"同一时刻多条 worker 同时发现过期"）。</summary>
+            public int Version;
+        }
 
         /// <summary>
         /// 最近一次探测到的文件总大小（字节，0 = 还没探到）。
@@ -380,6 +447,45 @@ namespace GeZi.Core.Download
 
         /// <summary>收尾阶段的最低年龄门槛。</summary>
         private const long PreemptEndgameMinAgeMs = 3_000;
+
+        // ==================== 【2026-10-31 新增】尾部收缩（移植自 YunX）====================
+        //
+        // 【要解决什么｜用户实测】任务收尾阶段（99.8% 附近）连接数掉到 0/256、
+        // 速度只剩 32 B/s，剩余时间估算暴涨。
+        //
+        // 【为什么 v2.8.8 那轮修完还是掉速】
+        // 那五处修的都是"检测到慢了怎么补救"（412 收兵、tailStall 动态阈值、
+        // 慢速爬行检测、收尾判据相对化）。而根因在**分片粒度**：
+        //   动态窃取（SplitLongestPartIfNeeded）只会把一片**切成两半** →
+        //   剩 500KB / 32 路时，最多只有 2 路在跑，其余 30 路空转。
+        //
+        // 【YunX 的做法（ElasticAllocator）】
+        // 当剩余字节不足以让每条连接分到一整块时，把块压到
+        //   block = clamp(remaining / workers, 64KB, base)
+        // 即**把剩余字节均分给所有在飞连接**，让全部连接一起冲最后一段。
+        // 对比效果（剩 500KB / 32 路）：
+        //   切半   → 2 路在跑
+        //   收缩   → 32 路各领 ~15KB，全在跑
+        //
+        // ⚠️ 为什么只加"尾部收缩"而不整套搬 ElasticAllocator：
+        //    GeZi 用固定分片区间 + .qmeta 记录每片 W（已写字节）。
+        //    若改成"每次运行分片区间都可能不同"，.qmeta 的 W 立刻对不上，
+        //    断点续传直接失效。所以这里只做**追加式切分**：
+        //    区间只被切细、从不重排，已有的 W 全部保留 → 断点续传天然兼容。
+        /// <summary>
+        /// 尾部收缩时，切出来的新片最小多少字节。
+        /// <para>取 64KB 对齐 YunX 的 MIN_TAIL_BLOCK：再小则 Range 请求与建连开销
+        /// 会超过"多一路并行"带来的收益。</para>
+        /// </summary>
+        private const long TailShrinkMinBytes = 64 * 1024;
+
+        /// <summary>
+        /// 尾部收缩的触发阈值：剩余**未完成字节**少于「在飞路数 × 此值」时，
+        /// 认为已进入"可以均分给所有连接"的收尾形态。
+        /// <para>取 1MB：一片的最小粒度。剩余不足每路 1MB 时，
+        /// 继续按整片发牌必然出现"路多片少"的空转。</para>
+        /// </summary>
+        private const long TailShrinkPerWorkerBytes = 1L * 1024 * 1024;
 
         /// <summary>
         /// 判定"整体限速"所需的最少有效样本数。
@@ -726,6 +832,12 @@ namespace GeZi.Core.Download
 
             var headers = BuildHeaders();
 
+            // 【2026-10-25】清掉上一个任务残留的"预取链"。
+            // 这个字段是实例级的，而一个 SegmentedDownloader 实例可能被
+            // 多个任务复用（同一批下载）—— 不清的话，B 任务可能捡到
+            // A 任务的直链，轻则 403，重则下到**错误的文件**。
+            _prefetchedUrl = null;
+
             // 【2026-10-22 诊断】用户实测"取链成功但速度一直是 0"。
             // 这里把**实际会发出去的头**打出来（Cookie 只打长度与键名，不打值），
             // 一眼就能看出是「没带 Cookie」还是「带了但 CDN 不认」。
@@ -817,8 +929,28 @@ namespace GeZi.Core.Download
                     _lastRemainParts = 0;
                 }
 
-                refreshed++;
                 cancel.ThrowIfCancellationRequested();
+
+                // 【2026-10-25 新增】先看预取任务有没有已经取好一条更热的链。
+                //
+                // 预取成功时会把新链写进 _prefetchedUrl。如果它跟当前 url 不同，
+                // 直接用它 —— 省掉一次取链接口调用（预取刚取的，还在有效期内）。
+                // 这样"预取 + 撞 403 兜底"两条路能协同，而不是各取各的。
+                //
+                // ⚠️ 放在 refreshed++ **之前**：复用现成的链并没有调接口，
+                //    不该消耗刷新配额（否则大文件会因"预取 + 兜底"双计而提前耗尽）。
+                string prefetched = _prefetchedUrl;
+                if (!string.IsNullOrEmpty(prefetched)
+                    && !string.Equals(prefetched, url, StringComparison.Ordinal))
+                {
+                    Log?.Invoke("直链已失效，但后台已提前取好一条新链，直接换用（省一次取链请求）。");
+                    url = prefetched;
+                    _prefetchedUrl = null;
+                    Log?.Invoke("已换用新直链，继续下载。");
+                    continue;
+                }
+
+                refreshed++;
                 Log?.Invoke(string.Format(
                     "直链已失效（{0}），正在重新获取第 {1}/{2} 次…已下载的部分会保留，换新链后自动续传。",
                     Trim(msg, 60), refreshed, maxRefreshes));
@@ -1658,6 +1790,18 @@ namespace GeZi.Core.Download
             _streamMap = null;
             _boostImpl = null;
 
+            // 【2026-10-25 新增】直链放进"可热切换的盒子"。
+            //
+            // worker 闭包通过 linkBox.Url 取链，而不是捕获参数 url ——
+            // 这样后台预取任务换链时，**在飞的连接不受影响**，
+            // 只有"下一次建连"才会用上新链，属于无损热切换。
+            var linkBox = new LinkBox
+            {
+                Url = url,
+                IssuedTicks = DateTime.UtcNow.Ticks,
+                Version = 0,
+            };
+
             var parts = Split(total, _threads);
             string metaPath, partsDirBase;
             ResolvePaths(dest, out partsDirBase, out metaPath);
@@ -1907,6 +2051,10 @@ namespace GeZi.Core.Download
             // ---- 动态窃取的配套状态（2026-10-24 从原版补回）----
             var splitLock = new object();   // 保护 plan.Parts.Add + queue.Enqueue 的原子性
             int splitCount = 0;             // 累计切分次数（诊断用）
+            // 【2026-10-31 尾部收缩】累计因"均分给所有连接"而追加的片数（诊断用）。
+            // 与 splitCount 分开统计：前者是"切一刀变两片"，后者是"切 N 刀变 N+1 片"，
+            // 混在一起看不出收尾到底摊薄到了什么程度。
+            int tailShrinkCount = 0;
 
             // ---------------- 边下边播：优先分片 ----------------
             // 播放器的 Range 请求会走到 _boostImpl：把覆盖该区间的分片塞进优先队列。
@@ -2287,6 +2435,124 @@ namespace GeZi.Core.Download
                 // workerCount 要等分片规划完成后才知道，但诊断日志在 reporter 里就要用，
                 // 所以用一个可写盒把它桥接过去。
                 int workerCountBox = 0;
+
+                // ==================== 【2026-10-25 新增】主动预取直链 ====================
+                //
+                // 【要解决什么｜用户实测】
+                // 669MB 的文件下到 665MB（99.3%）时，连接数从 240 骤降到 4，
+                // 速度 0 B/s，卡住十几分钟。事后测那条直链 → **HTTP 403**（签名过期）。
+                //
+                // 【为什么原来的自愈不够】
+                // 原逻辑是"等 401/403/412 出现 → 让所有 worker 停下 → 外层换链"。
+                // 问题有三：
+                //   ① 从"链刚失效"到"所有 worker 都撞上 403"之间，一直在白跑；
+                //   ② 收尾阶段只剩少数分片时，撞 403 的 worker 直接 return 不再领片，
+                //      于是"看着在下载、其实已经没人干活"（本次就是这个形态）；
+                //   ③ 换链后所有连接重建，又要重新慢启动。
+                //
+                // 【现在的做法】在链**还没过期**时就提前换好，放进 linkBox：
+                //   · 只换盒子里的引用，**不掐断任何在飞连接** —— 零成本热切换；
+                //   · worker 下次建连自然用新链，不用等报错、不用重建已有连接；
+                //   · 真遇到 403 时也还有兜底（外层那套自愈逻辑完全保留）。
+                //
+                // ⚠️ 为什么按"时间"而不是"剩余字节"：快下完时剩余字节很少，
+                //    但**链可能刚好在这一刻过期**——本次故障正是如此
+                //    （只剩 4MB，却 0 B/s）。按时间预取才能覆盖这种形态。
+                var prefetchStop = new CancellationTokenSource();
+                if (LinkRefresher != null)
+                {
+                    var prefetchTask = Task.Run(async () =>                    {
+                        long lastPrefetchTicks = 0;
+                        while (!prefetchStop.IsCancellationRequested && !cancelToken.IsCancellationRequested)
+                        {
+                            try { await Task.Delay(PrefetchTickSec * 1000, prefetchStop.Token).ConfigureAwait(false); }
+                            catch { return; }
+
+                            try
+                            {
+                                // 已经下完就没什么好预取的了
+                                if (Interlocked.Read(ref done) >= total) continue;
+                                if (pause != null && pause.IsPaused) continue;
+
+                                long issued = Interlocked.Read(ref linkBox.IssuedTicks);
+                                if (issued <= 0) continue;
+                                double ageSec = (DateTime.UtcNow - new DateTime(issued, DateTimeKind.Utc)).TotalSeconds;
+
+                                // ---- 判定"该不该提前换链" ----
+                                //
+                                // 【2026-10-25 用户提出的形态】「快下载完之前就做好预防：
+                                // 提前请求新链，防止后续无法连接」——正是本次故障
+                                // （669MB 下到 665MB，链过期，剩 4MB 却 0 B/s）。
+                                //
+                                // 两个触发条件，命中任一即预取：
+                                //   ① 时间维度：链已用超过 TTL 的 50%（见 PrefetchAtTtlRatio）
+                                //      —— 覆盖"下载很久、链快到期"的常规场景。
+                                //   ② 收尾维度：**已经进入收尾阶段**（剩余字节不多）
+                                //      且链已用超过 TTL 的 20%。
+                                //      为什么需要它：若下载很快（例如 30 秒就快下完），
+                                //      时间维度永远到不了 50%，但恰恰在这个节骨眼上
+                                //      链一过期就前功尽弃 —— 用户遇到的就是这种。
+                                //      20% 的门槛避免刚开始就乱换链。
+                                long doneNow = Interlocked.Read(ref done);
+                                long remainBytes = total - doneNow;
+
+                                // 收尾门槛：剩余不到 32MB，或剩余比例不到 5%
+                                bool nearFinish = remainBytes > 0
+                                    && (remainBytes <= 32L * 1024 * 1024
+                                        || (total > 0 && remainBytes * 20 <= total));
+
+                                bool dueByTime = ageSec >= LinkTtlSeconds * PrefetchAtTtlRatio;
+                                bool dueByTail = nearFinish && ageSec >= LinkTtlSeconds * 0.2;
+
+                                if (!dueByTime && !dueByTail) continue;
+
+                                // 节流：两次预取至少间隔 PrefetchMinIntervalSec
+                                long nowTicks = DateTime.UtcNow.Ticks;
+                                if (lastPrefetchTicks != 0
+                                    && (nowTicks - lastPrefetchTicks) < TimeSpan.FromSeconds(PrefetchMinIntervalSec).Ticks)
+                                    continue;
+
+                                lastPrefetchTicks = nowTicks;
+                                Log?.Invoke(string.Format(
+                                    "正在提前换链（{0}）：当前直链已用 {1} 秒（TTL {2} 秒），"
+                                    + "为防下到最后因签名过期而卡死，先取一条新链备用。",
+                                    dueByTail && !dueByTime
+                                        ? "已进入收尾，剩余 " + Fmt(remainBytes)
+                                        : "链已用掉一半寿命",
+                                    (int)ageSec, LinkTtlSeconds));
+
+                                string fresh = null;
+                                try { fresh = await LinkRefresher(prefetchStop.Token).ConfigureAwait(false); }
+                                catch (OperationCanceledException) { return; }
+                                catch (Exception ex) { Log?.Invoke("提前换链失败（不影响当前下载）: " + ex.Message); }
+
+                                if (string.IsNullOrEmpty(fresh)
+                                    || string.Equals(fresh, linkBox.Url, StringComparison.Ordinal))
+                                {
+                                    // 拿不到新链 / 与旧链相同：把计时重置，过一会儿再试，
+                                    // **绝不阻断下载** —— 现有链还能用。
+                                    Interlocked.Exchange(ref linkBox.IssuedTicks, DateTime.UtcNow.Ticks);
+                                    continue;
+                                }
+
+                                linkBox.Url = fresh;
+                                Interlocked.Exchange(ref linkBox.IssuedTicks, DateTime.UtcNow.Ticks);
+                                Interlocked.Increment(ref linkBox.Version);
+                                // 桥接给外层主循环：万一预取的新链也立刻被限，外层可以直接用它
+                                _prefetchedUrl = fresh;
+                                Log?.Invoke("已提前换用新直链（在飞连接不受影响，下次建连自动用新链）。");
+                            }
+                            catch (Exception ex)
+                            {
+                                // 预取是"锦上添花"，任何异常都不能影响下载本身
+                                try { Log?.Invoke("提前换链异常（已忽略）: " + ex.Message); } catch { }
+                            }
+                        }
+                    }, prefetchStop.Token);
+                    // 不 await：它是后台守护任务，随 prefetchStop 一起结束。
+                    // 用 _ = 显式表示"故意不等待"，避免编译器警告被当成疏漏。
+                    _ = prefetchTask;
+                }
 
                 var reporter = Task.Run(async () =>
                 {
@@ -2918,6 +3184,30 @@ namespace GeZi.Core.Download
                 }
 
                 var workers = new Task[workerCount];
+
+                /// <summary>
+                /// 是否**所有分片都已下完**（用于判断 worker 该不该退出）。
+                ///
+                /// <para>【2026-10-25 新增】原来 worker 只看"队列空了"就退出，
+                /// 但队列空 ≠ 活干完（见 worker 循环里那段长注释）。这里给一个
+                /// 真正的完成判据：逐片比较已写字节与片长。</para>
+                /// <para>代价：O(片数) 遍历，而片数上限 16384、且只在线程找不到活时才调，
+                /// 不是热路径，可以接受。</para>
+                /// </summary>
+                bool AllPartsDone()
+                {
+                    try
+                    {
+                        for (int i = 0; i < plan.Parts.Count; i++)
+                        {
+                            var p = plan.Parts[i];
+                            if (p.W < p.E - p.S + 1) return false;
+                        }
+                        return true;
+                    }
+                    catch { return true; }   // 读不到就认为完成，避免 worker 永久悬挂
+                }
+
                 // 分批开连接的闸门（Gopeed slowStartController 思路，2026-10-24 从原版补回）。
                 // 光靠时间错峰不保证前一批已建好连接 —— 见 SlowStartGate 的注释。
                 var slowStartGate = new SlowStartGate(workerCount);
@@ -2963,7 +3253,67 @@ namespace GeZi.Core.Download
                             // 同一片可能同时还在普通队列里，claimed 保证只下一次。
                             int idx;
                             bool fromBoost = boostQueue.TryDequeue(out idx);
-                            if (!fromBoost && !queue.TryDequeue(out idx)) break;
+
+                            // ==================== 【2026-10-25 关键修复】====================
+                            // 「快下完时连接数骤降、速度掉到几 KB/s」的真正根因。
+                            //
+                            // 【用户实测】887MB 的 exe 下到 96.3%（剩 30MB）时，
+                            // 连接从 251/256 掉到 **62/256**、速度只剩 5.73 KB/s。
+                            // 查 qmeta：**64 个分片未完成，片大小都正常（1MB），
+                            // 剩余总量 30MB** —— 说明活是够的，是**没人去干**。
+                            //
+                            // 【根因】这里原来是：
+                            //     if (!fromBoost && !queue.TryDequeue(out idx)) break;
+                            // 队列一空 worker 就**永久退出**。收尾阶段的连锁反应：
+                            //   ① 剩 64 片 → 前 64 个 worker 各领一片，队列空；
+                            //   ② 其余 192 个 worker 立刻 break 回家，**再也不回来**；
+                            //   ③ 那 64 片里只要有几片慢/被抢占重新入队，
+                            //      **没有任何 worker 会去接**（回家的不会回来）；
+                            //   ④ 于是并发从 256 塌到 62，再塌到个位数，速度归零。
+                            // 这不是"服务端限速"，是客户端自己把工人全遣散了。
+                            //
+                            // 【修法】队列空不再等于"活干完了"，而是"暂时没活"：
+                            //   · 只要**还有分片没下完**（其它 worker 手上还有活，或
+                            //     稍后会被抢占/切分放回来），就短暂等待后重试；
+                            //   · 只有真的**全部完成**、或已被取消，才退出。
+                            // 等待用 200ms 轮询：开销可忽略（只是读个计数器），
+                            // 却能把"收尾阶段并发塌缩"这个顽疾从根上治掉。
+                            //
+                            // ⚠️ 必须有退出条件，否则 worker 会永久悬挂：
+                            //   ① 全部完成 → 退出；
+                            //   ② 外部取消 → 退出；
+                            //   ③ 长时间（>60s）既没片可领、进度也不动 → 退出，
+                            //      把判断交给看门狗（它会给出"停滞"结论并换链）。
+                            if (!fromBoost && !queue.TryDequeue(out idx))
+                            {
+                                if (AllPartsDone())
+                                    break;      // 真的全下完了，正常收工
+
+                                // 等到有活、或确实没指望了
+                                int idleWaitMs = 0;
+                                bool gotWork = false;
+                                while (idleWaitMs < WorkerIdleGiveUpMs)
+                                {
+                                    if (cancelToken.IsCancellationRequested) return;
+                                    if (AllPartsDone()) break;
+
+                                    if (queue.TryDequeue(out idx)) { gotWork = true; break; }
+                                    if (boostQueue.TryDequeue(out idx)) { gotWork = true; fromBoost = true; break; }
+
+                                    try { await Task.Delay(200, cancelToken).ConfigureAwait(false); }
+                                    catch (OperationCanceledException) { return; }
+                                    idleWaitMs += 200;
+                                }
+
+                                if (!gotWork)
+                                {
+                                    // 等够了还是没有活：要么真完成（上面判过），
+                                    // 要么卡在别人手里 —— 让看门狗去处理。
+                                    break;
+                                }
+                            }
+                            // =================================================================
+
                             if (Interlocked.CompareExchange(ref claimed[idx], 1, 0) != 0)
                                 continue;
 
@@ -3009,7 +3359,85 @@ namespace GeZi.Core.Download
                                 if (queue.Count < workerCount / 2 && plan.Parts.Count < partCapacity)
                                 {
                                     long remainHere = (part.E - part.S + 1) - part.W;
-                                    if (remainHere >= 2 * MinStealBytes)
+
+                                    // 【2026-10-25 修：切分门槛必须按**实际片大小**自适应】
+                                    //
+                                    // 【用户实测】887MB 的 exe 收尾时 64 片未完成、
+                                    // 每片 1,048,878 字节，并发却只有 62 路、5.73 KB/s。
+                                    // 明明还有活、还有空闲 worker，为什么切不动？
+                                    //
+                                    // 原判据是 `remainHere >= 2 * MinStealBytes`，
+                                    // 而 MinStealBytes 固定 512KB → 门槛 **1,048,576**。
+                                    // 片大小恰好是 1,048,878 —— 只多 302 字节！
+                                    // 也就是说：**只有完全没开始下（W==0）的片才勉强够切**，
+                                    // 只要下过一点点就永远切不动 → 动态窃取在收尾阶段
+                                    // 完全失效，剩下几个大片只能靠少数连接慢慢磨。
+                                    //
+                                    // 修法：门槛跟着"本任务单片均值"走，只要求切出来的
+                                    // 两半各自还有意义（至少 64KB），并保留 MinStealBytes
+                                    // 作为上限，避免极小的片被无限切碎。
+                                    long avgPartBytes = total / Math.Max(1, plan.Parts.Count);
+                                    long stealFloor = Math.Max(64L * 1024, avgPartBytes / 2);
+                                    if (stealFloor > 2 * MinStealBytes) stealFloor = 2 * MinStealBytes;
+
+                                    // ---- 【2026-10-31 尾部收缩】----
+                                    //
+                                    // 先算"此刻还差多少字节没下完"（全任务口径），
+                                    // 用它判断是不是已经进入"路多片少"的收尾形态。
+                                    //
+                                    // ⚠️ 不能只看 queue.Count：动态窃取把片追加进队列后
+                                    //    queue 会短暂变长，但那不代表"活够分"。
+                                    //    真正的判据是"剩余字节 / 在飞路数" ——
+                                    //    每路不足 1MB 时，再怎么按整片发牌都会空转。
+                                    long remainTotal = 0;
+                                    for (int pi = 0; pi < plan.Parts.Count; pi++)
+                                    {
+                                        var pp = plan.Parts[pi];
+                                        long left = (pp.E - pp.S + 1) - Volatile.Read(ref pp.W);
+                                        if (left > 0) remainTotal += left;
+                                    }
+
+                                    int inflightNow = Math.Max(1, workerCount);
+                                    bool tailShrink = remainTotal > 0
+                                        && remainTotal < inflightNow * TailShrinkPerWorkerBytes;
+
+                                    // 尾部收缩时，把这一片**均分给剩余的在飞连接**，
+                                    // 而不是只切一半。目标：每条连接都有活干。
+                                    if (tailShrink)
+                                    {
+                                        // 还差多少条"空转连接"需要喂：
+                                        // 用剩余字节 / 期望片大小估算，至少切 2 份。
+                                        long wantSlice = Math.Max(TailShrinkMinBytes,
+                                                                  remainTotal / inflightNow);
+                                        int slices = (int)Math.Min(64, Math.Max(2, remainHere / wantSlice));
+                                        long sliceBytes = remainHere / slices;
+
+                                        if (sliceBytes >= TailShrinkMinBytes)
+                                        {
+                                            // 自己留第一份，其余追加进队列。
+                                            // 只改 E 与追加新片，**不动任何已有的 W** →
+                                            // 断点续传元数据天然兼容（见常量处的说明）。
+                                            long cutAt = part.S + part.W;      // 从已写位置开始切
+                                            long endNow = part.E;
+                                            part.E = cutAt + sliceBytes - 1;
+                                            lock (splitLock)
+                                            {
+                                                for (int k = 1; k < slices; k++)
+                                                {
+                                                    long s2 = cutAt + k * sliceBytes;
+                                                    long e2 = (k == slices - 1)
+                                                        ? endNow
+                                                        : s2 + sliceBytes - 1;
+                                                    if (s2 > endNow) break;
+                                                    plan.Parts.Add(new PartPlan { S = s2, E = Math.Min(e2, endNow), W = 0 });
+                                                    queue.Enqueue(plan.Parts.Count - 1);
+                                                }
+                                            }
+                                            Interlocked.Increment(ref splitCount);
+                                            Interlocked.Add(ref tailShrinkCount, slices - 1);
+                                        }
+                                    }
+                                    else if (remainHere >= stealFloor)
                                     {
                                         long mid = part.S + part.W + remainHere / 2;
                                         long oldEnd = part.E;
@@ -3140,7 +3568,10 @@ namespace GeZi.Core.Download
 
                                     try
                                     {
-                                        using (var req = BuildRequest(HttpMethod.Get, url, h))
+                                        // 【2026-10-25】从盒子取当前直链：
+                                        // 后台预取任务换链后，这里自然读到新链。
+                                        string curUrl = linkBox.Url;
+                                        using (var req = BuildRequest(HttpMethod.Get, curUrl, h))
                                         using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ioTok).ConfigureAwait(false))
                                         {
                                             int code = (int)resp.StatusCode;
@@ -3373,6 +3804,11 @@ namespace GeZi.Core.Download
                 }
                 finally
                 {
+                    // 【2026-10-25】先停掉"提前换链"的后台任务：
+                    // 下载都结束了还去刷取链接口毫无意义，而且会占着并发额度。
+                    try { prefetchStop.Cancel(); } catch { }
+                    try { prefetchStop.Dispose(); } catch { }
+
                     // 【顺序很关键】先把"worker 已全部结束"告诉 reporter，
                     // 再排空合并线程 —— 这期间 reporter 仍在跑，UI 能看到「正在合并分片」。
                     //

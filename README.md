@@ -4,7 +4,7 @@
 > 多线程分片下载、边下边播、多账号管理、深色模式。
 > 基于 **.NET Framework 4.8 + WPF** 开发，**零 NuGet 依赖、可完全离线构建**。
 >
-> **当前版本：v2.8.8** · [更新日志](#-更新日志) · [下载](https://github.com/zeroyong/gezi-quark-downloader-main/releases)
+> **当前版本：v2.8.9** · [更新日志](#-更新日志) · [下载](https://github.com/zeroyong/gezi-quark-downloader-main/releases)
 
 <p align="center">
   <img src="src/GeZi/Resources/app-logo.png" width="120" alt="鸽子下载">
@@ -81,7 +81,7 @@
 
 ### 方式一：下载发行版（推荐）
 
-1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.8.8-win64.zip` 并解压到任意目录
+1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.8.9-win64.zip` 并解压到任意目录
 2. 双击 `GeZi.exe` 即可运行
 3. 若系统缺少 .NET Framework 4.8，Windows 会弹窗提示，按引导安装即可
 
@@ -145,7 +145,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\package.ps1
 | 夸克网盘分享（回退） | `https://pan.quark.cn/s/065af2172c40`（提取码 `VD8m`） | 分享内 `GeZi-vX.Y.Z-win64.zip` |
 
 双源并发检查，取**版本号更高者**；版本相同时优先 GitHub。无论是哪个源，更新都**不会回退到更低版本**。
-当前应用版本号从程序集读取（如 `2.8.8`），更新检测据此判断是否有新版本。
+当前应用版本号从程序集读取（如 `2.8.9`），更新检测据此判断是否有新版本。
 
 > 说明（方案选择）：一键更新采用「解压覆盖 + 外部小脚本接力」的方式 —— 主进程先退出，
 > 再由 `gezi-updater.cmd` 用 `xcopy` 覆盖文件并拉起新版本，避免「程序自我覆盖」的占用冲突。
@@ -206,7 +206,62 @@ GeZi/
 > 每条都写清楚「**原来怎样 → 现在怎样**」，方便对比。完整改动见
 > [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases)。
 
-### v2.8.8（当前）
+### v2.8.9（当前）
+
+**修复：收尾阶段掉速 —— 只剩一点点却慢到几十 B/s**
+
+用户实测：2.6GB 的文件下到 99.8%，界面显示 `0/256 连接`、速度 32 B/s，
+剩余时间从 46 分钟一路涨。
+
+根因不在"检测"，而在**分片粒度**。原来的动态窃取只会把一片切成**两半**：
+
+| 剩余量 / 32 路 | 切半（原来） | 均分（现在） |
+|---|---|---|
+| 剩 500KB | 2 路在跑，30 路空转 | 32 路各领 ~15KB，全在跑 |
+| 剩 8MB | 8 路在跑，24 路空转 | 32 路各领 256KB，全在跑 |
+
+所以 v2.8.8 修的那五处（412 收兵、tailStall 动态阈值、慢速爬行检测、收尾判据相对化）
+都是"检测到慢了怎么补救"，而真正该改的是"发牌方式"。
+
+**这次的修法：移植 YunX 的「尾部收缩」**
+
+当剩余未完成字节 < 在飞路数 × 1MB 时，把当前片按
+`sliceBytes = max(64KB, 剩余 / 在飞)` 均分成最多 64 份，让**全部连接**一起冲最后一段。
+
+| 设计决定 | 理由 |
+|---|---|
+| 只做"追加式切分"，不动已有区间 | 区间只被切细、从不重排 → `.qmeta` 里每片的已写字节全部对得上，**断点续传天然兼容** |
+| 下限 64KB | 对齐 YunX 的 `MIN_TAIL_BLOCK`；再小则 Range 与建连开销超过"多一路并行"的收益 |
+| 触发阈值取每路 1MB | 1MB 是 GeZi 的最小分片粒度，剩余不足每路 1MB 时按整片发牌必然空转 |
+| 不整套搬 `ElasticAllocator` | 它每次运行分片区间都可能变，会让 GeZi 的 `.qmeta` 续传直接失效 |
+
+**关于「合并后目标文件大小不符」**
+
+收尾卡住后重试，可能看到：
+
+```
+失败：合并后目标文件大小不符：期望 2600561695，实际 2401647195。
+分片与进度已保留，可重试续传。
+```
+
+这**不是**数据损坏，而是一道保护 —— 合并后校验发现目标文件没长到应有大小，
+宁可报错也不交付残缺文件。**分片与 `.qmeta` 都完好保留**，点重试即可从断点续传补齐，
+已下载的 2.4GB 不会重下。
+
+<p align="center">
+  <img src="assets/image-20261031175430918.png" width="620" alt="失败例子：合并后目标文件大小不符">
+  <br>
+  <sub>▲ 失败例子：收尾停滞 → 合并校验不通过</sub>
+</p>
+<p align="center">
+  <img src="assets/image-20261031175737983.png" width="620" alt="重试成功">
+  <br>
+  <sub>▲ 重试成功：从断点续传补齐，无需重下</sub>
+</p>
+
+---
+
+### v2.8.8
 
 **新增：在默认浏览器里「边下边播」**
 
