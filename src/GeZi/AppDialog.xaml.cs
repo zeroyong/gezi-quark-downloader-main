@@ -39,6 +39,13 @@ namespace GeZi
         private MessageBoxResult _result = MessageBoxResult.None;
         private MessageBoxResult _defaultResult = MessageBoxResult.OK;
 
+        /// <summary>
+        /// 用户是否**直接关掉了弹窗**（右上角 X / Esc），而不是点了某个按钮。
+        /// <para>【2026-11-03 新增】见 <see cref="ShowWithDontAsk"/> 的 dismissed 参数说明：
+        /// "关闭弹窗"与"选了次按钮"必须能分开，否则调用方只能把误点当成明确选择。</para>
+        /// </summary>
+        private bool _dismissed;
+
         private AppDialog()
         {
             InitializeComponent();
@@ -109,10 +116,26 @@ namespace GeZi
         /// 右边 <paramref name="secondaryText"/>（次按钮，返回 <see cref="MessageBoxResult.Cancel"/>）。
         /// </summary>
         /// <param name="dontAskAgain">输出：用户是否勾选了「此后不再提示」</param>
-        /// <returns>主按钮 = OK，次按钮 = Cancel，右上角 X / Esc = Cancel</returns>
+        /// <param name="dismissed">
+        /// 输出：用户是否**直接关掉了弹窗**（点右上角 X / 按 Esc），而不是点了某个按钮。
+        ///
+        /// <para>【为什么需要这个参数】2026-11-03 用户报的 bug：
+        /// 「打开软件点 X 图标弹出弹窗选项，最小化和直接退出。但是此时如果点选项弹窗的 X
+        /// 的话就直接退出了。正常软件逻辑应该是关闭弹窗不退出，视作用户误点击」。</para>
+        ///
+        /// <para>根因：点 X / 按 Esc 走 <see cref="OnCancel"/>，返回 <c>Cancel</c>；
+        /// 而「直接退出程序」那个**次按钮**的 Tag 也是 <c>Cancel</c> ——
+        /// 两种完全不同的意图拿到同一个返回值，调用方根本分不开，
+        /// 只能把"关弹窗"当成"选了退出"。</para>
+        ///
+        /// <para>现在把两者分开：按钮仍然返回自己的 Tag，而 <c>dismissed=true</c>
+        /// 明确表示"这是关闭动作，不是选择"。调用方见到它就当用户没做选择。</para>
+        /// </param>
+        /// <returns>主按钮 = OK，次按钮 = Cancel，右上角 X / Esc = Cancel 且 dismissed = true</returns>
         public static MessageBoxResult ShowWithDontAsk(Window owner, string text, string title,
                                                        string primaryText, string secondaryText,
-                                                       MessageBoxImage icon, out bool dontAskAgain)
+                                                       MessageBoxImage icon, out bool dontAskAgain,
+                                                       out bool dismissed)
         {
             var dlg = new AppDialog();
             if (owner != null && owner.IsVisible)
@@ -139,6 +162,7 @@ namespace GeZi
 
             dlg.ShowDialog();
             dontAskAgain = dlg.DontAskCheck.IsChecked == true;
+            dismissed = dlg._dismissed;
             return dlg._result;
         }
 
@@ -439,6 +463,10 @@ namespace GeZi
         private void OnCancel(object sender, RoutedEventArgs e)
         {
             StopCountdown();
+            // 【2026-11-03】标记"这是关闭动作，不是选择"。
+            // 调用方靠它把"点 X 关掉弹窗"和"点了次按钮"区分开 ——
+            // 两者都返回 Cancel，只看返回值永远分不开。
+            _dismissed = true;
             // 点右上角 X：行为跟"取消/否"一致
             switch (_result)
             {

@@ -28,6 +28,22 @@ namespace GeZi.Core.Download
         public string Url { get; set; } = "";
         public string Dest { get; set; } = "";
         public string Cookie { get; set; } = "";
+
+        /// <summary>
+        /// 下载身份上下文（2026-11-02 新增，网盘抽象 P0）。
+        ///
+        /// <para>null = 走夸克默认（兼容老调用点）。非 null 时下载器完全按它发请求，
+        /// 这才是 UC 等其它网盘能正确下载的前提 —— 仅靠 <see cref="Cookie"/>
+        /// 一个字符串撑不起"Origin / Referer / 种子域 / 额外头"这些平台差异。</para>
+        /// </summary>
+        public DownloadContext Context { get; set; }
+
+        /// <summary>
+        /// 本条任务属于哪个网盘（"quark" / "uc" / …）。断点续传时靠它选回正确的客户端——
+        /// 否则切过平台之后，旧任务会拿着当前全局客户端去取链，轻则 403，重则认错文件。
+        /// </summary>
+        public string ProviderId { get; set; } = "quark";
+
         /// <summary>0 表示用默认线程数。</summary>
         public int Threads { get; set; } = 0;
 
@@ -134,6 +150,17 @@ namespace GeZi.Core.Download
         public string Token { get; set; }
         /// <summary>是否来自分享（否则为"我的网盘"）。</summary>
         public bool FromShare { get; set; }
+
+        /// <summary>
+        /// 这条任务属于哪个网盘（"quark" / "uc"）。
+        ///
+        /// <para>【2026-11-02 新增，网盘抽象 P0】续传时必须靠它选回**正确的**客户端。
+        /// 续传元数据是跨会话/跨平台的 —— 用户可能在夸克下到一半、切去 UC，
+        /// 回头再续夸克那个任务。若按"当前全局客户端"去取链，轻则 403，重则认错文件。
+        /// 空值按 "quark" 处理（兼容老元数据）。</para>
+        /// </summary>
+        public string ProviderId { get; set; } = "quark";
+
         /// <summary>相对目录（含尾部分隔符时也算合法），用于重建目标路径。</summary>
         public string RelDir { get; set; }
 

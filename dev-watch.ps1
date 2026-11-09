@@ -84,8 +84,26 @@ function Build-And-Run {
     Stop-App
     Start-Sleep -Milliseconds 250
 
-    & $dotnet build $proj -c Debug --nologo -v minimal
-    if ($LASTEXITCODE -ne 0) {
+    # 【2026-11-02】只把 error 打到控制台。
+    # 原来 -v minimal 会把 10 条 NU1900/CS0649 警告也刷出来，
+    # 连续改界面时满屏都是警告，真正有用的错误反而被淹没。
+    #
+    # ⚠️ 成败判定不能依赖 $LASTEXITCODE：
+    #    `& $dotnet ... 2>&1` 走管道后它在某些情况下不可靠（实测"成功却判失败"）。
+    # ⚠️ 也不能用中文标记判断（如 "已成功生成"）：PowerShell 5.1 按 ANSI 读本脚本，
+    #    UTF-8 中文字面量会乱码导致语法错误（实测踩到）。
+    #    改用"有没有 error 行" + "有没有输出 exe 路径"两个纯 ASCII 判据。
+    $log = & $dotnet build $proj -c Debug --nologo -v minimal 2>&1
+    $logText = ($log | Out-String)
+
+    $hasError = $logText -match 'error [A-Z]{2,}\d+'
+    $producedExe = $logText -match 'GeZi\.exe'
+    $failed = $hasError -or (-not $producedExe)
+
+    if ($failed) {
+        $log | Where-Object { $_ -match 'error [A-Z]{2,}\d+' } | ForEach-Object {
+            Write-Host "  $_" -ForegroundColor Red
+        }
         Write-Host "[$ts] BUILD FAILED - fix the error and save again" -ForegroundColor Red
         return
     }

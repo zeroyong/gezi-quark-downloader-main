@@ -133,7 +133,10 @@ namespace GeZi.Core.Download
                 using (var linked = CancellationTokenSource.CreateLinkedTokenSource(globalCancel, job.Cancel.Token))
                 {
                     Report(progress, job, JobState.Downloading);
-                    using (var dl = new SegmentedDownloader(threads: job.Threads, cookie: job.Cookie,
+                    // 【网盘抽象 P0】优先用 job 自带的 DownloadContext；
+                    // 老调用点没有 Context 时退回夸克默认（行为分毫不差）。
+                    var ctx = job.Context ?? DownloadContext.QuarkDefaults(job.Cookie);
+                    using (var dl = new SegmentedDownloader(job.Threads, ctx,
                                writeMode: job.WriteMode, partsRoot: job.PartsRoot))
                     {
                         dl.Log = Log;

@@ -224,5 +224,22 @@ namespace GeZi
 
         [DllImport("kernel32.dll", SetLastError = true)]
         internal static extern bool CloseHandle(IntPtr hObject);
+
+        // ---------------- 【2026-11-02 新增】读取 HttpOnly Cookie（UC 登录用） ----------------
+        //
+        // 【为什么需要】UC 的登录态关键字段 __puus 是 HttpOnly 的，
+        // WebBrowser 的 Document.Cookie 读不到它 —— 只能用 WinINET 的这个 API。
+        //
+        // lpszCookieName 传 null 表示"返回该 URL 的全部 Cookie"；
+        // dwFlags 必须带 INTERNET_COOKIE_HTTPONLY(0x2000)，否则 HttpOnly 项被过滤，
+        // __puus 永远拿不到，登录判定必然失败。
+        [DllImport("wininet.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        internal static extern bool InternetGetCookieEx(
+            string lpszUrl,
+            string lpszCookieName,
+            System.Text.StringBuilder lpszCookieData,
+            ref int lpdwSize,
+            int dwFlags,
+            IntPtr lpReserved);
     }
 }

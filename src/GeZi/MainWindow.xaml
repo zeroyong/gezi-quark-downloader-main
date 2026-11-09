@@ -2640,15 +2640,55 @@
                 <!-- ============ 登录 ============ -->
                 <TabItem Style="{StaticResource HeadlessTabItem}">
                     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0">
-                        <StackPanel Margin="20,18,20,24" MaxWidth="960" HorizontalAlignment="Left">
+                        <!-- 【2026-11-02 UC 全宽】这里必须是 StackPanel（垂直堆叠语义），
+                             不能换成 Grid —— Grid 不加 RowDefinitions 时所有子元素
+                             默认挤在 Row0/Column0 **全部重叠**，布局会彻底错乱。
+                             （我改过一次 Grid 忘了加 Row，实测就是这个后果。）
+                             原来限制宽度的是 MaxWidth="960" + HorizontalAlignment="Left"，
+                             现在把这两个挪到 code-behind 的 ApplyLoginLayout 里动态控制：
+                             · 夸克模式：MaxWidth=960 + Left（保持原样）
+                             · UC 全宽：MaxWidth=∞ + Stretch（撑满） -->
+                        <StackPanel x:Name="LoginPageRoot" Margin="20,18,20,24"
+                                    MaxWidth="960" HorizontalAlignment="Left">
 
                             <TextBlock Text="登录" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
                             <TextBlock Text="登录后可浏览「我的网盘」、转存分享文件；不登录也能用直链下载"
                                        Style="{StaticResource TertiaryText}" Margin="0,0,0,18"/>
 
+                            <!-- ============ 【2026-11-02 新增】平台切换（方案 C）============
+                                 2.9.0 加入 UC 网盘后，登录页要能区分"现在登录的是哪个平台"。
+                                 做成两段式切换而不是并排双卡：
+                                   · 两个平台的操作完全一样（都是扫码/WebView 取 Cookie），
+                                     并排会重复一整套界面；
+                                   · 切换后下方的扫码卡与账号列表整体替换，语义更清晰。
+                                 选中态用 PrimaryLight 底 + Primary 描边，与全局强调色一致。 -->
+                            <Border Style="{StaticResource Card}" Padding="6" Margin="0,0,0,14"
+                                    HorizontalAlignment="Left">
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="PlatformQuarkBtn" Click="OnPlatformSwitch"
+                                            Tag="quark" Style="{StaticResource PlatformTabOn}">
+                                        <TextBlock Text="夸克网盘" FontSize="13" FontWeight="SemiBold"/>
+                                    </Button>
+                                    <Button x:Name="PlatformUcBtn" Click="OnPlatformSwitch"
+                                            Tag="uc" Style="{StaticResource PlatformTabOff}" Margin="4,0,0,0">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="UC 网盘" FontSize="13" FontWeight="SemiBold"/>
+                                            <!-- 未登录时的小红点：让用户一眼看到"还有个平台没登录" -->
+                                            <Border x:Name="UcUnreadDot" Width="6" Height="6"
+                                                    CornerRadius="3" Margin="6,0,0,0"
+                                                    VerticalAlignment="Center"
+                                                    Background="{DynamicResource DangerBrush}"/>
+                                        </StackPanel>
+                                    </Button>
+                                </StackPanel>
+                            </Border>
+
                             <!-- 左右分栏：左=扫码（主操作，视觉最重），右=状态/导入导出/账号管理
-                                 之前是单列 640 宽，屏幕大时右侧大片空白，内容全挤在左边。 -->
-                            <Grid>
+                                 之前是单列 640 宽，屏幕大时右侧大片空白，内容全挤在左边。
+
+                                 【2026-11-02 定稿】UC 与夸克同构，都是扫码 + Cookie 导入，
+                                 不再有内嵌浏览器，两栏布局对两个平台都适用。 -->
+                            <Grid x:Name="LoginColumns">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="Auto"/>
                                     <ColumnDefinition Width="*"/>
@@ -2659,9 +2699,14 @@
                                      整卡 VerticalAlignment=Stretch 与右列等高；
                                      二维码行用 * 吸收多余高度并垂直居中 —— 这样无论
                                      登录前后、窗口多大，左右两列外轮廓都是同一个矩形。 -->
-                                <Border Grid.Column="0" Style="{StaticResource PrimaryCard}"
+                                <Border x:Name="LoginLeftCard" Grid.Column="0" Style="{StaticResource PrimaryCard}"
                                         Width="304" VerticalAlignment="Stretch">
                                     <Grid>
+                                        <!-- 【2026-11-02】两套互斥内容：
+                                             UcQrArea        = 扫码/登录区（未登录，或平台是夸克）
+                                             UcLoggedInPanel = 已登录的账号信息（仅 UC 登录后显示）
+                                             code-behind 的 ShowUcLoggedInPanel() 负责切换。 -->
+                                        <Grid x:Name="UcQrArea">
                                         <Grid.RowDefinitions>
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="*"/>
@@ -2670,22 +2715,26 @@
 
                                         <StackPanel Grid.Row="0">
                                             <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
-                                                <Path Data="{StaticResource IconQr}" Stretch="Uniform"
+                                                <Path x:Name="LoginCardIcon" Data="{StaticResource IconQr}" Stretch="Uniform"
                                                       Width="16" Height="16" VerticalAlignment="Center"
                                                       Stroke="{DynamicResource PrimaryBrush}"
                                                       StrokeThickness="1.8"
                                                       StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                                                <TextBlock Text="扫码登录"
+                                                <TextBlock x:Name="LoginCardTitle" Text="扫码登录"
                                                            Style="{StaticResource CardTitleText}"
                                                            Margin="7,0,0,0" FontSize="15"/>
                                             </StackPanel>
-                                            <TextBlock Text="用手机「夸克 App」扫描二维码并在手机上确认"
+                                            <TextBlock x:Name="QrHintText"
+                                                       Text="用手机「夸克 App」扫描二维码并在手机上确认"
                                                        Style="{StaticResource TertiaryText}"
                                                        TextWrapping="Wrap" Margin="0,0,0,14"/>
                                         </StackPanel>
 
-                                        <!-- 二维码：固定 264×264 占位框，未生成时显示提示，避免高度跳变 -->
-                                        <Grid Grid.Row="1" Height="264" Margin="0,0,0,14"
+                                        <!-- 二维码 / UC 登录页区
+                                             【2026-11-02】UC 模式下这块要撑满卡片剩余高度，
+                                             不再固定 264px（用户反馈"那么小个窗口看起来很难受"）。
+                                             夸克模式仍按 264 高度居中显示二维码，由 code-behind 切高度。 -->
+                                        <Grid x:Name="QrOrWebArea" Grid.Row="1" Height="264" Margin="0,0,0,14"
                                               VerticalAlignment="Center">
                                             <!-- ⚠️ Background="White" 是**故意硬编码**的，不要改成 DynamicResource：
                                                  二维码必须是"深色模块 + 白色静默区"才能被手机扫出来。
@@ -2721,6 +2770,7 @@
                                                                FontSize="11.5"/>
                                                 </StackPanel>
                                             </Border>
+
                                         </Grid>
 
                                         <!-- 按钮 + 状态：
@@ -2747,7 +2797,7 @@
                                                               StrokeThickness="1.8"
                                                               StrokeStartLineCap="Round"
                                                               StrokeEndLineCap="Round"/>
-                                                        <TextBlock Text="获取二维码" Margin="7,0,0,0"
+                                                        <TextBlock x:Name="QrLoginBtnText" Text="获取二维码" Margin="7,0,0,0"
                                                                    VerticalAlignment="Center"/>
                                                     </StackPanel>
                                                 </Button>
@@ -2784,13 +2834,82 @@
                                                 </StackPanel>
                                             </Border>
                                         </Grid>
+                                        </Grid>
+                                        <!-- /UcQrArea -->
+
+                                        <!-- ============ 【2026-11-02】UC 已登录：账号信息 ============
+                                             用户要求：「登录成功后 再切换成现在布局 并且展示用户的信息」。
+                                             登录后二维码已无用，这块替换掉整个扫码区（默认折叠，
+                                             由 code-behind 的 ShowUcLoggedInPanel 切换显示）。 -->
+                                        <StackPanel x:Name="UcLoggedInPanel" Visibility="Collapsed">
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                                                <Path Data="{StaticResource IconUser}" Stretch="Uniform"
+                                                      Width="16" Height="16" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource SuccessBrush}"
+                                                      StrokeThickness="1.8"
+                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                                <TextBlock Text="已登录"
+                                                           Style="{StaticResource CardTitleText}"
+                                                           Margin="7,0,0,0" FontSize="15"
+                                                           Foreground="{DynamicResource SuccessBrush}"/>
+                                            </StackPanel>
+
+                                            <!-- 头像 + 昵称 -->
+                                            <Grid Margin="0,0,0,18">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Border x:Name="UcAvatarBox" Grid.Column="0"
+                                                        Width="52" Height="52" CornerRadius="26"
+                                                        Background="{DynamicResource PrimaryBrush}"
+                                                        VerticalAlignment="Center">
+                                                    <Grid>
+                                                        <TextBlock x:Name="UcAvatarText" Text="U"
+                                                                   FontSize="20" FontWeight="SemiBold"
+                                                                   Foreground="{DynamicResource TextOnPrimaryBrush}"
+                                                                   HorizontalAlignment="Center"
+                                                                   VerticalAlignment="Center"/>
+                                                        <Image x:Name="UcAvatarImage" Stretch="UniformToFill"
+                                                               Visibility="Collapsed">
+                                                            <Image.Clip>
+                                                                <EllipseGeometry Center="26,26" RadiusX="26" RadiusY="26"/>
+                                                            </Image.Clip>
+                                                        </Image>
+                                                    </Grid>
+                                                </Border>
+                                                <StackPanel Grid.Column="1" Margin="12,0,0,0"
+                                                            VerticalAlignment="Center">
+                                                    <TextBlock x:Name="UcNickText" Text="UC 用户"
+                                                               FontSize="15" FontWeight="SemiBold"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                                    <TextBlock Text="UC 网盘"
+                                                               FontSize="11.5" Margin="0,3,0,0"
+                                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                                </StackPanel>
+                                            </Grid>
+
+                                            <!-- 容量 -->
+                                            <TextBlock Text="存储空间" FontSize="11.5"
+                                                       Margin="0,0,0,7"
+                                                       Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                            <ProgressBar x:Name="UcCapacityBar" Height="6"
+                                                         Minimum="0" Maximum="100" Value="0"
+                                                         BorderThickness="0"
+                                                         Background="{DynamicResource SurfaceSunkenBrush}"
+                                                         Foreground="{DynamicResource SuccessBrush}"/>
+                                            <TextBlock x:Name="UcCapacityText" Text="容量未知"
+                                                       FontSize="12" Margin="0,7,0,0"
+                                                       Foreground="{DynamicResource TextSecondaryBrush}"/>
+                                        </StackPanel>
                                     </Grid>
                                 </Border>
 
                                 <!-- ============ 右列：状态 / 导入导出 / 账号管理 / 提示 ============
                                      三行：状态 Auto / 导入 Cookie Auto / 小贴士 *。
                                      最后一行用 * 吸收剩余高度，右列上下沿与左列严格对齐。 -->
-                                <Grid Grid.Column="1" Margin="16,0,0,0">
+                                <Grid x:Name="LoginRightColumn" Grid.Column="1" Margin="16,0,0,0">
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
@@ -2860,10 +2979,14 @@
                                         <StackPanel>
                                             <TextBlock Text="导入 Cookie" Style="{StaticResource CardTitleText}"
                                                        Margin="0,0,0,6"/>
-                                            <TextBlock Text="扫码不方便时，可从浏览器复制夸克网盘的 Cookie 粘贴进来登录；也可以直接从 Cookie 文件导入。"
+                                            <TextBlock Text="扫码不方便时，可从浏览器复制网盘 Cookie 直接粘贴，粘贴后会自动登录；也可以从 Cookie 文件导入。"
                                                        Style="{StaticResource TertiaryText}"
                                                        TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                            <!-- 【2026-11-02 用户要求】「我是粘贴在输入框里的 应该检测到内容 就自动获取」。
+                                                 TextChanged 里做防抖检测：识别到完整 Cookie（含 __pus 与 __puus）就自动校验登录，
+                                                 不必再手点「导入并登录」。按钮保留作手动兜底与重试入口。 -->
                                             <TextBox x:Name="CookieImportBox" Height="72"
+                                                     TextChanged="OnCookieImportTextChanged"
                                                      Style="{StaticResource AppTextBoxMultiline}"/>
                                             <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
                                                 <Button x:Name="ImportCookieBtn" Content="导入并登录"

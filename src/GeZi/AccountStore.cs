@@ -32,11 +32,24 @@ namespace GeZi
     /// </summary>
     public class AccountProfile
     {
+        /// <summary>
+        /// 【2026-11-02 新增】账号所属平台。
+        /// <para>取值："quark" / "uc"。空串按 "quark" 处理 —— 老档案（2.9.0 之前）没有这个字段，
+        /// 反序列化后为 null，必须默认当成夸克，否则升级后所有老账号都会被判成"未知平台"而不可用。</para>
+        /// </summary>
+        public string Platform { get; set; } = "quark";
+
         /// <summary>账号稳定标识（夸克接口返回的 uid/account_id）。同一账号固定，用于去重与文件名。</summary>
         public string Key { get; set; } = "";
 
         /// <summary>显示昵称。取不到时回退到账号标识。</summary>
         public string Nick { get; set; } = "";
+
+        /// <summary>
+        /// 【2026-11-02 新增】头像 URL。夸克与 UC 都有，取不到为空串。
+        /// <para>UI 侧按 URL 拉图，拉失败时回退到"首字母圆形占位"。</para>
+        /// </summary>
+        public string AvatarUrl { get; set; } = "";
 
         /// <summary>登录 Cookie（明文，落盘前由 Store 用 DPAPI 加密）。</summary>
         public string Cookie { get; set; } = "";
@@ -46,6 +59,18 @@ namespace GeZi
 
         [XmlIgnore]
         public string DisplayName => string.IsNullOrEmpty(Nick) ? Key : Nick;
+
+        /// <summary>
+        /// 【2026-11-02 新增】平台的显示名（UI 直接用）。
+        /// <para>空串/未知一律显示"夸克" —— 与 <see cref="Platform"/> 的默认语义保持一致。</para>
+        /// </summary>
+        [XmlIgnore]
+        public string PlatformName =>
+            string.Equals(Platform, "uc", StringComparison.OrdinalIgnoreCase) ? "UC" : "夸克";
+
+        /// <summary>是否 UC 账号。</summary>
+        [XmlIgnore]
+        public bool IsUc => string.Equals(Platform, "uc", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -105,6 +130,19 @@ namespace GeZi
         /// </summary>
         public static void Save(string key, string nick, string cookie)
         {
+            Save(key, nick, cookie, null, null);
+        }
+
+        /// <summary>
+        /// 【2026-11-02 新增】带平台信息的保存。
+        /// <para>为什么要重载而不是改原签名：<see cref="Save(string,string,string)"/> 有大量
+        /// 调用点（登录、切换账号、导入 Cookie），加参数会全部改动；重载让老调用零改动，
+        /// 新调用（UC 登录）显式传平台。</para>
+        /// </summary>
+        /// <param name="platform">"quark" / "uc"；null 或空表示不改动既有值（老档案默认 quark）。</param>
+        /// <param name="avatarUrl">头像 URL；null 表示不改动。</param>
+        public static void Save(string key, string nick, string cookie, string platform, string avatarUrl)
+        {
             if (string.IsNullOrEmpty(key))
                 return;
             lock (Locker)
@@ -116,6 +154,10 @@ namespace GeZi
                     p.Key = key;
                     if (!string.IsNullOrEmpty(nick))
                         p.Nick = nick;
+                    if (!string.IsNullOrEmpty(platform))
+                        p.Platform = platform;
+                    if (avatarUrl != null)
+                        p.AvatarUrl = avatarUrl;
                     p.Cookie = SecretProtector.Protect(cookie ?? "");
                     p.LastUsedUtc = DateTime.UtcNow;
 

@@ -64,6 +64,16 @@ namespace GeZi.Core.Download
         private readonly HttpClient _http;
 
         /// <summary>
+        /// 本次下载的身份上下文（2026-11-02 新增，网盘抽象 P0）。
+        ///
+        /// <para>以前身份散在 <c>_ua</c> / <c>_referer</c> / <c>_cookie</c> 三个字段 +
+        /// <c>BuildHeaders()</c> 里硬编码的 <c>QuarkConstants.Origin</c> + <c>SeedCookies()</c>
+        /// 里写死的 <c>.quark.cn</c> 域 —— 结果 UC 的下载带着夸克身份，必被 OSS 403。
+        /// 现在全部收到这个字段里，下载器不再认识任何具体网盘。</para>
+        /// </summary>
+        private readonly DownloadContext _ctx;
+
+        /// <summary>
         /// 分片/续传元数据的**根目录**覆盖（null = 与目标文件同级，即默认行为）。
         ///
         /// 支持它的理由（对齐 Python Flet 版的 part_dir）：把分片集中放到另一个盘
@@ -437,13 +447,28 @@ namespace GeZi.Core.Download
         /// 若定到 64KB/s 会把正常收尾判成故障，反复换链反而更慢。</para>
         /// </summary>
         private const double CrawlBps = 16 * 1024;
-
         /// <summary>
         /// 【2026-10-24 新增】慢速爬行要持续多久才判定"该换链"（秒）。
         /// <para>20 秒：既要躲开"分片刚好在换片/建连"的瞬时低谷，
         /// 又不能等太久 —— 实测那次要磨 11 分钟，20 秒介入收益极大。</para>
         /// </summary>
         private const int CrawlSeconds = 20;
+
+        /// <summary>
+        /// 单个 HTTP 请求的总超时（秒）。
+        ///
+        /// <para>【2026-11-09 新增·对齐 YunX】原来 HttpClient 是
+        /// <c>Timeout.InfiniteTimeSpan</c>（完全禁超时），导致被 CDN 挂住的连接
+        /// 在 ReadAsync 上永久阻塞 —— 而 .NET Framework 的内容流读取不响应
+        /// CancellationToken，抢占也掐不断，只能等 TCP 自己超时（数分钟）。
+        /// 这就是"尾部 3/81 连接、0 B/s 卡死"最直接的原因。</para>
+        ///
+        /// <para>YunX 的下载客户端设的是 readTimeout=60s，被挂的连接 60 秒后
+        /// 抛异常 → 重试/抢占 → 尾部只是慢一下。这里取 300 秒是因为 GeZi 的
+        /// 单片可能达数 MB（比 YunX 的弹性块大得多），慢速链路上需要更宽裕的余量。
+        /// 真正"挂住不给数据"的场景 5 分钟内必然触发。</para>
+        /// </summary>
+        private const int DownloadRequestTimeoutSec = 300;
 
         /// <summary>收尾阶段的最低年龄门槛。</summary>
         private const long PreemptEndgameMinAgeMs = 3_000;
@@ -478,7 +503,6 @@ namespace GeZi.Core.Download
         /// 会超过"多一路并行"带来的收益。</para>
         /// </summary>
         private const long TailShrinkMinBytes = 64 * 1024;
-
         /// <summary>
         /// 尾部收缩的触发阈值：剩余**未完成字节**少于「在飞路数 × 此值」时，
         /// 认为已进入"可以均分给所有连接"的收尾形态。
@@ -488,6 +512,36 @@ namespace GeZi.Core.Download
         private const long TailShrinkPerWorkerBytes = 1L * 1024 * 1024;
 
         /// <summary>
+        /// 下载中途"让片"的检查间隔（字节）。每写这么多字节检查一次活跃连接数。
+        /// <para>取 512KB：太小则检查过于频繁（Interlocked 读取 + 队列操作有开销），
+        /// 太大则反应迟钝 —— 10MB 文件若隔 2MB 才查一次，只剩最后 1MB 时才动作就晚了。</para>
+        /// </summary>
+        private const long YieldCheckBytes = 512 * 1024;
+
+        /// <summary>
+        /// 让片时，本片至少要还剩这么多字节才值得切（否则切出来的片太小，纯属开销）。
+        /// <para>【2026-11-09 修】原来是 1MB —— 这是"尾部掉速修不掉"的直接原因。
+        /// 用户实测截图：29.33MB 的文件下到 99.3%、**只剩约 200KB**、1/79 连接、8 B/s。
+        /// 200KB &lt; 1MB，让片逻辑**一次都不会触发**，那 1 路只能以 8 B/s 磨到底。</para>
+        /// <para>改成 64KB，对齐 YunX 的 <c>MIN_TAIL_BLOCK</c>：再小则 Range 请求与
+        /// 建连开销会超过"多一路并行"带来的收益。</para>
+        /// </summary>
+        private const long YieldMinRemainBytes = 64 * 1024;
+
+        /// <summary>
+        /// 让片检查的**时间**间隔（毫秒）。
+        ///
+        /// <para>【2026-11-09 新增·关键】原来这里是按字节触发（每写 512KB 检查一次）。
+        /// 那在**慢速收尾**时是死循环般的失效：用户实测 8 B/s 时，
+        /// 要写满 512KB 需要约 17 小时 —— 检查点永远到不了，让片永不触发。</para>
+        ///
+        /// <para>而收尾期恰恰是最慢的时候，也是唯一需要让片的时候。
+        /// 按字节触发等于"越快越容易触发、越慢越不触发"，方向完全反了。</para>
+        /// <para>改成按时间：每 200ms 看一次，代价只是读两个 Interlocked 计数器。</para>
+        /// </summary>
+        private const int YieldCheckMs = 200;
+
+        /// <summary>
         /// 判定"整体限速"所需的最少有效样本数。
         ///
         /// 启动初期只有零星几个连接跑够了年龄（其余还在建连/错峰延迟中），
@@ -495,6 +549,141 @@ namespace GeZi.Core.Download
         /// 少于这个数就只做抢占、不做整体限速判定。
         /// </summary>
         private const int PreemptOverallSlowMinSamples = 4;
+
+        /// <summary>
+        /// 下载**中途**把当前片的剩余部分让出去（2026-11-02 新增，2026-11-09 重写）。
+        ///
+        /// <para>【为什么需要】原有的"动态窃取 + 尾部收缩"都只在**领片那一瞬间**生效。
+        /// 一旦某条连接拿到一个大片开始读，中途就再也不会切 —— 于是当其他连接都下完、
+        /// 只剩这一条在磨时，总速度会崩到几 B/s。用户实测：「UC网盘的 又出现 尾部掉速
+        /// 而且只有一个连接」，截图显示 1/11 连接、7 B/s、进度 96%。</para>
+        ///
+        /// <para>⚠️⚠️【2026-11-09 血的教训：这个函数原来会破坏数据】
+        /// 原做法是"原地改 <c>part.E</c>，把后半段作为新片追加进队列"。
+        /// 听起来无损（只改右边界、不动 W），**但它忽略了已经发出去的 HTTP 请求**：
+        /// 响应头里的 Range 是**发请求那一刻**的 part.E，让片把 part.E 改小之后，
+        /// 服务端仍按旧范围把数据一路送到底，而写入循环当时**完全不检查边界** ——
+        /// 于是被让出去的那段数据在【自己】这里又写了一遍，
+        /// 用户看到「31.34 MB / 29.49 MB」（已下载超过总大小），
+        /// 新片还会再下一遍同样区间，最后 done 虚高、进度卡 100% 速度归 0。
+        ///
+        /// <para>【YunX 为什么没这问题】看它的 DownloadManager：
+        /// <c>val range = elasticAllocator.take()</c> 拿到的是**不可变 LongRange**，
+        /// worker 全程不改它；需要换人时是 <c>preempt</c> 置位 + <c>call.cancel()</c>
+        /// **掐断连接**，把"剩余部分"重新排队，由**新连接**从已收字节续传。
+        /// 也就是说：**它从不修改一个已经发出请求的片段的边界**，只重新分配。</para>
+        ///
+        /// <para>【现在的做法·对齐 YunX】不再原地改 <c>part.E</c>。
+        /// 改为：把"本片尚未下载的部分"整体登记成一个新片放进队列，
+        /// 然后**掐断本 worker 的当前请求**（<c>cancelled</c> 语义走 partToken），
+        /// 让它回到领片循环 —— 它下次领到的可能就是刚切出去的一小块，
+        /// 也可能别人先领走。整个过程**没有任何已发出的 Range 被修改**。</para>
+        ///
+        /// <para>【触发条件】同时满足：
+        /// ① 活跃连接数明显低于 workerCount（说明确实有空转的 worker）；
+        /// ② 本片剩余量够切（≥ <see cref="YieldMinRemainBytes"/>）；
+        /// ③ 队列里没多少活（否则新片排不上队，等于白切）。</para>
+        /// </summary>
+        /// <returns>true 表示已经让片并掐断了当前请求，调用方必须放弃本片、回去重新领片。</returns>
+        private bool TryYieldTailOfPart(
+            DownloadPlan plan, PartPlan part, int idx,
+            System.Collections.Concurrent.ConcurrentQueue<int> queue, object splitLock,
+            int activeNow, int workerCount, int[] partCapacityBox = null,
+            CancellationTokenSource selfCts = null)
+        {
+            try
+            {
+                if (plan == null || part == null) return false;
+                if (workerCount <= 1) return false;
+
+                // ① 有多少条连接真的在跑？
+                int act = activeNow;
+                // 活跃数已达到 workerCount 的 3/4 就不必让 —— 说明大家都有活干
+                if (act * 4 >= workerCount * 3) return false;
+
+                // ③ 队列里还有活 → 新片排不上队，切了也没人来领
+                if (queue.Count > 0) return false;
+
+                // ② 本片还剩多少
+                long have = Volatile.Read(ref part.W);
+                long remainHere = (part.E - part.S + 1) - have;
+                if (remainHere < YieldMinRemainBytes) return false;
+
+                // ---- 对齐 YunX：不修改已发出请求的边界，而是"交出剩余部分 + 掐断自己" ----
+                //
+                // 把 [cutAt, 原E] 整体作为一个新片放回队列。**原片不改**（part.E 保持不变），
+                // 这样即便当前请求还在收数据，它写进去的位置也仍然合法；
+                // 我们随后掐断它，新片由别的 worker 从头下。
+                //
+                // 代价：当前请求已收到但尚未写入的缓冲区数据会被丢弃（≤ 一个 buf，64KB 级），
+                //       可接受；正确性远比这点重传重要。
+                long cutAt = part.S + have;
+                if (cutAt > part.E) return false;
+
+                // 均分成若干份喂饱空转连接（照搬 YunX 的 remaining / workers，下限 64KB）
+                int idleWorkers = Math.Max(1, workerCount - act);
+                long tailBytes = part.E - cutAt + 1;
+                int wantSlices = idleWorkers;
+                long sliceBytes = tailBytes / Math.Max(1, wantSlices);
+                if (sliceBytes < TailShrinkMinBytes)
+                {
+                    sliceBytes = TailShrinkMinBytes;
+                    wantSlices = (int)Math.Min(idleWorkers, tailBytes / sliceBytes);
+                    if (wantSlices < 1) return false;
+                }
+
+                int added = 0;
+                long s2 = cutAt;
+                for (int k = 0; k < wantSlices && s2 <= part.E; k++)
+                {
+                    long e2 = (k == wantSlices - 1) ? part.E : Math.Min(part.E, s2 + sliceBytes - 1);
+                    if (e2 < s2) break;
+                    lock (splitLock)
+                    {
+                        if (partCapacityBox != null && plan.Parts.Count >= partCapacityBox[0]) break;
+                        plan.Parts.Add(new PartPlan { S = s2, E = e2, W = 0 });
+                        queue.Enqueue(plan.Parts.Count - 1);
+                    }
+                    added++;
+                    s2 = e2 + 1;
+                }
+
+                if (added == 0) return false;
+
+                Log?.Invoke(string.Format(
+                    "[让片] 活跃连接 {0}/{1} 偏低，本片剩余 {2} 字节，切出 {3} 片给空转连接（每片约 {4}），本连接重新排队",
+                    act, workerCount, remainHere, added, Fmt(sliceBytes)));
+
+                // ★ 关键：掐断自己的当前请求，回到领片循环。
+                //   不这么做的话，本片 part.E 没变，当前连接会继续把整片下完 ——
+                //   而切出去的片也会被别的 worker 下，同一区间下两遍（正是 31.34/29.49 的成因）。
+                //
+                // 【为什么这时改 part.E 是安全的】与旧版的根本区别：
+                //   旧版在**请求还在接收数据**的时候就改 part.E，响应继续按旧 Range 送，
+                //   写入循环还不知道 → 数据重复写、done 虚高。
+                //   现在我们先 selfCts.Cancel() **掐断响应流**，再收缩边界，
+                //   此刻已不可能有任何字节再写进本片。
+                //   收缩后 part.W == part.E-part.S+1，本片自然满足"已完成"，
+                //   AllPartsDone() 不会因此永远为 false，catch 分支也不会把它重新入队。
+                try { selfCts?.Cancel(); } catch { }
+
+                long newEnd = cutAt - 1;
+                if (newEnd >= part.S)
+                {
+                    part.E = newEnd;                 // 剩余部分已全部交给新片
+                }
+                else
+                {
+                    // 一个字节都没写过 → 整片都让出去了，收到 part.S 位置避免空范围
+                    part.E = part.S;
+                    Volatile.Write(ref part.W, 0);
+                }
+
+                return true;
+            }
+            catch { /* 让片是优化，失败不影响下载 */ }
+            return false;
+        }
 
         /// <summary>
         /// 单调毫秒时钟。
@@ -783,11 +972,31 @@ namespace GeZi.Core.Download
 
         public SegmentedDownloader(int threads = 0, string ua = null, string referer = null, string cookie = "",
             WriteMode writeMode = WriteMode.SegmentedFiles, string partsRoot = null)
+            : this(threads, DownloadContext.QuarkDefaults(cookie), writeMode, partsRoot)
+        {
+            // 兼容老调用点：ua/referer 显式给了就覆盖上下文里的默认值。
+            // 这样既有代码行为分毫不差（夸克全局默认），新代码则走 DownloadContext 重载。
+            if (!string.IsNullOrEmpty(ua)) _ctx.UserAgent = ua;
+            if (!string.IsNullOrEmpty(referer)) _ctx.Referer = referer;
+            _ua = _ctx.UserAgent;
+            _referer = _ctx.Referer;
+        }
+
+        /// <summary>
+        /// 【网盘抽象 P0】唯一推荐入口：身份全部由 <see cref="DownloadContext"/> 提供。
+        ///
+        /// <para>下载器不再读任何 <c>QuarkConstants</c> 身份常量 —— 换网盘只需换上下文。
+        /// 这样 UC 的 <c>__pugs</c>、<c>drive.uc.cn</c> 的 Origin/Referer、
+        /// <c>.uc.cn</c> 的 Cookie 种子域才能正确落到请求上。</para>
+        /// </summary>
+        public SegmentedDownloader(int threads, DownloadContext ctx,
+            WriteMode writeMode = WriteMode.SegmentedFiles, string partsRoot = null)
         {
             _threads = Math.Max(1, threads > 0 ? threads : QuarkConstants.DownloadThreads);
-            _ua = string.IsNullOrEmpty(ua) ? QuarkConstants.DlUa : ua;
-            _referer = string.IsNullOrEmpty(referer) ? QuarkConstants.Referer : referer;
-            _cookie = cookie ?? "";
+            _ctx = ctx ?? DownloadContext.QuarkDefaults("");
+            _ua = string.IsNullOrEmpty(_ctx.UserAgent) ? QuarkConstants.DlUa : _ctx.UserAgent;
+            _referer = string.IsNullOrEmpty(_ctx.Referer) ? QuarkConstants.Referer : _ctx.Referer;
+            _cookie = _ctx.Cookie ?? "";
             // 【2026-10-20】落盘方式已唯一化：共写同一文件（SharedFile）物理移除。
             // 多 worker 各自 seek 写同一文件 = 随机 I/O，机械盘上磁盘占用打满、下载被拖慢；
             // 独立分片全程顺序追加，机械盘/固态盘都友好，且天然支持边下边播。
@@ -796,19 +1005,57 @@ namespace GeZi.Core.Download
             _partsRoot = string.IsNullOrWhiteSpace(partsRoot) ? null : partsRoot.Trim();
             _jar = new CookieContainer { Capacity = 500, PerDomainCapacity = 200 };
             SeedCookies(_jar, _cookie);
+            bool useJar = !_ctx.DisableCookieJar;
             var handler = new HttpClientHandler
             {
-                UseCookies = true,
-                CookieContainer = _jar,
+                // ★ 【2026-11-02 实测】上下文声明 DisableCookieJar 时必须关掉自动装配。
+                // 开着时 .NET 会用 handler 的 CookieContainer **覆盖**手工写的 Cookie 头，
+                // 而那个容器可能没收到这份 Cookie → 发出去的请求没有登录态 →
+                // UC 的 OSS 直接回 403「require login [auth not found]」。
+                // 实测同一份头：UseCookies=true → 403，false → 206。
+                UseCookies = useJar,
                 AllowAutoRedirect = true,
                 AutomaticDecompression = DecompressionMethods.None,
                 // 连接池必须随线程数放开，否则线程再高也只能干等空位
                 MaxConnectionsPerServer = Math.Max(1024, _threads * 2),
             };
+            // ⚠️ 只有 UseCookies=true 时才允许设 CookieContainer ——
+            // .NET Framework 在 UseCookies=false 时设这个属性会抛
+            // InvalidOperationException「必须将 UseCookies 属性设置为 true 才能使用此属性」。
+            // （这个坑是端到端真跑时才炸出来的，只编译不跑看不出来。）
+            if (useJar)
+                handler.CookieContainer = _jar;
             // 代理策略统一交给 NetworkOptions：默认直连（避免本机代理/抓包工具
             // 接管 CDN 长连接），设置页显式开启「跟随系统代理」时才读 WinINET。
             NetworkOptions.ApplyTo(handler);
-            _http = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+            // 🚨🚨【2026-11-09 修·尾部掉速的真正根因之一】
+            // 原来这里是 `Timeout = Timeout.InfiniteTimeSpan` —— **完全禁用超时**。
+            //
+            // 【后果】网盘 CDN 在收尾期常把个别分片"挂着不给数据"（不发也不断开）。
+            // 这种连接上 ReadAsync 会**无限期阻塞**，而 .NET Framework 的内容流读取
+            // **不响应 CancellationToken**（本文件多处注释都记着这个事实）——
+            // 于是抢占的 cts.Cancel() 也掐不断它，只能等 TCP 层自己超时（可达数分钟）。
+            // 用户看到的就是：3/81 连接、0 B/s、剩 6 分 53 秒，久等不动。
+            //
+            // 【YunX 怎么做的】它的下载专用客户端（HttpClients.buildDownload）明确设了：
+            //     .connectTimeout(15, TimeUnit.SECONDS)
+            //     .readTimeout(60, TimeUnit.SECONDS)      ← 关键
+            //     .writeTimeout(30, TimeUnit.SECONDS)
+            // 所以被挂住的连接最多卡 60 秒就抛 IOException → 自动重试/抢占换链，
+            // 尾部只是"慢一下"，不会像 GeZi 这样直接停死。
+            //
+            // 【为什么 HttpClient.Timeout 能解决】它是**总超时**，包含读取响应体的时间，
+            // 到点会让 ReadAsync 抛 TaskCanceledException —— 这正是我们需要的"能中断的读"。
+            // 单次请求超时是安全的：一个分片的 Range 请求本就不该超过几分钟。
+            //
+            // ⚠️ 取值不能太短：大分片在慢速链路上合法地需要较长时间。
+            //    这里取 DownloadRequestTimeoutSec(300s=5分钟)，
+            //    比 YunX 的 60 秒宽松（GeZi 单片可能达数 MB，YunX 弹性块多为 256KB~4MB）。
+            //    真正的"挂住不给数据"5 分钟内必然触发；而正常慢速下载不会被误杀。
+            _http = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(DownloadRequestTimeoutSec),
+            };
         }
 
         /// <summary>
@@ -1082,36 +1329,42 @@ namespace GeZi.Core.Download
 
         private Dictionary<string, string> BuildHeaders()
         {
-            var h = new Dictionary<string, string>
-            {
-                { "User-Agent", _ua },
-                { "Referer", _referer },
-            };
+            // 【网盘抽象 P0】基线头全部来自 DownloadContext，不再硬编码夸克。
+            // 这让 UC 的 Origin=drive.uc.cn / Referer=drive.uc.cn/ 能正确发出去。
+            var h = _ctx.BuildBaseHeaders();
+
             // 显式下发完整 Cookie，与 Python 版 _headers() 行为一致。
             // 只靠 CookieContainer 隐式附加并不可靠：它按域/路径过滤，
-            // 而直链域名（如 dl-pc-zb.drive.quark.cn）与种入时使用的 .quark.cn
-            // 未必总能匹配上。实测 Python 版不带 Cookie 会被防盗链直接拒（412）。
+            // 而直链域名（如 dl-pc-zb.drive.quark.cn / UC 的 OSS 域）与种入时使用的
+            // 种子域未必总能匹配上。实测 Python 版不带 Cookie 会被防盗链直接拒（412）。
             if (!string.IsNullOrEmpty(_cookie))
                 h["Cookie"] = _cookie;
 
-            // 客户端伪装补齐：取链时用的是"夸克 PC 客户端"身份（ApiUa），
+            // 客户端伪装补齐：取链时用的是"客户端"身份（ApiUa），
             // 下载时若只带 UA 不带 Origin/Sec-Fetch，头集合就不自洽 ——
             // 真实客户端发起请求时这组头是齐的，缺项本身即异常特征。
-            // 参考 QuarkDownloader 在 sendFilesToMotrixRpc 中同样补了 Referer，
-            // 这里把 Origin 与 Sec-Fetch-* 一并补齐，形成完整闭环。
-            h["Origin"] = QuarkConstants.Origin;
-            h["Accept"] = "*/*";
-            h["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8";
-            h["Sec-Fetch-Dest"] = "empty";
-            h["Sec-Fetch-Mode"] = "cors";
-            h["Sec-Fetch-Site"] = "cross-site";
+            // ⚠️ 这里只补**通用**的，覆盖型（Origin 等）已经由 ctx 给过了，
+            //    不要再用常量盖回去，否则等于把 P0 的修复又抹掉。
+            if (!h.ContainsKey("Accept")) h["Accept"] = "*/*";
+            if (!h.ContainsKey("Accept-Language")) h["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8";
+            if (!h.ContainsKey("Sec-Fetch-Dest")) h["Sec-Fetch-Dest"] = "empty";
+            if (!h.ContainsKey("Sec-Fetch-Mode")) h["Sec-Fetch-Mode"] = "cors";
+            if (!h.ContainsKey("Sec-Fetch-Site")) h["Sec-Fetch-Site"] = "cross-site";
             return h;
         }
 
-        private static void SeedCookies(CookieContainer jar, string cookie)
+        /// <summary>
+        /// 把 Cookie 串种进 CookieContainer。
+        /// <para>★ 域必须来自 <see cref="DownloadContext.CookieSeedDomain"/> —— 写死
+        /// <c>.quark.cn</c> 会让 UC 的 Cookie 全部落进夸克域，请求时一个都不附带。</para>
+        /// </summary>
+        private void SeedCookies(CookieContainer jar, string cookie)
         {
             if (string.IsNullOrEmpty(cookie))
                 return;
+            string domain = !string.IsNullOrEmpty(_ctx.CookieSeedDomain)
+                ? _ctx.CookieSeedDomain
+                : ".quark.cn";
             foreach (var part in cookie.Split(';'))
             {
                 var p = part.Trim();
@@ -1122,7 +1375,7 @@ namespace GeZi.Core.Download
                     continue;
                 try
                 {
-                    jar.Add(new Cookie(p.Substring(0, eq).Trim(), p.Substring(eq + 1).Trim(), "/", ".quark.cn"));
+                    jar.Add(new Cookie(p.Substring(0, eq).Trim(), p.Substring(eq + 1).Trim(), "/", domain));
                 }
                 catch
                 {
@@ -1131,17 +1384,26 @@ namespace GeZi.Core.Download
             }
         }
 
-        private static IEnumerable<Dictionary<string, string>> FallbackHeaders()
+        /// <summary>
+        /// 主请求失败后的降级头序列（CDN 对缺项的容忍度各不相同）。
+        /// <para>同样改为跟随上下文：UA/Referer/Origin 都取 <see cref="_ctx"/>，
+        /// 否则 UC 走到降级路径时又会变回夸克身份。</para>
+        /// </summary>
+        private IEnumerable<Dictionary<string, string>> FallbackHeaders()
         {
+            string ua = _ua ?? QuarkConstants.DlUa;
+            string referer = _referer ?? QuarkConstants.Referer;
+            string origin = !string.IsNullOrEmpty(_ctx.Origin) ? _ctx.Origin : QuarkConstants.Origin;
+
             yield return new Dictionary<string, string>
             {
-                { "User-Agent", QuarkConstants.DlUa },
-                { "Referer", QuarkConstants.Referer },
-                { "Origin", QuarkConstants.Origin },
+                { "User-Agent", ua },
+                { "Referer", referer },
+                { "Origin", origin },
             };
             yield return new Dictionary<string, string>
             {
-                { "User-Agent", QuarkConstants.DlUa },
+                { "User-Agent", ua },
             };
         }
 
@@ -1531,17 +1793,45 @@ namespace GeZi.Core.Download
             long wantParts = Math.Max(bySize, (long)eff * 8);
             if (wantParts < 1) wantParts = 1;
 
-            // 片数上限①：单片不低于 1MB（与 MinSegBytes 一致）。
-            // 这一条是"别切碎"的硬约束 —— 大文件在低并发时也不该被切成几万片。
+            // 片数上限①：单片不低于 MinSegBytes（1MB）。
+            //
+            // 【2026-11-02 修·UC 尾部掉速】原来这条是硬约束，导致**小文件片数 ≈ 连接数**：
+            //   实测 UC 一个 10.71MB 文件、11 路连接 → capByMinChunk=10 片 → 11 条连接抢 10 片，
+            //   有 1 条永远空转；更糟的是**没有富余的片可供动态窃取/尾部收缩**，
+            //   谁拿到慢片谁就把整个下载拖住 → 用户看到「只剩 1 个连接、7 B/s」。
+            //   用户实测反馈：「UC网盘的 又出现 尾部掉速 而且只有一个连接」。
+            //
+            // 修法：给片数留出**至少 4 倍于连接数**的余量，允许小文件也切细。
+            // 代价是每片一次 Range 请求（建连开销），但 4× 连接数是合理折中 ——
+            // 片仍然不会碎到"每片几 KB"那种程度。
             long capByMinChunk = total / MinSegBytes;
             if (capByMinChunk < 1) capByMinChunk = 1;
+
+            // 富余片数下限：4 × 连接数（但不超过 512，避免小文件被切出上千片）
+            long capByConcurrency = Math.Min(512, (long)eff * 4);
+            if (capByConcurrency < 1) capByConcurrency = 1;
+            if (capByMinChunk < capByConcurrency) capByMinChunk = capByConcurrency;
+
             if (wantParts > capByMinChunk) wantParts = capByMinChunk;
 
             // 片数上限②：元数据硬上限
             if (wantParts > MaxSegments) wantParts = MaxSegments;
 
             long seg = (total + wantParts - 1) / wantParts;
-            if (seg < MinSegBytes) seg = MinSegBytes;
+
+            // 【2026-11-02 修·UC 尾部掉速】单片下限不能再一律用 MinSegBytes(1MB)。
+            //
+            // 原来这里 `if (seg < MinSegBytes) seg = MinSegBytes;` 会把上面辛苦算出的
+            // "细片"重新拉回 1MB，于是 10.71MB 文件又变回 10 片 —— 富余量全没了。
+            // 现在下限跟着"总大小 / 目标片数"走：只要每片仍有 256KB，就允许它比 1MB 小。
+            // 256KB 是下载缓冲区大小（QuarkConstants.DownloadChunk），再小就纯是开销了。
+            long minSegNow = MinSegBytes;
+            if (total / Math.Max(1, capByMinChunk) < minSegNow)
+            {
+                minSegNow = Math.Max(QuarkConstants.DownloadChunk,
+                                      total / Math.Max(1, capByMinChunk));
+            }
+            if (seg < minSegNow) seg = minSegNow;
             if (seg > maxSegBytes) seg = maxSegBytes;
 
             // 由上一步的片大小算出片数
@@ -1920,27 +2210,77 @@ namespace GeZi.Core.Download
                 try { if (File.Exists(dest)) have = new FileInfo(dest).Length; } catch { }
                 if (have > total) have = total;
 
-                // 由已合并字节数反推：进度停在第几片、片内偏移多少
-                long acc = 0;
-                for (int i = 0; i < plan.Parts.Count; i++)
+                // 🚨🚨【2026-11-03 修·关键】由已合并字节数反推"合并进度停在哪一片"，
+                //   **必须按偏移区间去找，绝不能按索引顺序累加分片大小**。
+                //
+                // 【为什么】动态窃取（SplitLongestPartIfNeeded）与尾部收缩
+                // （TryYieldTailOfPart）都会往 plan.Parts **末尾追加**新片，而新片的
+                // 区间落在被切那片的后半段 —— 于是 **索引顺序 ≠ 偏移顺序**。
+                // 本次实测的 .qmeta 就是活证据：
+                //   p000000..p000005 是 973460 字节的大片（偏移 0 ~ 4867299），
+                //   p000025..p000035 却是偏移 5029543 起的 81121 字节小片，
+                //   而 p000006..p000024 覆盖的是 5029543 之后的各段。
+                // 按索引累加会把 mergedCount 算成 9，于是：
+                //   ① 2157 行那个循环**删掉 p000007、p000008 两个还没合并的分片文件**；
+                //   ② 合并线程从"目标文件当前长度"重新定位时，没有任何分片覆盖该偏移
+                //      → `pick < 0` → 立刻 break，目标文件停在旧长度；
+                //   ③ 收尾校验报「合并后目标文件大小不符」。
+                // 实录：期望 10708056、实际 6882685，且目标文件 LastWriteTime
+                // 还是**上一次运行**的时间（本次根本没写进去一个字节），
+                // 而进度条却是 100%（.qmeta 里各片 W 都被记成满）。
+                //
+                // 【判据】"已合并"不是"索引在前"，而是"**区间完全落在 [0, have) 之内**"。
+                int headIdx = -1;              // 覆盖偏移 have 的那一片（合并进度停在这里）
+                if (have < total)
                 {
-                    long sz = plan.Parts[i].E - plan.Parts[i].S + 1;
-                    if (acc + sz > have) break;
-                    acc += sz;
-                    mergedCount = i + 1;
-                }
-                mergedInHead = have - acc;
-                mergedBytes = have;
+                    for (int i = 0; i < plan.Parts.Count; i++)
+                    {
+                        if (plan.Parts[i].S <= have && have <= plan.Parts[i].E)
+                        { headIdx = i; break; }
+                    }
 
-                // 对账：目标文件尾部那一段必须是"从第 mergedCount 片的分片文件里读来的"。
+                    // 兜底：have 落在所有片区之外（分片规划出现空洞）。
+                    // 这种目标文件的内容不可信 —— 截断到"最后一个完全在 have 之前的片"
+                    // 的末尾，把中间那段可疑数据丢掉重下。
+                    if (headIdx < 0)
+                    {
+                        long safe = 0;
+                        for (int i = 0; i < plan.Parts.Count; i++)
+                            if (plan.Parts[i].E + 1 <= have && plan.Parts[i].E + 1 > safe)
+                                safe = plan.Parts[i].E + 1;
+                        Log?.Invoke(string.Format(
+                            "边合并: 目标文件长度 {0} 落在所有分片区间之外（分片规划有空洞），"
+                            + "已截断到 {1} 重下。", have, safe));
+                        try
+                        {
+                            using (var fs = new FileStream(dest, FileMode.Open, FileAccess.Write,
+                                       FileShare.ReadWrite | FileShare.Delete))
+                                fs.SetLength(safe);
+                        }
+                        catch { }
+                        have = safe;
+                        for (int i = 0; i < plan.Parts.Count; i++)
+                        {
+                            if (plan.Parts[i].S <= have && have <= plan.Parts[i].E)
+                            { headIdx = i; break; }
+                        }
+                    }
+                }
+
+                mergedBytes = have;
+                mergedInHead = headIdx >= 0 ? have - plan.Parts[headIdx].S : 0;
+                // mergedCount 的语义改成"合并进度所在片的索引"（找不到就是"全部合并完"）。
+                mergedCount = headIdx >= 0 ? headIdx : plan.Parts.Count;
+
+                // 对账：目标文件尾部那一段必须是"从头部片的分片文件里读来的"。
                 // 若分片文件比它短，说明目标文件里混进了来路不明的字节，
                 // 只能把这一段截掉重来 —— 宁可少一点，也不能产出内容错误的文件。
-                if (mergedInHead > 0)
+                if (headIdx >= 0 && mergedInHead > 0)
                 {
                     long headLen = 0;
                     try
                     {
-                        var hfi = new FileInfo(PartPath(partsDir, mergedCount));
+                        var hfi = new FileInfo(PartPath(partsDir, headIdx));
                         if (hfi.Exists) headLen = hfi.Length;
                     }
                     catch { }
@@ -1948,15 +2288,15 @@ namespace GeZi.Core.Download
                     {
                         Log?.Invoke(string.Format(
                             "边合并: 目标文件尾部 {0} 字节在分片 {1} 中找不到对应数据，已截除重下（内容正确优先于省流量）。",
-                            Fmt(mergedInHead), mergedCount));
+                            Fmt(mergedInHead), headIdx));
                         try
                         {
                             using (var fs = new FileStream(dest, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
-                                fs.SetLength(acc);
+                                fs.SetLength(plan.Parts[headIdx].S);
                         }
                         catch { }
                         mergedInHead = 0;
-                        mergedBytes = acc;
+                        mergedBytes = plan.Parts[headIdx].S;
                     }
                 }
 
@@ -1964,9 +2304,22 @@ namespace GeZi.Core.Download
                 // sidecar 里的 W 是"已写入"的记账，但缓冲未落盘时进程被杀，
                 // 记账会大于真实文件长度；反过来也可能因删除失败而残留多余字节。
                 // 两种偏差都会让续传写到错误位置，所以这里强制以磁盘为准。
-                for (int i = mergedCount; i < plan.Parts.Count; i++)
+                //
+                // ⚠️ 必须遍历**全部分片**（不能从 mergedCount 开始）：
+                //    索引顺序 ≠ 偏移顺序，头部片的索引可能比某些未合并片的索引还大。
+                for (int i = 0; i < plan.Parts.Count; i++)
                 {
                     long sz = plan.Parts[i].E - plan.Parts[i].S + 1;
+
+                    // 区间完全落在已合并前缀之内 → 这片早就合并完了，分片文件该已删除。
+                    // 残留就清掉，记账补满，绝不能再当成"未下载"去重下。
+                    if (plan.Parts[i].E < have)
+                    {
+                        plan.Parts[i].W = sz;
+                        try { File.Delete(PartPath(partsDir, i)); } catch { }
+                        continue;
+                    }
+
                     long len = 0;
                     try
                     {
@@ -1985,6 +2338,12 @@ namespace GeZi.Core.Download
                         catch { }
                         len = sz;
                     }
+
+                    // 头部片：目标文件里已经有一截是它的数据，磁盘上的分片文件通常更短
+                    // （那一截已合并后并不删片，直到整片合并完）。记账取两者较大值，
+                    // 保证 worker 从"目标文件末尾"继续写，而不是把已合并的部分重下一遍。
+                    if (i == headIdx && len < mergedInHead) len = mergedInHead;
+
                     plan.Parts[i].W = len;
                     // 磁盘上已经完整的分片直接标记完成。
                     // 这一步不能省：worker 见到"本片已完整"会直接跳过、不置标记，
@@ -1992,12 +2351,6 @@ namespace GeZi.Core.Download
                     // （续传时目标文件卡在某个分片边界上再也不动）。
                     if (len >= sz)
                         partDone[i] = 1;
-                }
-                // 已合并的分片：分片文件应已删除，残留则清掉，并补齐记账
-                for (int i = 0; i < mergedCount; i++)
-                {
-                    plan.Parts[i].W = plan.Parts[i].E - plan.Parts[i].S + 1;
-                    try { File.Delete(PartPath(partsDir, i)); } catch { }
                 }
                 SavePlan(metaPath, plan);
 
@@ -2045,8 +2398,16 @@ namespace GeZi.Core.Download
             }
 
             var queue = new ConcurrentQueue<int>();
-            for (int i = mergedCount; i < plan.Parts.Count; i++)
+            // 🚨【2026-11-03 修】不能写 `for (i = mergedCount; ...)`：
+            //   索引顺序 ≠ 偏移顺序（见上面 mergedCount 处的长注释），
+            //   按索引切一刀会**漏掉索引小但偏移大的未完成片**，
+            //   它们永远进不了队列 → 永远下不完。
+            //   正确判据：区间完全落在已合并前缀之内的才算"已完成"。
+            for (int i = 0; i < plan.Parts.Count; i++)
+            {
+                if (mergeMode && plan.Parts[i].E < mergedBytes) continue;   // 已合并
                 queue.Enqueue(i);
+            }
 
             // ---- 动态窃取的配套状态（2026-10-24 从原版补回）----
             var splitLock = new object();   // 保护 plan.Parts.Add + queue.Enqueue 的原子性
@@ -2424,6 +2785,8 @@ namespace GeZi.Core.Download
                 int crawlFlag = 0;
                 // 慢速爬行计时（Environment.TickCount 毫秒，0 = 未在爬行）
                 long lastCrawlMs = 0;
+                // 【2026-11-09】收尾诊断日志的限频戳（每 5 秒最多打一行）
+                long lastCrawlDiagMs = 0;
 
                 // 诊断用：当前有多少条连接正真在传数据。
                 // 速度上不去时，问题无非两种：
@@ -2739,8 +3102,7 @@ namespace GeZi.Core.Download
                         {
                             lastProgressBytes = d;
                             lastAdvance = now;
-                        }
-                        // 【关键】用户暂停期间不计入停滞判定。
+                        }                        // 【关键】用户暂停期间不计入停滞判定。
                         // 暂停时 done 必然不增长，若不排除，用户暂停超过 45 秒就会
                         // 被判为"网络停滞"并主动中止 —— 这是错的：暂停是用户的意愿，
                         // 不是故障。恢复后把计时器重置，避免把暂停时长算进停滞窗口。
@@ -2822,6 +3184,61 @@ namespace GeZi.Core.Download
                                 && remainForCrawl <= crawlEndgameLimit
                                 && speed < CrawlBps;
 
+                            // ==================== 【2026-11-09 诊断日志】====================
+                            // 用户反馈「前面都正常，尾部差一点就开始掉速，慢慢到 0 B/s」，
+                            // 而按现有判据 crawl 检测**应该**在 20 秒后触发换链，实际却没触发。
+                            // 与其继续猜，不如把每个判据的真实取值打出来。
+                            //
+                            // 只在"收尾且慢"时打（remainForCrawl 小 且 speed 低），
+                            // 其余情况一行都不输出 —— 不会污染正常下载的日志。
+                            if (remainForCrawl > 0 && remainForCrawl <= Math.Max(16, crawlEndgameLimit * 2)
+                                && speed < CrawlBps * 4)
+                            {
+                                long diagNowMs = NowMs();
+                                if (diagNowMs - lastCrawlDiagMs >= 5000)
+                                {
+                                    lastCrawlDiagMs = diagNowMs;
+
+                                    // 逐个列出未完成分片的真实状态 —— 这是最关键的信息：
+                                    // W 是否还在增长、有没有 worker 认领它、被抢占过几次。
+                                    var sb = new System.Text.StringBuilder();
+                                    int shown = 0;
+                                    long remainBytes = 0;
+                                    for (int pi = 0; pi < plan.Parts.Count; pi++)
+                                    {
+                                        var pp = plan.Parts[pi];
+                                        long psz = pp.E - pp.S + 1;
+                                        long pleft = psz - pp.W;
+                                        if (pleft <= 0) continue;
+                                        remainBytes += pleft;
+                                        if (shown < 6)
+                                        {
+                                            // 找哪个 worker 正在负责这一片
+                                            int owner = -1;
+                                            for (int wi = 0; wi < wCurPart.Length; wi++)
+                                                if (Volatile.Read(ref wCurPart[wi]) == pi) { owner = wi; break; }
+                                            if (sb.Length > 0) sb.Append("；");
+                                            sb.AppendFormat("片{0}[{1}/{2} 剩{3} {4}]",
+                                                pi, Fmt(pp.W), Fmt(psz), Fmt(pleft),
+                                                owner >= 0 ? ("worker#" + owner) : "无worker");
+                                            shown++;
+                                        }
+                                    }
+
+                                    Log?.Invoke(string.Format(
+                                        "[诊断·收尾] 剩{0}片/{1}字节 速度={2}/s 活跃={3}/{4} "
+                                        + "stalled={5} crawling={6} 已磨{7}s/{8}s | {9}",
+                                        remainForCrawl, Fmt(remainBytes), Fmt((long)speed),
+                                        Volatile.Read(ref activeConns), Volatile.Read(ref workerCountBox),
+                                        Volatile.Read(ref stalledFlag),
+                                        crawling ? "是" : "否",
+                                        lastCrawlMs == 0 ? 0 : (Environment.TickCount - lastCrawlMs) / 1000,
+                                        CrawlSeconds,
+                                        sb.ToString()));
+                                }
+                            }
+                            // =================================================================
+
                             if (crawling)
                             {
                                 if (lastCrawlMs == 0)
@@ -2900,8 +3317,26 @@ namespace GeZi.Core.Download
                             return;
                         }
                         var mbuf = new byte[1024 * 1024];
-                        int next = mergedCount;
-                        long inPart = mergedInHead;
+                        // 🚨【2026-11-03 修】初值不能直接取 mergedCount / mergedInHead ——
+                        //   它们是"按索引"推出来的。虽然循环第一轮就会用区间覆盖重新定位
+                        //   （见下），但初值若是个错的索引，`next` 在重新定位前被日志/异常
+                        //   引用到就会误导排查。这里统一从"区间覆盖"重新求一次。
+                        int next = 0;
+                        long inPart = 0;
+                        {
+                            long t0 = mfs.Length;
+                            int p0 = -1;
+                            for (int i = 0; i < plan.Parts.Count; i++)
+                            {
+                                if (plan.Parts[i].S <= t0 && t0 <= plan.Parts[i].E)
+                                { p0 = i; break; }
+                            }
+                            if (p0 >= 0)
+                            {
+                                next = p0;
+                                inPart = t0 - plan.Parts[p0].S;
+                            }
+                        }
                         // 收到收尾信号后还要连续多少轮"读不到新数据"才真的退出。
                         // 见下面收尾分支的注释 —— 这个宽限期是必须的。
                         int stallRounds = 0;
@@ -3227,6 +3662,12 @@ namespace GeZi.Core.Download
                         // 拿到就意味着 TCP+TLS 握手完成 —— 那一刻通知分批闸门放行下一批。
                         bool firstResponseSeen = false;
 
+                        // 【2026-11-09 新增】本 worker 上次观察到的全局已完成字节数。
+                        // 用于区分"我自己暂时没活"（不该退出）与"整个任务真的停滞"（该交给看门狗）。
+                        // 只看自己的等待时长会误判：收尾期 78 条 worker 都在等、但剩下那 1 条在正常跑，
+                        // 此时它们不该集体退出（见下面等待循环的长注释）。
+                        long lastSeenDone = Interlocked.Read(ref done);
+
                         // 冷启动错峰：多个 worker 同时发起首请求会挤在一起做 TLS 握手，
                         // 不仅拖慢首个字节时间，还更容易触发服务端限流。
                         //
@@ -3290,9 +3731,31 @@ namespace GeZi.Core.Download
                                     break;      // 真的全下完了，正常收工
 
                                 // 等到有活、或确实没指望了
+                                //
+                                // 【2026-11-09 修·关键】这里原来等 60 秒没活就 `break` ——
+                                // **worker 永久退出，再也不回来**。
+                                //
+                                // 用户实测截图（29.33MB 文件、99.3%、剩约 200KB）：
+                                // 显示 **1/79 连接、8 B/s**。那 78 条不是"没活干在等"，
+                                // 是**已经退出了**——它们在更早的时刻各自空转了 60 秒。
+                                //
+                                // 于是形成死锁式局面：
+                                //   ① 收尾期只剩 1 片在下，队列空；
+                                //   ② 其余 worker 空转 60s → 全部 break 退出；
+                                //   ③ 那 1 片以 8 B/s 磨，即使让片逻辑切出新片，
+                                //      **也没有任何 worker 还在**，切了也没人领。
+                                // 这就是"尾部掉速修了几次都还在"的根本原因 ——
+                                // 不是切分算法不够好，是**干活的人已经走光了**。
+                                //
+                                // 【修法】只要还有分片没下完，就让 worker **一直等下去**
+                                // （200ms 轮询，开销只是读两个计数器）。真正的退出条件有三个：
+                                //   · AllPartsDone()  → 真的全下完了
+                                //   · 外部取消        → 用户不要了
+                                //   · 全局停滞        → 交给看门狗判定（它会换链或报停滞）
+                                // 绝不因为"这一小会儿没活"就遣散工人。
                                 int idleWaitMs = 0;
                                 bool gotWork = false;
-                                while (idleWaitMs < WorkerIdleGiveUpMs)
+                                while (true)
                                 {
                                     if (cancelToken.IsCancellationRequested) return;
                                     if (AllPartsDone()) break;
@@ -3300,15 +3763,28 @@ namespace GeZi.Core.Download
                                     if (queue.TryDequeue(out idx)) { gotWork = true; break; }
                                     if (boostQueue.TryDequeue(out idx)) { gotWork = true; fromBoost = true; break; }
 
+                                    // 安全阀：如果整个任务已经很久没有任何字节进展，
+                                    // 说明真的卡死了（不是"暂时没活"），交给看门狗。
+                                    // 判据用 done 的单调值 + 时间，而不是"我自己等了多久"。
+                                    long progressedNow = Interlocked.Read(ref done);
+                                    if (progressedNow != lastSeenDone)
+                                    {
+                                        lastSeenDone = progressedNow;
+                                        idleWaitMs = 0;          // 有全局进展 → 重新计时
+                                    }
+                                    else
+                                    {
+                                        idleWaitMs += 200;
+                                        if (idleWaitMs >= WorkerIdleGiveUpMs) break;   // 全任务真停滞
+                                    }
+
                                     try { await Task.Delay(200, cancelToken).ConfigureAwait(false); }
                                     catch (OperationCanceledException) { return; }
-                                    idleWaitMs += 200;
                                 }
 
                                 if (!gotWork)
                                 {
-                                    // 等够了还是没有活：要么真完成（上面判过），
-                                    // 要么卡在别人手里 —— 让看门狗去处理。
+                                    // 走到这里只有两种可能：真的完成了，或全任务停滞（交给看门狗）。
                                     break;
                                 }
                             }
@@ -3474,6 +3950,10 @@ namespace GeZi.Core.Download
                                 // 单个分片独立重试：网络抖动不应该让整个任务失败。
                                 // 指数退避 + 抖动，最多 MaxSegmentRetries 次。
                                 string lastErr = null;
+                                // 【2026-11-09 新增】本片是否刚被"让片"处理过。
+                                // 让片会掐断本连接并把剩余部分切出去，此时 catch 分支
+                                // 不应再把本片塞回队列（见 catch 里的说明）。
+                                bool yieldedSelf = false;
                                 // 片内所有 I/O 走 partToken：看门狗抢占时只掐这一片，
                                 // 不影响其他 worker，也不污染全局取消语义。
                                 var partToken = pcts.Token;
@@ -3526,12 +4006,17 @@ namespace GeZi.Core.Download
                                     }
 
                                     long written = part.W;
-                                    if (written >= segSize)
+                                    // 【2026-11-09 修】用实时边界判断，而非领片时冻结的 segSize
+                                    // （让片可能已经把 part.E 收缩到 written 之前）。
+                                    if (written >= (part.E - part.S + 1))
                                         break;
                                     long reqStart = part.S + written;
 
                                     var h = new Dictionary<string, string>(headers)
                                     {
+                                        // ⚠️ 这里用**发请求这一刻**的 part.E。之后若让片把它改小，
+                                        //    响应仍会按这个旧范围送到底 —— 由下面写入循环的
+                                        //    "实时边界截断"负责丢弃超出部分。
                                         ["Range"] = "bytes=" + reqStart + "-" + part.E,
                                     };
 
@@ -3667,14 +4152,115 @@ namespace GeZi.Core.Download
                                                     Interlocked.Increment(ref activeConns);
                                                     try
                                                     {
+                                                        // 【2026-11-02 新增】下载中途的"主动让片"。
+                                                        //
+                                                        // 【解决什么】上面那套动态窃取/尾部收缩只在
+                                                        // **领片那一瞬间**生效。一旦某条连接拿到一个
+                                                        // 10MB 的大片开始读，中途再也不会切 —— 于是
+                                                        // 当别的连接都下完了、只剩这一条在磨时，总速度
+                                                        // 就崩到几 B/s，用户看到「1/11 连接」。
+                                                        // 实测：UC 的 10.71MB 文件收尾时 7 B/s。
+                                                        //
+                                                        // 【做法】每读若干块检查一次活跃连接数；
+                                                        // 若明显低于 workerCount，且本片还剩足够多，
+                                                        // 就把**尚未下载的后半段**切出来放回队列，
+                                                        // 让空转的 worker 来领。
+                                                        // 只改 part.E（收缩自己的右边界），
+                                                        // 不动任何已写字节 → 断点续传元数据仍然兼容。
+                                                        long nextYieldCheck = written + YieldCheckBytes;
+                                                        // 【2026-11-09 修】让片检查改成**按时间**触发。
+                                                        // 原来按字节（每 512KB）→ 8 B/s 时要 17 小时才检查一次，
+                                                        // 收尾慢速期永远不触发，方向完全反了。
+                                                        long nextYieldMs = NowMs() + YieldCheckMs;
                                                         while (true)
                                                         {
                                                             cancelToken.ThrowIfCancellationRequested();
                                                             if (pause != null)
                                                                 await pause.WaitIfPausedAsync(cancelToken).ConfigureAwait(false);
+
+                                                            // ---- 中途让片检查（按时间）----
+                                                            long nowMs = NowMs();
+                                                            if (nowMs >= nextYieldMs)
+                                                            {
+                                                                nextYieldMs = nowMs + YieldCheckMs;
+                                                                // 【2026-11-09 修】让片现在会**掐断自己**并返回 true。
+                                                                // 这时必须放弃本片、回领片循环 —— 不能继续把整片下完，
+                                                                // 否则切出去的区间会被下两遍（done 虚高、超总大小）。
+                                                                // yieldedSelf 让 catch 分支知道"别再把本片塞回队列"。
+                                                                yieldedSelf = TryYieldTailOfPart(plan, part, idx, queue, splitLock,
+                                                                        Volatile.Read(ref activeConns), workerCount,
+                                                                        new[] { partCapacity }, pcts);
+                                                                if (yieldedSelf)
+                                                                {
+                                                                    // 本片剩余部分已交给队列，自己回去领新活。
+                                                                    // 走到 catch(OperationCanceledException) 里按"被抢占"处理：
+                                                                    // 不计失败、不退避。
+                                                                    //
+                                                                    // 若本片被收缩成"一个字节都不剩"（W 已等于新长度），
+                                                                    // 补一次完成标记 —— 合并线程要等它才敢删分片文件。
+                                                                    if (mergeMode && Volatile.Read(ref part.W) >= (part.E - part.S + 1))
+                                                                        Volatile.Write(ref partDone[idx], 1);
+                                                                    throw new OperationCanceledException(partToken);
+                                                                }
+                                                            }
+
+                                                            // 【2026-11-09 诊断】卡在读上的连接是"尾部掉速"最可疑的成因：
+                                                            // net48 下内容流 ReadAsync **不响应取消令牌**（代码里早有注释），
+                                                            // 若 CDN 掐着连接不发数据，worker 会一直阻塞在这里，
+                                                            // 抢占的 cts.Cancel() 也掐不断，只能等 TCP 超时（可达数分钟）。
+                                                            // 这行日志能直接回答："到底卡了多久、还是根本没数据"。
+                                                            long readStartedMs = NowMs();
+
                                             int n = await stream.ReadAsync(buf, 0, buf.Length, ioTok).ConfigureAwait(false);
                                             if (n <= 0)
                                                 break;
+
+                                            // 【2026-11-09 诊断】这一次读花了多久？>8 秒说明连接被 CDN 掐住了。
+                                            // 只在异常慢的时候打，正常读取一行都不输出。
+                                            long readCostMs = NowMs() - readStartedMs;
+                                            if (readCostMs >= 8000)
+                                            {
+                                                Log?.Invoke(string.Format(
+                                                    "[诊断·慢读] 片{0} 一次 ReadAsync 花了 {1}s 才返回 {2} 字节"
+                                                    + "（进度 {3}/{4}）。net48 的流读取不响应取消令牌，"
+                                                    + "抢占掐不断这种阻塞。",
+                                                    idx, readCostMs / 1000.0, n,
+                                                    Fmt(part.W), Fmt(part.E - part.S + 1)));
+                                            }
+
+                                            // 🚨🚨【2026-11-09 修·数据正确性】按**实时**右边界截断。
+                                            //
+                                            // 【用户实测】新任务下到 100% 时显示
+                                            // 「31.34 MB / 29.49 MB」—— 已下载**超过**文件总大小，
+                                            // 而且最后速度归 0 卡死。
+                                            //
+                                            // 【根因】这是 2026-11-02 加"中途让片"时引入的：
+                                            //   ① 领片时 `segSize = part.E - part.S + 1` 算一次，之后冻结；
+                                            //   ② HTTP 请求的 Range 在**发请求那一刻**用当时的 part.E；
+                                            //   ③ 让片（TryYieldTailOfPart）会**中途把 part.E 改小**；
+                                            //   ④ 但已发出的响应不会被回撤 —— 服务端仍按旧 Range
+                                            //      把数据一路送到底；
+                                            //   ⑤ 这里的写入循环**原来完全不看 part.E**，
+                                            //      收到多少就写多少、`done` 加多少。
+                                            // 结果：被让出去的那段数据在**自己**这里也写了一遍，
+                                            // done 因此虚高（31.34 > 29.49），而新片还会再下一遍同样的区间。
+                                            //
+                                            // 对比 YunX：它的 ElasticAllocator.take() 一次性给出
+                                            // `LongRange`，worker 拿到后**边界永不改变**，
+                                            // 所以根本没这个窗口期。GeZi 的让片是"事后收缩"，
+                                            // 必须自己补上这个不变量。
+                                            //
+                                            // 【修法】每读一块都重新读 part.E，只接受**还属于本片**的字节；
+                                            // 超出的部分直接丢弃（最多浪费当前请求的尾巴，可接受）。
+                                            long liveEnd = part.E;                    // 实时右边界（让片可能刚改小）
+                                            long allowedSize = liveEnd - part.S + 1;
+                                            if (allowedSize < 0) allowedSize = 0;
+                                            long remainAllowed = allowedSize - written;
+                                            if (remainAllowed <= 0)
+                                                break;                                // 已经没有属于本片的空间
+                                            if (n > remainAllowed)
+                                                n = (int)remainAllowed;               // 截断超出部分
+
                                             // 【2026-10-20 移植】暂停必须在**写盘前**再查一次：
                                             // net48 下内容流读取**不响应取消令牌**（实测确认，见原仓库同处注释），
                                             // 暂停那一刻在途的读会带着数据正常返回 —— 若这里不拦，就照样写盘、
@@ -3694,11 +4280,16 @@ namespace GeZi.Core.Download
                                                     }
                                                 }
 
-                                                if (written < segSize)
+                                                // 🚨【2026-11-09 修】判定"本片是否下完"必须用**实时**边界，
+                                                //   不能用领片时冻结的 segSize —— 让片会中途把 part.E 改小，
+                                                //   用旧 segSize 判断会把"已被收缩的片"误判成不完整，
+                                                //   于是一遍遍重试（这也是"最后 0 B/s 卡死"的成因之一）。
+                                                long finalSize = part.E - part.S + 1;
+                                                if (written < finalSize)
                                                 {
                                                     // 连接被中途掐断：已写入的部分保留（part.W 已更新），
                                                     // 下一轮重试会从断点继续，不会重复下载。
-                                                    lastErr = "分片不完整 " + written + "/" + segSize;
+                                                    lastErr = "分片不完整 " + written + "/" + finalSize;
                                                     continue;
                                                 }
                                             }
@@ -3737,7 +4328,13 @@ namespace GeZi.Core.Download
                                     {
                                         // 回普通队列前释放认领，下一轮才能重新领到这一片
                                         Interlocked.Exchange(ref claimed[idx], 0);
-                                        queue.Enqueue(idx);
+                                        // 【2026-11-09 修】让片已经把这个片的剩余部分切出去、
+                                        // 并把本片收缩成"已下完"。此时**不能**再把它塞回队列 ——
+                                        // 否则 worker 领到后要走一遍无用判断，更糟的是若边界处理
+                                        // 有偏差就会和新片区间重叠、重复下载（done 虚高）。
+                                        // 让片场景由 TryYieldTailOfPart 自己负责标记完成。
+                                        if (!yieldedSelf)
+                                            queue.Enqueue(idx);
                                         Interlocked.Increment(ref preemptedCount);
                                         // ⚠️ 【2026-10-04 修】必须把 lastErr 清掉再跳出。
                                         // 这片被抢占后会**重新入队、由别的 worker 接着下**，
@@ -3750,8 +4347,21 @@ namespace GeZi.Core.Download
                                         lastErr = null;
                                         break;   // 跳出 attempt 循环，回去领下一片
                                     }
-                                    catch (OperationCanceledException)
+                                    catch (OperationCanceledException oce)
                                     {
+                                        // 🚨【2026-11-09 新增·必须】HttpClient.Timeout 到点会抛
+                                        // TaskCanceledException（继承自 OperationCanceledException），
+                                        // 而下面的 catch-all 会把它当成「用户取消」→ **整个任务被判失败**。
+                                        // 但它其实只是"这一片被 CDN 挂太久"，应当按普通网络错误重试。
+                                        //
+                                        // 判据：partToken 没被取消 && 外部 cancelToken 也没取消
+                                        //       → 既不是抢占也不是用户取消 → 那就是超时。
+                                        if (!partToken.IsCancellationRequested && !cancelToken.IsCancellationRequested)
+                                        {
+                                            lastErr = "请求超时（" + DownloadRequestTimeoutSec + "s 未完成，疑似 CDN 挂起连接）";
+                                            continue;   // 走重试（下一次会是全新连接）
+                                        }
+
                                         Interlocked.Exchange(ref cancelled, 1);
                                         AddError("已取消");
                                         // 同前：仅外部令牌取消才算用户取消

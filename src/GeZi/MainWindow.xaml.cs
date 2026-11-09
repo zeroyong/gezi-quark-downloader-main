@@ -31,6 +31,7 @@ using System.Windows.Data;                  // Binding（同上）
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;          // BitmapImage（登录页头像加载）
 using System.Windows.Threading;
 using GeZi.Core.Api;
 using GeZi.Core.Download;
@@ -101,6 +102,16 @@ namespace GeZi
             public List<string> PathList = new List<string>();
             public string PwdId;
             public string Stoken;
+            /// <summary>
+            /// 分享的父文件夹名（<c>_shareRootName</c>）。
+            ///
+            /// <para>【2026-10-25 补】快照里原来**没有这一项**，于是
+            /// 「分享模式 → 切到我的网盘 → 再切回分享」之后，
+            /// <c>ResetNav()</c> 把 <c>_shareRootName</c> 清成空串、
+            /// 而 ApplyNav 又不会还原它 —— 面包屑和历史记录当场退化成「根目录」。
+            /// 这类"切个模式就丢名字"的问题极难让用户描述清楚，必须在这里存住。</para>
+            /// </summary>
+            public string ShareRootName = "";
         }
 
         /// <summary>「分享」模式与「我的网盘」模式各自的导航快照。</summary>
@@ -403,6 +414,51 @@ namespace GeZi
             _scheduler.Log = LogFromWorker;
             _scheduler.Diagnostics = OnDiagnostics;
             LoadSettingsToUi();
+
+            // 【2026-11-02 修·回归】恢复上次选中的平台。
+            // 原来 _loginPlatform 硬编码默认 "uc" 且从不持久化，于是每次启动都跳回默认值，
+            // 与用户上次用的平台不一致 —— 表现就是「启动后无法恢复之前的浏览历史」
+            // （上次看的是 UC 分享，这次却拿夸克去重解析 → 必失败）。
+            try
+            {
+                string saved = _settings == null ? null : _settings.LoginPlatform;
+                if (!string.IsNullOrEmpty(saved)
+                    && (saved == "uc" || saved == "quark"))
+                {
+                    _loginPlatform = saved;
+                }
+                else if (!string.IsNullOrEmpty(_settings.LastBrowseProviderId))
+                {
+                    // 老配置没有 LoginPlatform → 用"上次浏览的平台"兜底
+                    _loginPlatform = _settings.LastBrowseProviderId;
+                }
+
+                // 【2026-11-02 修】冷启动恢复 UC 登录态。
+                //
+                // 【为什么必须做】UC 登录时只写了 AccountStore，没写 _settings，
+                // 而且 _ucClient 是内存对象、重启就没了。于是重启后：
+                //   · 左下角账号卡不显示 UC 用户；
+                //   · Cookie 输入框是空的（用户反馈「粘贴的 cookie 重启后不见了」）；
+                //   · 恢复浏览位置拿不到 UC 客户端。
+                // 现在按设置里存的 UcCookie 现场重建客户端与昵称。
+                if (string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase)
+                    && !string.IsNullOrEmpty(_settings.UcCookie))
+                {
+                    try
+                    {
+                        _ucClient = new GeZi.Core.Api.UcClient(_settings.UcCookie);
+                        _ucProvider = new GeZi.Core.Pan.UcProvider(_ucClient);
+                        _ucNick = _settings.UcWho ?? "";
+                        _ucAvatarUrl = _settings.UcAvatarUrl ?? "";
+                        // 【2026-11-02】先用上次缓存的容量垫上，避免界面一片"未知"
+                        _ucTotal = _settings.UcTotalCapacity;
+                        _ucUsed = _settings.UcUsedCapacity;
+                        LogDetail("已恢复 UC 登录态：" + _ucNick);
+                    }
+                    catch (Exception ex) { LogDetail("恢复 UC 登录态失败：" + ex.Message); }
+                }
+            }
+            catch { }
             // 【2026-10-23】把更新模块的诊断接到「运行日志」。
             //
             // ⚠️ 一律走 LogDetail（详细级）：这些是**排查用**的内部状态
@@ -475,6 +531,32 @@ namespace GeZi
                 // 清扫只回收"超过阈值没被碰过"的孤儿分片，不会动正在续传的，
                 // 但顺序上仍让清扫先跑，避免把刚被判定为待续的分片误伤（mtime 很新，实际不会）。
                 StartPartsSweep();
+
+                // 【2026-11-02】登录页的平台布局要在窗口加载后初始化一次：
+                // 默认平台可能是 uc（记住上次选择），此时必须立刻套用全宽布局，
+                // 否则会先按夸克的两栏摆出来、切一下才正常。
+                try
+                {
+                    ApplyPlatformVisual();
+                    RefreshLoginPlatformView();
+                    // 【2026-11-02】启动时按当前模式决定「清空当前目录」是否显示
+                    UpdateEmptyDirButtonVisibility(ShareMode);
+                }
+                catch { }
+
+                // 【2026-11-02 新增】启动后自动拉一次容量。
+                //
+                // 【为什么需要】用户反馈：「每次你重启后 这个账号信息 都没了，
+                // 两个必须要再点导入并登录」。根因是登录态其实已经恢复了
+                // （昵称/头像/Cookie 都从设置里读到了），但**容量从来没主动拉过** ——
+                // 所以界面永远显示"容量未知"，看起来就像没登录。
+                // 这里在窗口就绪后异步补一次，不阻塞界面。
+                var ignoredCapacityKick = Dispatcher.BeginInvoke(
+                    new Action(async () =>
+                    {
+                        try { await RefreshCapacityAsync(); } catch { }
+                    }),
+                    System.Windows.Threading.DispatcherPriority.Background);
 
                 // 【2026-10-13 移除】原来这里会用 Idle 优先级弹「未完成的任务」询问框。
                 // 现在任务页本身就会把上次的任务（含未完成的进度）恢复成列表行，
@@ -1120,6 +1202,13 @@ namespace GeZi
             bool nowShare = ShareMode;
             SharePanel.Visibility = nowShare ? Visibility.Visible : Visibility.Collapsed;
 
+            // 【2026-11-02 修】「清空当前目录」只对**自己的网盘**有意义 ——
+            // 分享里的文件属于分享者，删不得。原来这个按钮在分享模式下也照常显示，
+            // 用户点下去才弹"只能清空自己的网盘"，属于明显误导。
+            // 用户原话：「下载页的清空当前目录 为啥分享页面也展示 它只适用于：夸克网盘 /我的网盘
+            // 这样容易误导人」。所以这里直接隐藏。
+            UpdateEmptyDirButtonVisibility(nowShare);
+
             // ① 先把**离开的那个模式**的导航状态存下来
             CaptureNav(nowShare ? _driveNav : _shareNav);
 
@@ -1149,6 +1238,25 @@ namespace GeZi
             }
         }
 
+        /// <summary>
+        /// 按当前模式/平台决定「清空当前目录」按钮是否显示（2026-11-02 新增）。
+        ///
+        /// <para>【为什么】它只对**自己的网盘**有意义：分享里的文件属于分享者，删不得。
+        /// 原来在分享模式下也照常显示，用户点下去才弹一句"只能清空自己的网盘" —— 明显误导。
+        /// 另外 UC 没有 Delete 能力，也不该显示。</para>
+        /// </summary>
+        private void UpdateEmptyDirButtonVisibility(bool nowShare)
+        {
+            try
+            {
+                if (EmptyDirBtn == null) return;
+                bool canDelete = CurrentHasCaps(GeZi.Core.Pan.PanCapabilities.Delete);
+                EmptyDirBtn.Visibility = (!nowShare && canDelete)
+                    ? Visibility.Visible : Visibility.Collapsed;
+            }
+            catch { }
+        }
+
         /// <summary>把当前导航状态存进指定快照。</summary>
         private void CaptureNav(NavSnapshot into)
         {
@@ -1159,6 +1267,8 @@ namespace GeZi
             into.PathList = _pathList.ToList();
             into.PwdId = _pwdId;
             into.Stoken = _stoken;
+            // 【2026-10-25】分享父文件夹名也要存：否则切模式回来会丢（见字段注释）
+            into.ShareRootName = _shareRootName ?? "";
         }
 
         /// <summary>把快照还原成当前导航状态（含分享的 pwd_id / stoken）。</summary>
@@ -1180,6 +1290,8 @@ namespace GeZi
 
             _pwdId = s.PwdId;
             _stoken = s.Stoken;
+            // 【2026-10-25】还原分享父文件夹名，保证面包屑/分组名切模式后不丢
+            _shareRootName = s.ShareRootName ?? "";
 
             UpdatePathText();
             UpdateEmptyStates();
@@ -1224,6 +1336,11 @@ namespace GeZi
                     _settings.LastSharePwdId = _pwdId ?? "";
                     _settings.LastSharePasscode = _sharePasscode ?? "";
                     _settings.LastShareStartFid = string.IsNullOrEmpty(_shareStartFid) ? "0" : _shareStartFid;
+                    // 【2026-11-02】存**真实链接**。恢复时按它的域名判断平台，
+                    // 这是唯一可靠的依据 —— 记录字段可能是老配置留下的空值。
+                    if (!string.IsNullOrEmpty(_lastShareUrl))
+                        _settings.LastShareUrl = _lastShareUrl;
+                    _settings.LastBrowseProviderId = CurrentProviderId();
                 }
                 else
                 {
@@ -1231,6 +1348,9 @@ namespace GeZi
                     _settings.LastSharePwdId = "";
                     _settings.LastSharePasscode = "";
                     _settings.LastShareStartFid = "0";
+                    _settings.LastShareUrl = "";
+                    // 「我的网盘」目前只有夸克支持
+                    _settings.LastBrowseProviderId = "quark";
                 }
 
                 // 祖先链：_fidStack.ToList() 是"栈顶在前" = [上一层, …, 根]，反转成 [根, …, 上一层]
@@ -1428,7 +1548,7 @@ namespace GeZi
                 try
                 {
                     if (LinkBox != null && string.IsNullOrEmpty(LinkBox.Text))
-                        LinkBox.Text = "https://pan.quark.cn/s/" + pwdId;
+                        LinkBox.Text = RestoredShareUrl(pwdId);
                     if (PassBox != null && string.IsNullOrEmpty(PassBox.Text.Trim())
                         && !string.IsNullOrEmpty(_settings.LastSharePasscode))
                         PassBox.Text = _settings.LastSharePasscode;
@@ -1445,25 +1565,86 @@ namespace GeZi
                 try
                 {
                     if (LinkBox != null && string.IsNullOrEmpty(LinkBox.Text))
-                        LinkBox.Text = "https://pan.quark.cn/s/" + pwdId;
+                        LinkBox.Text = RestoredShareUrl(pwdId);
                     if (PassBox != null && string.IsNullOrEmpty(PassBox.Text.Trim())
                         && !string.IsNullOrEmpty(_sharePasscode))
                         PassBox.Text = _sharePasscode;
                 }
                 catch { }
 
-                // 拿 stoken 后才能真正拉目录（分享过期 / 提取码变了会在这里失败）
-                _client?.Dispose();
-                _client = new QuarkClient(_settings.Cookie);
+                // 【2026-11-02 三修】按**链接域名**决定平台 —— 这才是唯一可靠依据。
+                //
+                // 前两版都错在"猜"：
+                //   ① 硬编码 QuarkClient → UC 分享必然失败；
+                //   ② 按 LastBrowseProviderId 走，但那是新字段、老配置里为空 → 回退 "quark"
+                //      → 仍然拿夸克请求 UC 分享 → 用户实测日志 `[获取分享凭证] 分享不存在`。
+                // 用户的原话：「你根据链接来啊，是夸克平台 直接请求夸克对应不就行了」。
+                //
+                // 所以：先看存下来的**真实链接**的域名；没有链接才退回记录字段；
+                // 两者都没有才按"当前平台 → 另一个"的顺序兜底尝试。
+                var candidates = new List<string>();
+                string byUrl = PlatformOfShareUrl(_settings.LastShareUrl);
+                if (!string.IsNullOrEmpty(byUrl)) candidates.Add(byUrl);
 
-                var shareInfo = await _client.GetShareInfoAsync(pwdId, _sharePasscode);
-                if (shareInfo == null || string.IsNullOrEmpty(shareInfo.Stoken))
+                string recorded = _settings.LastBrowseProviderId;
+                if (!string.IsNullOrEmpty(recorded) && !candidates.Contains(recorded))
+                    candidates.Add(recorded);
+
+                if (!candidates.Contains(_loginPlatform)) candidates.Add(_loginPlatform);
+                string other = string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase)
+                    ? "quark" : "uc";
+                if (!candidates.Contains(other)) candidates.Add(other);
+
+                GeZi.Core.Pan.IPanProvider provider = null;
+                GeZi.Core.Pan.ShareTicket ticket = null;
+                string usedPlatform = null;
+
+                foreach (var cand in candidates)
+                {
+                    var prov = await BuildProviderForAsync(cand);
+                    if (prov == null) continue;
+
+                    try
+                    {
+                        var t = await prov.ResolveShareAsync(pwdId, _sharePasscode);
+                        if (t != null && !string.IsNullOrEmpty(t.Stoken))
+                        {
+                            provider = prov;
+                            ticket = t;
+                            usedPlatform = cand;
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // 这个平台解析不了（多半是"分享不存在"）→ 换下一个试试
+                        LogDetail("用 " + cand + " 恢复分享失败：" + ex.Message);
+                    }
+                }
+
+                if (provider == null || ticket == null)
                 {
                     Log("上次的分享已失效（可能过期或需要提取码），已回到根目录。");
                     ResetNav();
                     return;
                 }
-                _stoken = shareInfo.Stoken;
+
+                // 还原到真正成功的那个平台
+                if (!string.Equals(usedPlatform, _loginPlatform, StringComparison.OrdinalIgnoreCase))
+                {
+                    _loginPlatform = usedPlatform;
+                    ApplyPlatformVisual();
+                    RefreshLoginPlatformView();
+                }
+                _settings.LastBrowseProviderId = usedPlatform;
+
+                _stoken = ticket.Stoken;
+                // 【2026-10-25 修】恢复上次浏览位置时也要还原分享父文件夹名。
+                //
+                // 这里已经调过 GetShareInfoAsync，Title 就在手上 —— 不设的话
+                // 重启后面包屑与历史会再次退化成「根目录」（本函数上游
+                // RestoreChainThenLoadAsync 只重建 _pathList，不管这个名字）。
+                _shareRootName = ticket.Title ?? "";
                 _linkCache.Clear();
                 _dirCache.Clear();
                 _dirSizeCache.Clear();
@@ -1822,19 +2003,62 @@ namespace GeZi
                 Log("无法从链接解析出分享 ID");
                 return;
             }
+
+            // 【2026-11-02 修·回归】**不要**在这里按链接域名强行切平台。
+            //
+            // 原因：历史记录与「恢复上次浏览位置」构造的都是 `https://pan.quark.cn/s/<pwdId>`
+            // 这种**夸克格式的 URL**（见 OnHistoryItemClick / RestoreSharePositionAsync），
+            // 哪怕这条分享其实来自 UC 平台。如果按 URL 域名切平台，就会出现：
+            //   用户登录的是 UC → 点历史记录 → 被强行切成夸克 → 夸克没登录 Cookie
+            //   → 解析必然失败。用户实测反馈「点击之前的历史记录 都无法解析了」。
+            //
+            // 所以平台**只认用户的显式选择**（顶部平台切换按钮 / 登录页选择），
+            // URL 域名不参与决策。要在 URL 层带上平台，得把平台一起存进历史记录，
+            // 那是另一件事（见 ShareHistoryEntry 的 ProviderId）。
+
             string passcode = string.IsNullOrEmpty(PassBox.Text.Trim()) ? info.Passcode : PassBox.Text.Trim();
             // 整段分享文案里自带提取码时，把它回填到输入框 —— 让用户看得见"用了什么码"，
             // 否则解析失败时完全不知道是码错了还是别的原因。
             if (!string.IsNullOrEmpty(info.Passcode) && PassBox.Text.Trim() != info.Passcode)
                 PassBox.Text = info.Passcode;
             _pwdId = info.PwdId;
+            // 【2026-11-02】存下**用户真正粘贴的那条链接**。
+            // 以前各处用 "https://pan.quark.cn/s/" + pwdId 反推，UC 的分享也会被
+            // "变成"夸克链接，平台信息就丢了 —— 恢复时只能靠猜。
+            _lastShareUrl = url;
             _linkCache.Clear();   // 换分享后旧 fid 的直链不再适用
             // 目录缓存与大小缓存同理：fid 是分享内的编号，换了分享再留着会张冠李戴。
             _dirCache.Clear();
             _dirSizeCache.Clear();
 
-            _client?.Dispose();
-            _client = new QuarkClient(_settings.Cookie);
+            // 【2026-11-02 修】按**链接域名**决定用哪个平台解析。
+            // 用户原话：「你根据链接来啊，是夸克平台 直接请求夸克对应不就行了」。
+            // 这是最可靠的依据 —— 用户粘的是哪家的链接，就用哪家的客户端。
+            string linkPlatform = PlatformOfShareUrl(url);
+            if (!string.IsNullOrEmpty(linkPlatform)
+                && !string.Equals(linkPlatform, _loginPlatform, StringComparison.OrdinalIgnoreCase))
+            {
+                string prevP = _loginPlatform;
+                _loginPlatform = linkPlatform;
+                SwapCookieDraft(prevP, linkPlatform);
+                ApplyPlatformVisual();
+                RefreshLoginPlatformView();
+                Log("链接来自 " + CurrentProviderName() + "，已自动切换平台。");
+            }
+
+            // 【2026-11-02 P1】解析走接口层：按当前平台拿 provider，不再硬编码 QuarkClient。
+            // 夸克未登录时 _client 仍会建（游客链路可用），所以这里保底造一个夸克 provider。
+            var provider = CurrentProvider;
+            if (provider == null)
+            {
+                EnsureQuarkProvider();
+                provider = CurrentProvider;
+            }
+            if (provider == null)
+            {
+                Log("当前平台还没有可用的客户端，请先登录。");
+                return;
+            }
 
             // 解析要发两次网络请求（换 stoken + 拉目录），期间必须让用户看到"在忙"
             long t0 = BusyClock();
@@ -1842,8 +2066,8 @@ namespace GeZi
             SetBusy(true);
             try
             {
-                var shareInfo = await _client.GetShareInfoAsync(info.PwdId, passcode);
-                _stoken = shareInfo.Stoken;
+                var ticket = await provider.ResolveShareAsync(info.PwdId, passcode);
+                _stoken = ticket == null ? "" : ticket.Stoken;
                 if (string.IsNullOrEmpty(_stoken))
                 {
                     Log("获取分享凭证失败（可能需登录或提取码错误）");
@@ -1857,10 +2081,34 @@ namespace GeZi
                 // _curFid 之后会随用户导航变化，不能当分享起点用。
                 _sharePasscode = passcode ?? "";
                 _shareStartFid = string.IsNullOrEmpty(info.StartFid) ? "0" : info.StartFid;
-                // 链接直接指向某个子目录（#/list/share/<fid>）时，列表里只有它的子项，
-                // 拿不到它自己的名字 —— 用分享标题兜底，作为任务分组的名字。
-                _shareRootName = info.StartFid != "0" ? (shareInfo.Title ?? "") : "";
+                // 分享的"父文件夹名"，供面包屑与任务分组显示。
+                //
+                // 【2026-10-24 第二次修：不再区分 StartFid 是否为 0】
+                //
+                // 原实现：`info.StartFid != "0" ? shareInfo.Title : ""`
+                // —— 只有链接带 `#/list/share/<fid>` 时才取值。
+                //
+                // 【为什么那样是错的】用户实测两种链接表现不一致：
+                //   · 带子目录 → 名字正确（31876）
+                //   · 裸链接   → 面包屑仍是「根目录」、历史仍是「（根目录）· N 个文件」
+                // 但裸链接同样有分享标题，赛个空串没有任何道理 ——
+                // 只是当时以为"根目录的列表里就能看到文件夹名，不需要标题"。
+                // 而实际分享根目录可能**直接就是一堆散文件**（本例只有 1 个 exe），
+                // 列表里根本没有文件夹可用，于是退化成「（根目录）」。
+                //
+                // 现在统一取 Title。分享者没设标题时夸克会回退成分享编号
+                // （本例 `31876`），仍然比"根目录"更能让用户认出是哪条分享。
+                _shareRootName = ticket.Title ?? "";
                 await LoadDirAsync(_curFid);
+                // 【2026-10-24 修】解析完成后必须重刷一次面包屑。
+                //
+                // 【为什么原来漏了】UpdatePathText() 只在「切换模式 / 重置导航 /
+                // 上一级 / 单click进子目录」这几处调用，**解析流程里没有**。
+                // 而 BuildCrumbs() 依赖 _shareRootName（分享标题）——
+                // 这个值在第 1862 行才被赋值，晚于唯一那次 ResetNav() 里的刷新，
+                // 所以首次解析后面包屑一直停在初始的「根目录」不动。
+                // 用户实测：「链接带 #/list/share/<fid> 时只显示根目录」。
+                UpdatePathText();
                 Log("解析成功。单击文件夹进入子目录；选中文件后点「下载选中」即可下载"
                     + "（文件夹要先选中：Shift / Ctrl+点击，或右键该行）。");
                 RecordShareHistory(info.PwdId, passcode, info.StartFid);
@@ -2181,10 +2429,10 @@ namespace GeZi
                 string text = TryReadClipboardText();
                 if (string.IsNullOrEmpty(text)) return;
 
-                string url = FindQuarkShareUrl(text);
+                string url = FindShareUrl(text);
                 if (string.IsNullOrEmpty(url))
                 {
-                    // 不是夸克分享链接（含"夸克口令"）。这里**刻意什么都不做、也不弹窗**：
+                    // 不是可识别的分享链接（含"夸克口令"）。这里**刻意什么都不做、也不弹窗**：
                     // 剪贴板通知不是用户在本程序里发起的动作，为一句"这不能解析"打断他很粗暴
                     // —— 何况口令在聊天记录里到处都是，复制顺手就会触发。
                     return;
@@ -2192,6 +2440,23 @@ namespace GeZi
 
                 var info = ShareUrlParser.Parse(url);
                 if (string.IsNullOrEmpty(info.PwdId)) return;
+
+                // 【2026-11-02 P1】剪贴板里是**用户真实复制来的链接**，域名可信，
+                // 所以允许据此自动切平台 —— 但有个硬前提：目标平台必须**已登录**。
+                //
+                // 【为什么加这个前提】不加的话，用户登录夸克、随手复制一条 UC 链接，
+                // 程序会切到 UC 然后将 UC 未登录的解析失败甩给他。
+                // 已登录才切 = 永远切到一个"能干活"的平台。
+                string detected = PlatformOfShareUrl(url);
+                if (!string.IsNullOrEmpty(detected)
+                    && !string.Equals(detected, _loginPlatform, StringComparison.OrdinalIgnoreCase)
+                    && IsPlatformLoggedIn(detected))
+                {
+                    _loginPlatform = detected;
+                    ApplyPlatformVisual();
+                    RefreshLoginPlatformView();
+                    Log("剪贴板里发现 " + CurrentProviderName() + " 分享链接，已自动切换平台。");
+                }
 
                 if (string.Equals(info.PwdId, _clipboardLastPwdId, StringComparison.Ordinal))
                 {
@@ -2212,19 +2477,23 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 从一段文本里找出**夸克网盘**的分享链接；找不到返回 null。
+        /// 从一段文本里找出**可识别的网盘分享链接**；找不到返回 null。
         ///
         /// 🚨 这里必须比「粘贴进链接框」（<see cref="OnLinkBoxPasting"/>）严得多：
         ///    · 粘贴是用户在**本程序里**的明确动作，识别宽松些最多是顺手填个框；
         ///    · 剪贴板监听是**后台自己发起**的，认错就会把用户正在复制的别的东西
-        ///      （比如别的网盘恰好也叫 /s/ 的链接）当夸克链接去请求、还把他的界面切走。
-        /// 所以域名必须真的是夸克的，`/s/` 只是必要条件。
+        ///      （比如别的网盘恰好也叫 /s/ 的链接）当分享链接去请求、还把他的界面切走。
+        /// 所以域名必须真的是我们支持的网盘，`/s/` 只是必要条件。
+        ///
+        /// <para>【2026-11-02 P1】从 <c>FindQuarkShareUrl</c> 改名：原来只认 quark.cn，
+        /// 复制 UC 链接完全不响应（用户实测反馈「为什么我复制了UC链接 没有自动解析」）。
+        /// 现在按 <see cref="SupportedShareHosts"/> 白名单判定。</para>
         ///
         /// 【顺带解决了"自己写剪贴板"的死循环】本程序有唯一一处 Clipboard.SetText
-        /// （诊断面板「复制诊断文本」），写的是制表符分隔的文件名 —— 不含夸克域名，
+        /// （诊断面板「复制诊断文本」），写的是制表符分隔的文件名 —— 不含网盘域名，
         /// 因此不会触发自己，不需要额外的"自写抑制"标记。
         /// </summary>
-        private static string FindQuarkShareUrl(string text)
+        private static string FindShareUrl(string text)
         {
             if (string.IsNullOrEmpty(text)) return null;
             if (text.Length > MaxClipboardScanChars) return null;
@@ -2241,7 +2510,7 @@ namespace GeZi
                 while (cut < u.Length && IsUrlChar(u[cut])) cut++;
                 u = u.Substring(0, cut).TrimEnd('.', ',', ';', '!', '?');
 
-                if (!IsQuarkHost(u)) continue;
+                if (!IsShareHost(u)) continue;
                 return u;
             }
             return null;
@@ -2255,19 +2524,47 @@ namespace GeZi
             return "-._~:/?#[]@!$&'()*+,;=%".IndexOf(c) >= 0;
         }
 
-        /// <summary>URL 的主机是不是夸克自己（<c>quark.cn</c> / <c>*.quark.cn</c>）。</summary>
-        private static bool IsQuarkHost(string url)
+        /// <summary>
+        /// 支持的分享域名白名单（主机后缀 → 平台 id）。
+        /// <para>加新平台时**只改这里**，剪贴板识别与自动切平台都会跟着生效。</para>
+        /// </summary>
+        private static readonly Dictionary<string, string> SupportedShareHosts =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                { "quark.cn", "quark" },
+                { "uc.cn", "uc" },
+            };
+
+        /// <summary>URL 的主机是不是我们支持的某个网盘。</summary>
+        private static bool IsShareHost(string url)
+        {
+            return !string.IsNullOrEmpty(PlatformOfShareUrl(url));
+        }
+
+        /// <summary>从 URL 主机推断平台 id（"quark" / "uc"）；不是支持的域名返回 null。</summary>
+        private static string PlatformOfShareUrl(string url)
         {
             try
             {
                 Uri u;
-                if (!Uri.TryCreate(url, UriKind.Absolute, out u)) return false;
-                if (u.Scheme != Uri.UriSchemeHttp && u.Scheme != Uri.UriSchemeHttps) return false;
+                if (!Uri.TryCreate(url, UriKind.Absolute, out u)) return null;
+                if (u.Scheme != Uri.UriSchemeHttp && u.Scheme != Uri.UriSchemeHttps) return null;
                 string h = u.Host;
-                return h.Equals("quark.cn", StringComparison.OrdinalIgnoreCase)
-                    || h.EndsWith(".quark.cn", StringComparison.OrdinalIgnoreCase);
+                foreach (var kv in SupportedShareHosts)
+                {
+                    if (h.Equals(kv.Key, StringComparison.OrdinalIgnoreCase)
+                        || h.EndsWith("." + kv.Key, StringComparison.OrdinalIgnoreCase))
+                        return kv.Value;
+                }
             }
-            catch { return false; }
+            catch { }
+            return null;
+        }
+
+        /// <summary>URL 的主机是不是夸克自己（保留给既有调用点）。</summary>
+        private static bool IsQuarkHost(string url)
+        {
+            return string.Equals(PlatformOfShareUrl(url), "quark", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -2601,9 +2898,32 @@ namespace GeZi
 
             HideHistoryPanel();
 
+            // 【2026-11-02 三修】按**记录里的真实链接**判断平台。
+            // 用户原话：「你根据链接来啊，是夸克平台 直接请求夸克对应不就行了」。
+            // 老记录没有 ShareUrl → 退回 ProviderId → 再退回当前平台。
+            string url = it.ShareUrl;
+            string recPlatform = PlatformOfShareUrl(url);
+            if (string.IsNullOrEmpty(recPlatform))
+                recPlatform = it.EffectiveProviderId;
+
+            if (!string.IsNullOrEmpty(recPlatform)
+                && !string.Equals(recPlatform, _loginPlatform, StringComparison.OrdinalIgnoreCase))
+            {
+                _loginPlatform = recPlatform;
+                ApplyPlatformVisual();
+                RefreshLoginPlatformView();
+                Log("该分享属于 " + CurrentProviderName() + "，已切回对应平台。");
+            }
+
+            // 没有原始链接时按平台拼一个（至少域名对）
+            if (string.IsNullOrEmpty(url))
+            {
+                string host = string.Equals(recPlatform, "uc", StringComparison.OrdinalIgnoreCase)
+                    ? "https://drive.uc.cn/s/" : "https://pan.quark.cn/s/";
+                url = host + it.PwdId;
+            }
             // 原来那条链接指向某个子目录时，把 fid 也拼回去：OnParseClick 会把它当成
             // start_fid，于是回到上次看的那个目录，而不是分享根目录。
-            string url = "https://pan.quark.cn/s/" + it.PwdId;
             if (!string.IsNullOrEmpty(it.StartFid) && it.StartFid != "0")
                 url += "/" + it.StartFid;
 
@@ -2616,13 +2936,64 @@ namespace GeZi
         {
             try
             {
-                // 名字取"解析后看到的第一个文件夹" —— 这正是用户认这条记录的依据；
-                // 分享根目录只有散文件时退化成「（根目录）· N 个文件」。
-                var firstDir = _files.FirstOrDefault(f => f.IsDir);
-                string name = firstDir != null
-                    ? firstDir.Name
-                    : "（根目录）· " + _files.Count + " 个文件";
-                HistoryStore.AddShareHistory(pwdId, passcode, startFid, name, firstDir != null);
+                // 名字**直接复用下载时的分组名**，不再自己另算一套。
+                //
+                // 【2026-10-24 修：链接带子目录时历史记录显示「（根目录）· N 个文件」】
+                //
+                // 【用户实测】粘贴
+                //   https://pan.quark.cn/s/b1c7fbc16411#/list/share/869431f454...97
+                // 解析后**历史记录显示「根目录」**，而同一个文件下载时任务页
+                // 显示的却是正确的文件夹名 —— 两处行为不一致。
+                //
+                // 【根因】原实现从 **_files 里找第一个文件夹**：
+                //     var firstDir = _files.FirstOrDefault(f => f.IsDir);
+                // 而这条链接的 `#/list/share/<fid>` 让解析直接**进入**那个子目录，
+                // `_files` 是它的**内容**（只有一个 exe），里面没有文件夹，
+                // 于是退化成「（根目录）· 1 个文件」。
+                //
+                // 而下载分组走 CurrentFolderGroupName()：_pathList 为空时回退到
+                // **_shareRootName**（= 分享的父文件夹名）。所以任务页是对的，
+                // 只有历史记录这一处错。
+                //
+                // 【修法】不再自己算，直接调用 CurrentFolderGroupName() ——
+                // 与下载分组**共用同一个函数**，从根上杜绝将来再分叉。
+                // （这正是用户要求的「直接复用下载时获取的父文件夹名称」。）
+                string name = CurrentFolderGroupName();
+
+                // 兜底：CurrentFolderGroupName() 在"分享根目录且没有标题"时返回空串
+                // （此时下载分组会归入「单独选择的文件」）。历史记录需要一条可读的
+                // 名字让用户认得出是哪条分享，所以这里再回退两层：
+                //   ① 分享根目录里确实有文件夹 → 用第一个文件夹名（原行为）；
+                //   ② 根目录全是散文件         → 「（根目录）· N 个文件」。
+                bool isFolder = !string.IsNullOrWhiteSpace(name);
+                if (!isFolder)
+                {
+                    var firstDir = _files.FirstOrDefault(f => f.IsDir);
+                    if (firstDir != null)
+                    {
+                        name = firstDir.Name;
+                        isFolder = true;
+                    }
+                    else
+                    {
+                        name = "（根目录）· " + _files.Count + " 个文件";
+                        // 走的是"根目录散文件"分支，name 已自带文件数，直接落库
+                        HistoryStore.AddShareHistory(pwdId, passcode, startFid, name, false,
+                            CurrentProviderId(), _lastShareUrl);
+                        Log("已记录到分享历史：" + name);
+                        return;
+                    }
+                }
+
+                // 【2026-10-24 用户选择】历史记录显示「文件夹名 + 文件数」，
+                // 便于区分同名分享（例如两个都叫 31876 的分享，靠文件数一眼分开）。
+                // 面包屑那边只显示纯文件夹名（用户另一项选择），两处刻意不同。
+                if (isFolder)
+                    name = name + " · " + _files.Count + " 个文件";
+
+                HistoryStore.AddShareHistory(pwdId, passcode, startFid, name, isFolder,
+                    CurrentProviderId(), _lastShareUrl);
+                Log("已记录到分享历史：" + name);
             }
             catch { }
         }
@@ -3007,11 +3378,38 @@ namespace GeZi
         }
 
         /// <summary>取一页目录（分享模式 / 网盘模式走各自接口）。</summary>
-        private Task<QuarkClient.DirPage> FetchDirPageAsync(string fid, int page)
+        /// <summary>
+        /// 取当前目录的一页。
+        /// <para>【2026-11-02 P1】分享模式走 <see cref="IPanProvider.ListSharePageAsync"/>，
+        /// 于是 UC 也能分页浏览分享 —— 以前这里是写死的 QuarkClient 调用。</para>
+        /// </summary>
+        private Task<GeZi.Core.Models.DirPage> FetchDirPageAsync(string fid, int page)
         {
-            return ShareMode
-                ? _client.ShareDetailPageAsync(_pwdId, _stoken, fid, page)
-                : _client.ListDirPageAsync(fid, page);
+            var provider = CurrentProvider;
+            if (ShareMode)
+            {
+                if (provider == null)
+                    return Task.FromResult(new GeZi.Core.Models.DirPage());
+                return provider.ListSharePageAsync(_pwdId, _stoken, fid, page);
+            }
+
+            // 「我的网盘」是夸克特有能力（UC 的 Caps 里没有 Mine）
+            if (!CurrentHasCaps(GeZi.Core.Pan.PanCapabilities.Mine))
+            {
+                Log("当前网盘（" + CurrentProviderName() + "）暂不支持浏览「我的网盘」。");
+                return Task.FromResult(new GeZi.Core.Models.DirPage());
+            }
+            return _client.ListDirPageAsync(fid, page);
+        }
+
+        /// <summary>当前平台的显示名（日志/提示用）。</summary>
+        private string CurrentProviderName()
+        {
+            var p = CurrentProvider;
+            if (p != null && p.Meta != null && !string.IsNullOrEmpty(p.Meta.DisplayName))
+                return p.Meta.DisplayName;
+            return string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase)
+                ? "UC 网盘" : "夸克网盘";
         }
 
         /// <summary>
@@ -3527,9 +3925,24 @@ namespace GeZi
             if (_dirSizeCache.TryGetValue(DirSizeKey(fid), out cached)) return cached;
             if (!takeBudget()) return 0;
 
-            var items = ShareMode
-                ? await _client.ShareDetailAsync(_pwdId, _stoken, fid)
-                : await _client.ListDirAsync(fid);
+            // 【2026-11-02 修】原来这里直接调 `_client.ShareDetailAsync`（夸克客户端）。
+            // UC 平台下 _client 为 null → 抛 NullReferenceException → 被上层 catch 掉
+            // 标成 DirSizeFailed，于是文件夹右侧**永远没有大小**。
+            // 用户实测反馈「一开始的解析的文件夹 右侧没有展示大小」。
+            var prov = CurrentProvider;
+            if (prov == null) return 0;
+
+            List<QuarkFileEntry> items;
+            if (ShareMode)
+            {
+                items = await prov.ListShareAllAsync(_pwdId, _stoken, fid, ct);
+            }
+            else
+            {
+                if (!CurrentHasCaps(GeZi.Core.Pan.PanCapabilities.Mine)) return 0;
+                items = await _client.ListDirAsync(fid);
+            }
+            if (items == null) return 0;
 
             long sum = 0;
             foreach (var it in items)
@@ -3597,19 +4010,50 @@ namespace GeZi
 
         private async void OnUp(object sender, RoutedEventArgs e)
         {
-            if (_fidStack.Count == 0)
+            // 【2026-10-25 修：链接直接进入子目录时，A /「上一级」点不动】
+            //
+            // 【用户实测】粘贴带 `#/list/share/<fid>` 的分享链接（或裸链接但
+            // 分享根就是一个文件夹），解析后直接站在那个子目录里，
+            // 此时按 a 没有任何反应，日志只打「已在根目录」——
+            // 而用户恰恰需要**上到父级去选中整个文件夹再下载**。
+            //
+            // 【根因】原判断只看 `_fidStack.Count == 0`：
+            // 而解析流程是 ResetNav() 清栈之后**直接把 _curFid 设成 StartFid**，
+            // 栈里自然一项都没有 —— 于是"栈空"被误当成"已经在分享根目录"。
+            //
+            // 【修法】栈空但 `_shareStartFid != "0"` 时，说明我们是"空降"到子目录的，
+            // 父级就是**分享根目录**（fid = "0"）：直接把 _curFid 设回 "0" 重新加载。
+            // 这一步不需要压栈（根目录就是最终层），也符合面包屑的语义
+            // （上到根后 _pathList 已空，面包屑显示分享名）。
+            bool atShareRoot = _fidStack.Count == 0
+                && (string.IsNullOrEmpty(_shareStartFid) || _shareStartFid == "0");
+
+            if (atShareRoot)
             {
                 Log("已在根目录");
                 return;
             }
+
             // ⚠️ 重入检查必须放在**改导航状态之前**：否则连点时会把栈 pop 两次却不加载
             long t0 = BusyClock();
             if (!BeginBusy(DriveUpBtn, "返回中")) return;
             try
             {
-                _curFid = _fidStack.Pop();
-                if (_pathList.Count > 0)
-                    _pathList.RemoveAt(_pathList.Count - 1);
+                if (_fidStack.Count > 0)
+                {
+                    // 正常路径：回到栈里的上一层
+                    _curFid = _fidStack.Pop();
+                    if (_pathList.Count > 0)
+                        _pathList.RemoveAt(_pathList.Count - 1);
+                }
+                else
+                {
+                    // 空降路径：直接回到分享根目录。
+                    // 此时 _pathList 已经是空的（解析时被 ResetNav 清掉），
+                    // 不用再动它；面包屑会靠 _shareRootName 显示分享名。
+                    Log("返回分享根目录（链接原本直接指向子文件夹）");
+                    _curFid = "0";
+                }
                 UpdatePathText();
                 await LoadDirAsync(_curFid);
             }
@@ -3864,7 +4308,7 @@ namespace GeZi
         /// <summary>面包屑的一节。</summary>
         private sealed class Crumb
         {
-            /// <summary>显示名（第一段固定是「根目录」）。</summary>
+            /// <summary>显示名（第一段在分享带子目录时会显示分享/文件夹名）。</summary>
             public string Name;
             /// <summary>这一层对应的 fid；点它就是要跳到这个目录。</summary>
             public string Fid;
@@ -3883,19 +4327,42 @@ namespace GeZi
         /// 所以第 0 段「根目录」用 chain[0]（没进过子目录时就是 "0"），
         /// `_pathList[i]` 这一层用 chain[i+1]，最后一段（当前层）用 `_curFid`。
         ///
-        /// 【分享链接带 StartFid 的情况】解析时 ResetNav 清掉了栈，只有 _curFid 指向
-        /// 子目录 → 面包屑就只剩「根目录」一节，而它的 fid 是进入点；
-        /// 点不了（本来就是当前层），要出去用「上一级」。
+        /// 【分享链接带 StartFid 的情况 —— 2026-10-24 修】
+        ///
+        /// 解析时 ResetNav 清掉了栈，只有 _curFid 指向子目录 →
+        /// 面包屑只剩一节，而它的名字原来被写死成「根目录」。
+        ///
+        /// 【用户实测】粘贴
+        ///   https://pan.quark.cn/s/b1c7fbc16411#/list/share/869431f454...97
+        /// 面包屑只显示「根目录」，但里面明明是个具体文件夹（Dont.Starve…exe 所在处）。
+        /// 用户要求「在前面加上对应的名称」。
+        ///
+        /// 【修法】分享模式下若 `_pathList` 为空但 `_shareRootName` 有值
+        /// （= shareInfo.Title = 被分享文件夹名，见 QuarkClient.GetShareInfoAsync），
+        /// 就用它作为第一节的名字，而不是干巴巴的「根目录」。
+        /// 点它仍然回到 enterFid（分享根或链接指定的子目录），行为不变。
+        ///
+        /// ⚠️ 只在**分享模式**下这么做：网盘模式没有 title，`_shareRootName` 恒为空，
+        ///    保持原来的「根目录」不变。
         /// </summary>
         private List<Crumb> BuildCrumbs()
         {
             var chain = _fidStack.ToList();   // 栈顶在前
             chain.Reverse();                  // → 根在最前
 
+            // 【2026-10-24】第一节的名字：分享带子目录时用真实文件夹名。
+            // 判据：还没进入任何层（_pathList 为空）且确实是分享模式且有标题。
+            string rootName = "根目录";
+            if (_pathList.Count == 0 && ShareMode
+                && !string.IsNullOrWhiteSpace(_shareRootName))
+            {
+                rootName = _shareRootName;
+            }
+
             var list = new List<Crumb>();
             list.Add(new Crumb
             {
-                Name = "根目录",
+                Name = rootName,
                 Fid = chain.Count > 0 ? chain[0] : "0",
                 IsCurrent = _pathList.Count == 0,
             });
@@ -4763,14 +5230,31 @@ namespace GeZi
         /// </summary>
         private int[] AllocateThreads(IList<long> sizes)
         {
+            // 【2026-10-25】自动调度算出的"本批单文件并发"优先，但不写回设置。
+            // 见 StartDownloadAsync 里那段长注释：ConcurrentTasks 必须尊重设置，
+            // 而 Threads 可以随本批文件数自适应（它只影响单文件切多细）。
+            int perFileCap = _perBatchThreads > 0
+                ? _perBatchThreads
+                : _settings.Threads;
+
             return GeZi.Core.Download.ThreadAllocator.Allocate(
                 sizes,
-                Math.Min(_settings.Threads, GeZi.Core.Download.SegmentedDownloader.MaxRealConcurrency),
+                Math.Min(perFileCap, GeZi.Core.Download.SegmentedDownloader.MaxRealConcurrency),
                 DownloadConnBudget,
                 MinThreadsPerFile,
                 // 同时最多跑几个 —— 预算约束的是"同时并发"的量级，不是整批的账面总和
                 Math.Max(1, _settings.ConcurrentTasks));
         }
+
+        /// <summary>
+        /// 自动调度为**当前批次**算出的单文件并发数（0 = 没有，退回设置里的值）。
+        ///
+        /// <para>【2026-10-25 新增】刻意**不落盘**：AutoTuner 是按"本次提交几个文件"
+        /// 算的（1 个 → 256×1，2 个 → 256×2），若把它写回设置，
+        /// 用户分两次恢复任务时第二次就受制于第一次的批大小
+        /// （实测：先恢复 1 个导致 ConcurrentTasks 被固化成 1，之后只能跑一个）。</para>
+        /// </summary>
+        private int _perBatchThreads;
 
         /// <summary>把分配结果写进日志（只在"不是所有任务都一样"时打，避免刷屏）。</summary>
         private void LogAllocation(int[] threads)
@@ -4916,6 +5400,30 @@ namespace GeZi
                 DuplicateHintBar.Visibility = Visibility.Visible;
 
                 // 自动隐藏（用户要求）：显示后开始计时，到点自己收起
+                RestartDuplicateHintTimer();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 在文件列表上方的提示条里显示一句**看得见**的下载提示（2026-11-02 P1 新增）。
+        ///
+        /// <para>【为什么要它】原来下载路径遇到"没登录/没选中"只调 <c>Log()</c> 写日志框，
+        /// 用户在下载页根本看不到 —— 表现为「按 d 没有任何反应」。用户实测反馈过这一点。
+        /// 这里复用已有的 <see cref="DuplicateHintBar"/> 提示条，不再新造控件。</para>
+        /// </summary>
+        private void ShowDownloadHint(string text)
+        {
+            try
+            {
+                if (DuplicateHintBar == null || DuplicateHintText == null || string.IsNullOrEmpty(text))
+                    return;
+                DuplicateHintText.Text = text;
+                DuplicateHintBar.Background =
+                    (Brush)(TryFindResource("WarningLightBrush") ?? Brushes.Transparent);
+                DuplicateHintBar.BorderBrush = (Brush)(TryFindResource("WarningBrush") ?? Brushes.Gray);
+                if (DuplicateOpenDirBtn != null) DuplicateOpenDirBtn.Visibility = Visibility.Collapsed;
+                DuplicateHintBar.Visibility = Visibility.Visible;
                 RestartDuplicateHintTimer();
             }
             catch { }
@@ -5103,7 +5611,11 @@ namespace GeZi
                 jobs.Add(new DownloadJob
                 {
                     Name = item.Name, Url = item.Url, Dest = dest,
-                    Cookie = _client.CookieStr,
+                    Cookie = CurrentProviderCookie(),
+                    // 【P0】身份上下文：UC 的 Origin/Referer/种子域/__pugs 全靠它，
+                    // 少了它 UC 的直链请求会被 OSS 直接 403。
+                    Context = BuildDownloadContext(),
+                    ProviderId = CurrentProviderId(),
                     Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
                     // 写入方式统一取设置页的全局值（原来靠下载区的「边下边播」勾选框，
                     // 与设置页重复且容易误导，已移除该勾选框）。
@@ -5125,6 +5637,8 @@ namespace GeZi
                         // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                         SourceFid = item.SourceFid,
                         SourceName = item.SourceName,
+                        // 【P0】记下平台，续传时才能选回正确的客户端
+                        ProviderId = CurrentProviderId(),
                     },
                 });
             }
@@ -5153,14 +5667,22 @@ namespace GeZi
         private async Task StartDownloadAsync(List<ShareFileItem> selected, bool forceNoSave = false,
             CancellationToken ct = default(CancellationToken))
         {
-            if (_client == null)
+            // 【2026-11-02 P1 修·回归】原来这里判的是 `_client == null`（夸克客户端）。
+            // UC 平台下 _client 永远为 null → 按 d 直接 return，而且**只写日志不提示**，
+            // 用户感觉就是「选中文件按 d 没有任何反应」。用户实测反馈了这一点。
+            // 现在改判"当前平台有没有可用 provider"，并给出看得见的界面提示。
+            var provider = CurrentProvider;
+            if (provider == null)
             {
-                Log("请先登录或解析分享");
+                string hint = "当前平台（" + CurrentProviderName() + "）还没有可用的客户端，请先登录。";
+                Log(hint);
+                ShowDownloadHint(hint);
                 return;
             }
             if (selected.Count == 0)
             {
                 Log("没有选中任何文件");
+                ShowDownloadHint("没有选中任何文件 —— 请先单击选中文件（不是只把鼠标移上去）。");
                 return;
             }
 
@@ -5278,16 +5800,50 @@ namespace GeZi
                 // 就是因为设置页显示的是通用值，与实际批次无关。
                 if (_settings.AutoTune)
                 {
-                    var autoPlan = GeZi.Core.Download.AutoTuner.Compute(items.Count);
+                    // 【2026-10-25 修：按"届时的活跃任务总数"算，而不是"本批文件数"】
+                    //
+                    // 【用户实测】「恢复另外两个任务时，只有一个在跑，另一个排队，
+                    //  为什么？应该可以同时恢复吧」。
+                    //
+                    // 【根因】原来这里做两件错事：
+                    //   ① `AutoTuner.Compute(items.Count)` 只看**本次提交几个文件**
+                    //      —— 分两次恢复就各算各的：第一次 1 个 → 算出 256×**1**，
+                    //      第二次再来也还是按 1 个算；
+                    //   ② 把结果 `_settings.ConcurrentTasks = ...` 并 `SettingsStore.Save()`
+                    //      **持久化**了 → 设置被永久改成 1，重启后依然是 1，
+                    //      用户完全不知道为什么只能跑一个。
+                    //
+                    // 【修法】
+                    //   · 并发数按「已在跑/排队的任务数 + 本批文件数」算 ——
+                    //     这才是"待会儿真正要同时跑几个"的正确规模；
+                    //   · 结果**不落盘**，只作为本次的临时值；
+                    //   · 仍然尊重用户显式设过的更大值（取两者较大），
+                    //     否则用户手填 5 却被自动算成 2 会很困惑。
+                    int inFlight = _tasks == null ? 0
+                        : _tasks.Count(t => t.State == JobState.Downloading
+                                         || t.State == JobState.Queued
+                                         || t.State == JobState.Paused);
+                    int expected = inFlight + items.Count;
+                    if (expected < 1) expected = items.Count;
+
+                    var autoPlan = GeZi.Core.Download.AutoTuner.Compute(expected);
                     if (autoPlan != null && autoPlan.Threads > 0 && autoPlan.Concurrent > 0)
                     {
-                        _settings.Threads = autoPlan.Threads;
-                        _settings.ConcurrentTasks = autoPlan.Concurrent;
-                        try { SettingsStore.Save(_settings); } catch { }
-                        // 同时任务数变了 → 调度器要按新值重建（空闲时是安全的）
+                        // 单文件并发：用本批算出的值（不落盘），决定每片切多细
+                        _perBatchThreads = autoPlan.Threads;
+
+                        // 同时下载数：**不覆盖用户设置**，只在用户没设过时兜底。
+                        // 这样"同时恢复几个就能跑几个"符合直觉。
+                        if (_settings.ConcurrentTasks <= 0)
+                            _settings.ConcurrentTasks = autoPlan.Concurrent;
+
+                        // 调度器按当前值重建（空闲时安全；有任务在跑也不会打断它们）
                         RecreateScheduler();
                         UpdateAutoTuneUi();
-                        Log("自动调度（本批 " + items.Count + " 个文件）：" + autoPlan.Reason);
+                        Log("自动调度（本批 " + items.Count + " 个，另有 " + inFlight
+                            + " 个在跑/暂停 → 预计同时 " + expected + " 个）：单文件 "
+                            + autoPlan.Threads + " 路；同时下载上限 "
+                            + _settings.ConcurrentTasks + " 个。");
                     }
                 }
 
@@ -5310,7 +5866,10 @@ namespace GeZi
                     jobs.Add(new DownloadJob
                     {
                         Name = item.Name, Url = item.Url, Dest = dest,
-                        Cookie = _client.CookieStr,
+                        Cookie = CurrentProviderCookie(),
+                        // 【P0】身份上下文（见 BuildDownloadContext 的注释）
+                        Context = BuildDownloadContext(),
+                        ProviderId = CurrentProviderId(),
                         Threads = i < alloc.Length ? alloc[i] : _settings.Threads,
                         // 写入方式统一取设置页的全局值（原下载区「边下边播」勾选框已移除）。
                         WriteMode = WriteMode.SegmentedFiles,   // 落盘方式唯一化
@@ -5335,6 +5894,8 @@ namespace GeZi
                             // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                             SourceFid = item.SourceFid,
                             SourceName = item.SourceName,
+                            // 【P0】记下平台，续传时才能选回正确的客户端
+                            ProviderId = CurrentProviderId(),
                         },
                     });
                 }
@@ -5378,8 +5939,11 @@ namespace GeZi
                     List<QuarkFileEntry> children;
                     try
                     {
+                        // 【2026-11-02 P1】目录展开也走接口层 —— UC 的分享目录靠这里才能下钻。
+                        var prov = CurrentProvider;
+                        if (prov == null) continue;
                         children = ShareMode
-                            ? await _client.ShareDetailAsync(_pwdId, _stoken, it.Fid)
+                            ? await prov.ListShareAllAsync(_pwdId, _stoken, it.Fid, ct)
                             : await _client.ListDirAsync(it.Fid);
                     }
                     catch (OperationCanceledException)
@@ -5423,7 +5987,18 @@ namespace GeZi
                     return await NoSaveGetItemsAsync(files);
                 }
 
-                bool loggedIn = !string.IsNullOrEmpty(_settings.Cookie);
+                // 【2026-11-02 P1 修】原来的判据是 `!string.IsNullOrEmpty(_settings.Cookie)`
+                // —— 那是**夸克**的 Cookie。UC 平台下它是空的 → 会被判成"未登录"，
+                // 走游客路径，甚至可能因为游客额度限制而失败。
+                // 现在按**当前平台**判登录态；并且「转存」是夸克特有能力，UC 直接走免转存。
+                bool loggedIn = IsPlatformLoggedIn(CurrentProviderId());
+                bool canSave = CurrentHasCaps(GeZi.Core.Pan.PanCapabilities.Save);
+                if (loggedIn && !canSave)
+                {
+                    Log("当前网盘（" + CurrentProviderName()
+                        + "）暂不支持转存，直接走「免转存」取链。");
+                    return await NoSaveGetItemsAsync(files);
+                }
                 if (loggedIn)
                 {
                     // 【2026-10-24 新增】下载前先问一句「要不要转存」。
@@ -5769,27 +6344,36 @@ namespace GeZi
 
         private Task<List<DownloadLink>> FetchBatchAsync(List<LinkTarget> batch, bool fromShare)
         {
+            // 【2026-11-02 P1】分享取链统一走接口层 —— UC 与夸克共用这一段。
+            var provider = CurrentProvider;
             if (fromShare)
             {
-                // 【2026-10-22 诊断】正常下载（用户勾选文件按 D 发送）走的是这条路径，
-                // 不是续传的 TryShareDownloadAsync。用户实测"新文件能下、老的续传不行"，
-                // 需要看清这里的入参差异 —— 尤其是 stoken 是不是当前会话那一份。
+                if (provider == null)
+                    throw new InvalidOperationException("当前平台还没有可用客户端，请先登录。");
+
                 Log("[诊断·批量取链] 分享模式 " + batch.Count + " 个文件"
+                    + " 平台=" + CurrentProviderId()
                     + " pwdId=" + Short(_pwdId)
                     + " stoken=" + Short(_stoken)
                     + " 首个fid=" + Short(batch[0].Fid)
                     + " 首个token=" + Short(batch[0].Token));
-                // 【2026-10-23 诊断】打清"这次取链用的是不是登录态" ——
-                // 夸克更新源用**空 cookie（游客）** 取链，拿到的是 dl-guest-* 域名，
-                // 实测下载被拒（412）。手动免转存走这里，是**带登录态**的，
-                // 拿到的应该是 dl-pc-*。两条日志对照即可确认差别。
-                Log("[诊断·批量取链] 登录态: cookie 长度="
-                    + (_client == null || _client.CookieStr == null ? 0 : _client.CookieStr.Length)
-                    + "（0 = 游客，非 0 = 登录）");
-                return _client.GetShareDownloadAsync(
-                    batch.Select(t => t.Fid).ToList(),
-                    batch.Select(t => t.Token ?? "").ToList(),
-                    _pwdId, _stoken);
+
+                var refs = new List<QuarkFileEntry>();
+                foreach (var t in batch)
+                {
+                    refs.Add(new QuarkFileEntry
+                    {
+                        Fid = t.Fid, Token = t.Token ?? "", Name = t.Name,
+                    });
+                }
+                return provider.LinkFromShareAsync(refs, _pwdId, _stoken);
+            }
+
+            // 「我的网盘」取链是夸克特有能力
+            if (!CurrentHasCaps(GeZi.Core.Pan.PanCapabilities.MineDownload))
+            {
+                throw new InvalidOperationException(
+                    "当前网盘（" + CurrentProviderName() + "）暂不支持从「我的网盘」取直链。");
             }
             Log("[诊断·批量取链] 网盘模式 " + batch.Count + " 个文件");
             return _client.GetDownloadAsync(batch.Select(t => t.Fid).ToList());
@@ -7107,6 +7691,8 @@ namespace GeZi
                         // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                         SourceFid = pi == null ? null : pi.SourceFid,
                         SourceName = pi == null ? null : pi.SourceName,
+                        // 【P0】记下平台，重启续传时才能选回正确的客户端
+                        ProviderId = pi == null ? CurrentProviderId() : pi.ProviderId,
                         Segmented = true,   // 落盘方式唯一化：恒为独立分片
                         Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                     });
@@ -7264,12 +7850,17 @@ namespace GeZi
                         WriteMode = WriteMode.SegmentedFiles,   // 落盘方式唯一化
                         PartsRoot = string.IsNullOrWhiteSpace(_settings.PartsRoot) ? null : _settings.PartsRoot,
                         ResumeCannotRefresh = s.FromShare,
+                        // 【P0】按**记录里的平台**还原，不能拿当前平台顶 —— 否则切过平台就认错盘。
+                        ProviderId = string.IsNullOrEmpty(s.ProviderId) ? "quark" : s.ProviderId,
+                        Context = BuildContextFor(s.ProviderId),
+                        Cookie = CookieFor(s.ProviderId),
                         Pending = new PendingInfo
                         {
                             PwdId = s.PwdId, Stoken = s.Stoken, Passcode = s.Passcode,
                             Fid = s.Fid, Token = s.Token, FromShare = s.FromShare,
                             RelDir = s.RelDir ?? "", Dest = s.Dest, Size = s.Size,
                             GroupName = s.GroupName ?? "",
+                            ProviderId = string.IsNullOrEmpty(s.ProviderId) ? "quark" : s.ProviderId,
                             // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                             SourceFid = s.SourceFid,
                             SourceName = s.SourceName,
@@ -9106,6 +9697,14 @@ namespace GeZi
                 // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                 SourceFid = p.SourceFid,
                 SourceName = p.SourceName,
+                // 🚨【2026-11-03 关键修复】必须把平台带过去！
+                //   漏了这一行 → 后面 ResumePendingBatchAsync 里
+                //   `taskPid = p.ProviderId ?? "quark"` 永远兜底成夸克，
+                //   UC 的任务被拿去请求夸克接口 →
+                //   「分享的stoken过期」+「分享不存在」（QuarkApiException），
+                //   而 TryResumeUcShareAsync 一次都不会被调用（日志里连
+                //   `[UC 续传]` 都没有，就是这个原因）。
+                ProviderId = p.ProviderId,
             };
         }
 
@@ -10400,6 +10999,133 @@ namespace GeZi
             return null;
         }
 
+        /// <summary>
+        /// 为续传准备指定平台的客户端（2026-11-02 新增）。
+        ///
+        /// <para>【为什么需要】原 <see cref="EnsureClientForResumeAsync"/> 只会返回**夸克**客户端，
+        /// 于是整条恢复流程都假定是夸克。用户实测：UC 分享的未完成任务恢复时，
+        /// 日志打出 `[获取分享直链] 分享的stoken过期` 和 `[获取分享凭证] 分享不存在`
+        /// —— 那两句都是**夸克**返回的，因为拿夸克去请求了 UC 的分享。
+        /// 用户原话：「为什么想恢复 上次未完成的失败了」。</para>
+        ///
+        /// <returns>拿不到凭据返回 null（调用方按"该任务跳过"处理）。</returns>
+        /// </summary>
+        private async Task<GeZi.Core.Pan.IPanProvider> EnsureProviderForResumeAsync(string providerId)
+        {
+            bool wantUc = string.Equals(providerId, "uc", StringComparison.OrdinalIgnoreCase);
+
+            if (wantUc)
+            {
+                if (_ucProvider != null) return _ucProvider;
+
+                // 冷启动时 UC 客户端可能还没建 → 用已存的 Cookie 现建一个
+                string ucCookie = FindUcCookieForRestore();
+                if (string.IsNullOrEmpty(ucCookie)) return null;
+
+                try
+                {
+                    if (_ucClient == null)
+                        _ucClient = new GeZi.Core.Api.UcClient(ucCookie);
+                    if (_ucProvider == null)
+                        _ucProvider = new GeZi.Core.Pan.UcProvider(_ucClient);
+                    return _ucProvider;
+                }
+                catch (Exception ex)
+                {
+                    Log("准备 UC 续传客户端失败: " + ex.Message);
+                    return null;
+                }
+            }
+
+            // 夸克
+            var qc = await EnsureClientForResumeAsync().ConfigureAwait(true);
+            if (qc == null) return null;
+            _quarkProvider = new GeZi.Core.Pan.QuarkProvider(qc);
+            return _quarkProvider;
+        }
+
+        /// <summary>按平台 id 取显示名（2026-11-02 新增，供日志用）。</summary>
+        private static string CurrentProviderNameFor(string providerId)
+        {
+            return string.Equals(providerId, "uc", StringComparison.OrdinalIgnoreCase)
+                ? "UC 网盘" : "夸克网盘";
+        }
+
+        /// <summary>
+        /// UC 分享的续传取链（2026-11-02 新增），含 stoken 过期自愈。
+        ///
+        /// <para>【流程】先用记录里的 stoken/token 直接取一次链；
+        /// 失败就**重新解析分享**换新 stoken，再取一次。
+        /// UC 没有夸克那套「沿 ShareRelDir 逐级下钻找源文件」的复杂度 ——
+        /// 它的 share_fid_token 与 stoken 同源，重解析后直接用同一个 fid 重取即可。</para>
+        /// </summary>
+        private async Task<string> TryResumeUcShareAsync(
+            GeZi.Core.Pan.IPanProvider provider, PendingTask p)
+        {
+            try
+            {
+                // ① 先用旧凭证试
+                var refs = new List<QuarkFileEntry>
+                {
+                    new QuarkFileEntry { Fid = p.Fid, Token = p.Token ?? "" },
+                };
+                var links = await provider.LinkFromShareAsync(refs, p.PwdId, p.Stoken);
+                var url = links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                if (!string.IsNullOrEmpty(url)) return url;
+            }
+            catch (Exception ex)
+            {
+                Log("[UC 续传] 旧凭证取链失败（将重解析分享）: " + ex.Message);
+            }
+
+            // ② stoken 过期 → 重新解析分享换新的
+            try
+            {
+                Log("[UC 续传] 正在重新解析分享 pwdId=" + Short(p.PwdId));
+                var ticket = await provider.ResolveShareAsync(p.PwdId, p.Passcode ?? "");
+                if (ticket == null || string.IsNullOrEmpty(ticket.Stoken))
+                {
+                    Log("[UC 续传] 重新解析分享失败（分享可能已取消或改了提取码）。");
+                    return null;
+                }
+
+                // 回填新 stoken，供后续 job.Pending 与刷新回调使用
+                p.Stoken = ticket.Stoken;
+
+                // ③ 用新 stoken 取链。⚠️ token 可能也随分享变化 —— 重新取一次列表定位文件。
+                string freshToken = p.Token;
+                try
+                {
+                    var list = await provider.ListShareAllAsync(
+                        p.PwdId, ticket.Stoken, string.IsNullOrEmpty(p.StartFid) ? "0" : p.StartFid);
+                    var hit = list == null ? null : list.FirstOrDefault(f => f.Fid == p.Fid);
+                    if (hit != null && !string.IsNullOrEmpty(hit.Token))
+                        freshToken = hit.Token;
+                }
+                catch (Exception ex) { LogDetail("[UC 续传] 重新定位文件 token 失败: " + ex.Message); }
+
+                if (!string.IsNullOrEmpty(freshToken)) p.Token = freshToken;
+
+                var refs2 = new List<QuarkFileEntry>
+                {
+                    new QuarkFileEntry { Fid = p.Fid, Token = freshToken ?? "" },
+                };
+                var links2 = await provider.LinkFromShareAsync(refs2, p.PwdId, ticket.Stoken);
+                var url2 = links2?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                if (!string.IsNullOrEmpty(url2))
+                {
+                    Log("[UC 续传] 重新解析后取链成功。");
+                    return url2;
+                }
+                Log("[UC 续传] 重新解析后仍未取到直链。");
+            }
+            catch (Exception ex)
+            {
+                Log("[UC 续传] 重新解析异常: " + ex.Message);
+            }
+            return null;
+        }
+
         private async Task ResumePendingBatchAsync(List<PendingTask> tasks)
         {
             // 【2026-10-04 用户反馈】「弹出续传窗口时我点继续下载，但左下角的账号卡
@@ -10414,7 +11140,11 @@ namespace GeZi
             // 注意用的是**局部** client：自动登录完成时会换掉全局客户端，
             // 若直接用字段，换的那一刻可能在途请求会被 Dispose 掉。
             var client = await EnsureClientForResumeAsync();
-            if (client == null)
+
+            // 【2026-11-02 修】原来 client 为 null 就直接 return，弹"需要先登录"。
+            // 但 UC 任务根本不需要夸克客户端 —— 它有自己的一份凭据。
+            // 所以现在只有"两种平台都拿不到凭据"时才拦。
+            if (client == null && _ucProvider == null && string.IsNullOrEmpty(FindUcCookieForRestore()))
             {
                 Log("续传需要先登录。请登录后重新下载（分片在，会自然续传）。");
                 AppDialog.Show(this,
@@ -10444,34 +11174,57 @@ namespace GeZi
                     {
                         string url = null;
 
+                        // 【2026-11-02 修·关键】按**这条任务自己的平台**准备客户端。
+                        // 原来整段恢复流程只用 EnsureClientForResumeAsync()（永远返回夸克），
+                        // UC 的任务被拿夸克去请求 → 「分享的stoken过期」+「分享不存在」。
+                        string taskPid = string.IsNullOrEmpty(p.ProviderId) ? "quark" : p.ProviderId;
+                        var taskProvider = await EnsureProviderForResumeAsync(taskPid).ConfigureAwait(true);
+
                         if (p.FromShare)
                         {
                             // 分享模式：走"先试旧凭证 → 失败自动重解析分享"的自愈路径（2026-10-20）。
                             // stoken 一般几小时就过期，原来一过期续传就整批跳过，用户只能手动重解析。
-                            url = await GetShareLinkWithReResolveAsync(
-                                client, p.Fid, p.Token, p.PwdId, p.Stoken, p.Passcode,
-                                p.StartFid, p.ShareRelDir,
-                                // 【2026-10-22】老任务没有 ShareRelDir → 用 GroupName/RelDir 兜底下钻
-                                FirstNonEmpty(p.GroupName, p.RelDir), p.Name,
-                                (freshStoken, freshToken) =>
-                                {
-                                    p.Stoken = freshStoken;   // 回填到续传记录，后续 job.Pending 用的就是新值
-                                    p.Token = freshToken;
-                                }, CancellationToken.None).ConfigureAwait(true);
-                                // 🚨 【2026-10-22】必须是 true（回到 UI 线程）。
-                                // 这里原来写的是 false —— 于是 await 之后的代码
-                                // （_tasks.Remove / AddTaskItem / RunJobs）
-                                // 全跑在线程池线程上，改 ObservableCollection 直接抛
-                                // NotSupportedException（CollectionView 跨线程），
-                                // RunJobs 里改 DependencyProperty 再抛 InvalidOperationException。
-                                // 表现为"取链成功但任务停在排队中、速度 0"。
-                                // 本方法是 UI 层方法，本来就该全程在 UI 线程 ——
-                                // 真正耗时的网络请求在 QuarkClient 内部已用 ConfigureAwait(false)。
+                            if (taskProvider == null)
+                            {
+                                Log("[" + p.Name + "] 该任务属于 " + CurrentProviderNameFor(taskPid)
+                                    + "，但当前没有可用的登录态，跳过。");
+                                continue;
+                            }
+
+                            // UC 与夸克的「重解析自愈」实现不同：UC 走接口层的 LinkFromShareAsync，
+                            // 夸克仍走原来那套（它内部会沿 ShareRelDir 逐级下钻找源文件）。
+                            if (string.Equals(taskPid, "uc", StringComparison.OrdinalIgnoreCase))
+                            {
+                                url = await TryResumeUcShareAsync(taskProvider, p).ConfigureAwait(true);
+                            }
+                            else
+                            {
+                                url = await GetShareLinkWithReResolveAsync(
+                                    client, p.Fid, p.Token, p.PwdId, p.Stoken, p.Passcode,
+                                    p.StartFid, p.ShareRelDir,
+                                    // 【2026-10-22】老任务没有 ShareRelDir → 用 GroupName/RelDir 兜底下钻
+                                    FirstNonEmpty(p.GroupName, p.RelDir), p.Name,
+                                    (freshStoken, freshToken) =>
+                                    {
+                                        p.Stoken = freshStoken;   // 回填到续传记录，后续 job.Pending 用的就是新值
+                                        p.Token = freshToken;
+                                    }, CancellationToken.None).ConfigureAwait(true);
+                            }
+                            // 🚨 【2026-10-22】必须是 true（回到 UI 线程）。
+                            // 这里原来写的是 false —— 于是 await 之后的代码
+                            // （_tasks.Remove / AddTaskItem / RunJobs）
+                            // 全跑在线程池线程上，改 ObservableCollection 直接抛
+                            // NotSupportedException（CollectionView 跨线程），
+                            // RunJobs 里改 DependencyProperty 再抛 InvalidOperationException。
+                            // 表现为"取链成功但任务停在排队中、速度 0"。
+                            // 本方法是 UI 层方法，本来就该全程在 UI 线程 ——
+                            // 真正耗时的网络请求在 QuarkClient 内部已用 ConfigureAwait(false)。
 
                             // 【2026-10-22】还是拿不到 → 走「转存副本没了就回免转存」的兜底。
                             // 场景：转存路径下 p.Fid 是**中转副本**的 fid，用户把副本删了，
                             // 而分享里的源文件还好好的 —— 原来这里直接跳过，任务永远续不上。
-                            if (string.IsNullOrEmpty(url))
+                            if (string.IsNullOrEmpty(url)
+                                && !string.Equals(taskPid, "uc", StringComparison.OrdinalIgnoreCase))
                             {
                                 url = await TryFallbackToShareSourceAsync(client, p, CancellationToken.None)
                                     .ConfigureAwait(true);
@@ -10480,6 +11233,14 @@ namespace GeZi
                         else
                         {
                             // 我的网盘：fid 失效（文件被删）时，同样回退到分享源文件。
+                            // 【2026-11-03 修】这里原来无条件用夸克 `client`。
+                            // UC 当前能力位不含 Mine，理论上走不到这里；
+                            // 但万一是老记录（ProviderId 缺失被兜底成夸克）也不能拿夸克去请求 UC 的 fid。
+                            if (string.Equals(taskPid, "uc", StringComparison.OrdinalIgnoreCase))
+                            {
+                                Log("[" + p.Name + "] UC 网盘暂不支持「我的网盘」续传，跳过。");
+                                continue;
+                            }
                             string myUrl = null;
                             try
                             {
@@ -10522,7 +11283,10 @@ namespace GeZi
                             Name = p.Name ?? Path.GetFileName(dest),
                             Url = url,
                             Dest = dest,
-                            Cookie = client.CookieStr,
+                            Cookie = CookieFor(p.ProviderId),
+                            // 【P0】按记录里的平台还原身份，而不是当前平台
+                            Context = BuildContextFor(p.ProviderId),
+                            ProviderId = string.IsNullOrEmpty(p.ProviderId) ? "quark" : p.ProviderId,
                             // 【2026-10-24 修】原来这里是 `_settings.Threads`（直接 256），
                             // **绕过了连接预算分配器** —— 用户实测「7 个任务每个都开 256 路
                             // = 1792 条连接，远超夸克账号配额，结果 244/256 连接却只跑 1~2 MB/s」。
@@ -10538,6 +11302,7 @@ namespace GeZi
                                 RelDir = p.RelDir ?? "", Dest = dest, Size = p.Size,
                                 GroupName = p.GroupName ?? "",
                                 StartFid = p.StartFid, ShareRelDir = p.ShareRelDir,
+                                ProviderId = string.IsNullOrEmpty(p.ProviderId) ? "quark" : p.ProviderId,
                                 // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                                 SourceFid = p.SourceFid,
                                 SourceName = p.SourceName,
@@ -10701,22 +11466,49 @@ namespace GeZi
             var p = job.Pending;
             if (p == null || string.IsNullOrEmpty(p.Fid))
                 return null;
+
+            // 【2026-11-02 P1】按**任务记录里的平台**选客户端，不能用"当前平台"。
+            // 用户可能夸克下一半切去 UC，回头再续夸克那个任务 —— 拿当前平台会认错盘。
+            string pid = string.IsNullOrEmpty(p.ProviderId) ? "quark" : p.ProviderId;
+            if (string.Equals(pid, "uc", StringComparison.OrdinalIgnoreCase)
+                && _ucProvider == null)
+            {
+                Log("该任务属于 UC 网盘，但 UC 尚未登录，无法重新取链。");
+                return null;
+            }
+
             try
             {
                 List<DownloadLink> links;
                 if (p.FromShare)
                 {
-                    links = await _client.GetShareDownloadAsync(
-                        new List<string> { p.Fid },
-                        new List<string> { p.Token ?? "" },
-                        p.PwdId, p.Stoken);
+                    var provider = string.Equals(pid, "uc", StringComparison.OrdinalIgnoreCase)
+                        ? _ucProvider : EnsureQuarkProvider();
+                    if (provider == null) return null;
+
+                    var refs = new List<QuarkFileEntry>
+                    {
+                        new QuarkFileEntry { Fid = p.Fid, Token = p.Token ?? "" },
+                    };
+                    links = await provider.LinkFromShareAsync(refs, p.PwdId, p.Stoken);
                 }
                 else
                 {
+                    // 「我的网盘」取链是夸克特有能力
+                    if (_client == null) return null;
                     links = await _client.GetDownloadAsync(new List<string> { p.Fid });
                 }
                 var url = links?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
                 if (!string.IsNullOrEmpty(url)) return url;
+
+                // 🚨【2026-11-03 修】兜底取链 `TryFallbackToShareSourceAsync` 的参数类型是
+                //   `QuarkClient`，UC 任务根本没有夸克客户端 —— 原来无条件传 `_client`，
+                //   UC 下要么传 null（方法首行 return null，兜底静默失效），
+                //   要么误用夸克客户端去请求 UC 的分享（回到"拿夸克请求 UC"的老 bug）。
+                //   UC 的取链自愈已经在上面 `LinkFromShareAsync` 里由 UcClient 自己做，
+                //   这里只对夸克任务走兜底。
+                if (string.Equals(pid, "uc", StringComparison.OrdinalIgnoreCase))
+                    return null;
 
                 // 【2026-10-22】原路径取不到链 → 回退到分享源文件（免转存）
                 return await TryFallbackToShareSourceAsync(_client, p, ct).ConfigureAwait(false);
@@ -10724,6 +11516,8 @@ namespace GeZi
             catch
             {
                 // 原路径失败 → 也回退一次（转存副本可能已被删）
+                if (string.Equals(pid, "uc", StringComparison.OrdinalIgnoreCase))
+                    return null;
                 try { return await TryFallbackToShareSourceAsync(_client, p, ct).ConfigureAwait(false); }
                 catch { return null; }
             }
@@ -12094,8 +12888,660 @@ namespace GeZi
             };
         }
 
+        // ==================== 【2026-11-02 新增】平台切换（2.9.0 加 UC）====================
+
+        /// <summary>
+        /// 当前选中的平台："quark" 或 "uc"。
+        /// <para>只影响<b>登录页</b>的展示与操作，不影响已登录账号的可用性 ——
+        /// 两个平台可以同时登录，下载时按任务所属平台选客户端。</para>
+        /// <para>【2026-11-02】改为从设置读取并持久化。原来硬编码默认 "uc" 且不保存，
+        /// 导致每次启动都跳回默认平台、与用户上次用的不一致。</para>
+        /// </summary>
+        private string _loginPlatform = "quark";
+
+        /// <summary>UC 客户端（登录后创建；未登录为 null）。</summary>
+        private GeZi.Core.Api.UcClient _ucClient;
+
+        /// <summary>
+        /// UC 的 <see cref="GeZi.Core.Pan.IPanProvider"/> 包装（2026-11-02 P1 新增）。
+        /// <para>与 <see cref="_ucClient"/> 指向同一个底层对象，只是多一层接口适配。
+        /// 解析/取链等**共用路径**走它，UC 特有的细节（如 LastPugs）仍可直接用 _ucClient。</para>
+        /// </summary>
+        private GeZi.Core.Pan.IPanProvider _ucProvider;
+
+        // ==================== 【2026-11-02 P1】网盘接口统一入口 ====================
+
+        /// <summary>
+        /// 当前平台对应的 <see cref="GeZi.Core.Pan.IPanProvider"/>。
+        ///
+        /// <para>【这是 P1 落地的关键】以前 UI 直接调 <c>_client.XXX</c>（夸克方法名），
+        /// 加一个平台就要在每个调用点写 if 分支。现在共用能力（解析分享、翻页、
+        /// 取直链、下载身份）统一走这里，UI 不再关心"是哪个盘"。</para>
+        ///
+        /// <para>⚠️ 夸克特有能力（转存 / 删除 / 我的网盘）仍需用 <see cref="_client"/>，
+        /// 因为 UC 的 Caps 里没有这些 —— 调用前先用 <see cref="CurrentHasCaps"/> 判断。</para>
+        /// </summary>
+        private GeZi.Core.Pan.IPanProvider CurrentProvider
+        {
+            get
+            {
+                if (string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase))
+                    return _ucProvider;          // 未登录时可能为 null，调用方须判空
+                return _quarkProvider;
+            }
+        }
+
+        /// <summary>夸克的 provider 包装（懒创建，跟着 <see cref="_client"/> 生命周期走）。</summary>
+        private GeZi.Core.Pan.IPanProvider _quarkProvider;
+
+        /// <summary>取夸克 provider（有 _client 才建，避免老代码 set _client 后忘记同步）。</summary>
+        private GeZi.Core.Pan.IPanProvider EnsureQuarkProvider()
+        {
+            if (_quarkProvider == null && _client != null)
+                return _quarkProvider = new GeZi.Core.Pan.QuarkProvider(_client);
+            return _quarkProvider;
+        }
+
+        /// <summary>当前平台是否具备某项能力（UI 灰度 + 调用前守卫）。</summary>
+        private bool CurrentHasCaps(GeZi.Core.Pan.PanCapabilities c)
+        {
+            var p = CurrentProvider;
+            return p != null && p.Meta != null && p.Meta.Has(c);
+        }
+
+        /// <summary>
+        /// 恢复浏览位置时要回填到链接框的 URL（2026-11-02 新增）。
+        ///
+        /// <para>【为什么不能直接拼】以前各处写 <c>"https://pan.quark.cn/s/" + pwdId</c>，
+        /// 于是 UC 的分享也被"变成"夸克链接 —— 用户在界面上看到的链接是错的，
+        /// 而且平台信息从此丢失。优先用存下来的**真实链接**。</para>
+        /// </summary>
+        private string RestoredShareUrl(string pwdId)
+        {
+            try
+            {
+                if (_settings != null && !string.IsNullOrEmpty(_settings.LastShareUrl))
+                    return _settings.LastShareUrl;
+            }
+            catch { }
+            // 兜底：按平台拼（至少域名对）
+            string host = string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase)
+                ? "https://drive.uc.cn/s/" : "https://pan.quark.cn/s/";
+            return host + (pwdId ?? "");
+        }
+
+        /// <summary>当前分享的**原始链接**（用户真正粘贴的那条，含平台域名）。2026-11-02 新增。</summary>
+        private string _lastShareUrl;
+
+        /// <summary>指定平台是否已登录（2026-11-02 P1 新增）。
+        /// <para>用于"自动切平台"前的守卫 —— 切到一个未登录的平台等于把失败甩给用户。</para>
+        /// </summary>
+        private bool IsPlatformLoggedIn(string platformId)
+        {
+            try
+            {
+                if (string.Equals(platformId, "uc", StringComparison.OrdinalIgnoreCase))
+                    return _ucClient != null && !string.IsNullOrEmpty(_ucNick);
+                return _client != null && !string.IsNullOrEmpty(_settings.Who);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 为指定平台造一个可用的 provider（2026-11-02 新增）。
+        ///
+        /// <para>【为什么需要】冷启动时 <c>_ucProvider</c> 还没建（要等用户去登录页操作），
+        /// 但"恢复上次浏览位置"必须**立刻**有个客户端去重解析分享。
+        /// 这里按平台现场补建，凭据从内存 → 账号档案里取。</para>
+        ///
+        /// <returns>拿不到凭据时返回 null（调用方换下一个平台试）。</returns>
+        /// </summary>
+        private async Task<GeZi.Core.Pan.IPanProvider> BuildProviderForAsync(string platformId)
+        {
+            try
+            {
+                if (string.Equals(platformId, "uc", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_ucProvider != null) return _ucProvider;
+
+                    string ucCookie = FindUcCookieForRestore();
+                    if (string.IsNullOrEmpty(ucCookie)) return null;
+
+                    _ucClient = new GeZi.Core.Api.UcClient(ucCookie);
+                    _ucProvider = new GeZi.Core.Pan.UcProvider(_ucClient);
+                    var (ok, nick) = await _ucClient.ValidateAsync();
+                    if (ok)
+                    {
+                        _ucNick = string.IsNullOrEmpty(nick) ? "UC 用户" : nick;
+                        _ucAvatarUrl = _ucClient.AvatarUrl ?? "";
+                    }
+                    return _ucProvider;
+                }
+
+                // 夸克
+                if (_quarkProvider != null && _client != null) return _quarkProvider;
+                if (string.IsNullOrEmpty(_settings.Cookie)) return null;
+                _client?.Dispose();
+                _client = new QuarkClient(_settings.Cookie);
+                _quarkProvider = new GeZi.Core.Pan.QuarkProvider(_client);
+                return _quarkProvider;
+            }
+            catch (Exception ex)
+            {
+                LogDetail("创建 " + platformId + " 客户端失败：" + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 启动时恢复 UC 浏览位置用：从账号档案里找一份可用的 UC Cookie（2026-11-02 新增）。
+        ///
+        /// <para>【为什么需要】冷启动时 <c>_ucClient</c> 还没建（要等用户去登录页操作）。
+        /// 但"恢复上次浏览位置"必须**立刻**有一个 UC 客户端去重解析分享，
+        /// 否则用户上次看的 UC 分享永远恢复不了。</para>
+        ///
+        /// <para>优先级：内存里的 _ucClient → 账号档案里 Platform="uc" 的最新一条。</para>
+        /// </summary>
+        private string FindUcCookieForRestore()
+        {
+            try
+            {
+                if (_ucClient != null && !string.IsNullOrEmpty(_ucClient.Cookie))
+                    return _ucClient.Cookie;
+            }
+            catch { }
+
+            // 【2026-11-02】设置里的 UC Cookie（登录时写入）—— 冷启动最快的来源
+            try
+            {
+                if (_settings != null && !string.IsNullOrEmpty(_settings.UcCookie))
+                    return _settings.UcCookie;
+            }
+            catch { }
+
+            try
+            {
+                var all = AccountStore.LoadAll();
+                if (all == null) return null;
+                AccountProfile best = null;
+                foreach (var a in all)
+                {
+                    if (a == null || !a.IsUc) continue;
+                    if (string.IsNullOrEmpty(a.Cookie)) continue;
+                    if (best == null || a.LastUsedUtc > best.LastUsedUtc) best = a;
+                }
+                return best == null ? null : best.Cookie;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Cookie 输入框防抖定时器（粘贴后自动登录用，2026-11-02 新增）。</summary>
+        private System.Windows.Threading.DispatcherTimer _cookieAutoLoginTimer;
+
+        /// <summary>上次自动尝试登录的 Cookie 签名，避免同一串重复请求。</summary>
+        private string _lastAutoLoginSig;
+
+        /// <summary>
+        /// 两个平台各自的 Cookie 输入框草稿（2026-11-02 新增）。
+        ///
+        /// <para>【为什么需要】<c>CookieImportBox</c> 是**两个平台共用的一个输入框**。
+        /// 用户先粘夸克 Cookie、再切到 UC 粘 UC Cookie，框里就只剩 UC 那份；
+        /// 切回夸克时，框里放着 UC 的 Cookie，一按「导入并登录」就拿 UC 的串去校验夸克 ——
+        /// 表现为「两个网盘的 Cookie 居然是一样的」「夸克一直在获取容量」。
+        /// 用户实测反馈过这个 bug。</para>
+        ///
+        /// <para>所以按平台各存一份草稿，切换时互换。</para>
+        /// </summary>
+        private readonly Dictionary<string, string> _cookieDrafts =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>切换平台时把输入框内容存到旧平台、载入新平台的草稿。</summary>
+        private void SwapCookieDraft(string fromPlatform, string toPlatform)
+        {
+            try
+            {
+                if (CookieImportBox == null) return;
+                if (!string.IsNullOrEmpty(fromPlatform))
+                    _cookieDrafts[fromPlatform] = CookieImportBox.Text ?? "";
+
+                string next = "";
+                if (!string.IsNullOrEmpty(toPlatform))
+                    _cookieDrafts.TryGetValue(toPlatform, out next);
+
+                // 【2026-11-02 修·关键】目标平台草稿为空时，**不要把输入框清空**，
+                // 而是交给 RestoreCookieBoxFor 从设置里取真实 Cookie 回填。
+                //
+                // 【之前怎么错的】这里无条件 `CookieImportBox.Text = next`（next 可能是空串），
+                // 而 RestoreCookieBoxFor 的判断是「草稿非空就 return」——
+                // 空串也算"存在草稿"？不，是随后它看到输入框已空、草稿却有条目，
+                // 于是以为"用户在编辑"直接跳过 → UC 的 Cookie 永远填不进来。
+                // 用户实测：「你的两个cookie 都是夸克的，但明明 UC 是粘贴过对应 cookie 的」。
+                if (!string.IsNullOrEmpty(next))
+                {
+                    CookieImportBox.Text = next;
+                }
+                else
+                {
+                    // 清空 → 让 RestoreCookieBoxFor 按平台重新从设置里取
+                    CookieImportBox.Text = "";
+                    _cookieDrafts.Remove(toPlatform ?? "");
+                    RestoreCookieBoxFor(toPlatform);
+                }
+
+                // 载入的是**另一个平台的**内容 → 允许它重新触发一次自动登录判断
+                _lastAutoLoginSig = null;
+            }
+            catch { }
+        }
+
+        /// <summary>UC 账号信息（昵称/头像/容量）。null = 未登录。</summary>
+        private string _ucNick;
+        private string _ucAvatarUrl;
+        private long _ucUsed;
+        private long _ucTotal;
+
+        /// <summary>
+        /// 平台切换按钮：切换登录页展示的平台。
+        /// <para>只换"看哪个平台"，不动任何账号数据 —— 两个平台各自独立登录。</para>
+        /// </summary>
+        private void OnPlatformSwitch(object sender, RoutedEventArgs e)
+        {
+            var btn = sender as Button;
+            if (btn == null) return;
+            string target = (btn.Tag as string) ?? "quark";
+            if (string.Equals(target, _loginPlatform, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            // 【2026-11-02 修】两个平台共用同一个 Cookie 输入框，切换时互换草稿，
+            // 否则切过去会看到另一个平台的 Cookie（用户实测反馈过）。
+            string prev = _loginPlatform;
+            _loginPlatform = target;
+            SwapCookieDraft(prev, target);
+
+            ApplyPlatformVisual();
+
+            // 【2026-11-02】记住选择，下次启动沿用（否则每次启动都跳回默认平台）
+            try
+            {
+                if (_settings != null)
+                {
+                    _settings.LoginPlatform = _loginPlatform;
+                    SettingsStore.Save(_settings);
+                }
+            }
+            catch { }
+
+            // 切换后刷新登录页的账号状态展示
+            RefreshLoginPlatformView();
+
+            // 【2026-11-02】切平台后也要重算「清空当前目录」的显隐（UC 没有删除能力）
+            UpdateEmptyDirButtonVisibility(ShareMode);
+        }
+
+        /// <summary>按 <see cref="_loginPlatform"/> 摆正两个标签的样式与小红点。</summary>
+        private void ApplyPlatformVisual()
+        {
+            bool isUc = string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase);
+            try
+            {
+                PlatformQuarkBtn.Style = (Style)FindResource(isUc ? "PlatformTabOff" : "PlatformTabOn");
+                PlatformUcBtn.Style = (Style)FindResource(isUc ? "PlatformTabOn" : "PlatformTabOff");
+
+                // 小红点：UC 未登录时才亮（提醒"还有个平台没登"）
+                if (UcUnreadDot != null)
+                {
+                    bool ucLoggedIn = _ucClient != null && !string.IsNullOrEmpty(_ucNick);
+                    UcUnreadDot.Visibility = ucLoggedIn ? Visibility.Collapsed : Visibility.Visible;
+                }
+            }
+            catch { /* 样式找不到也不该影响功能 */ }
+        }
+
+        /// <summary>
+        /// 刷新登录页右列的「当前状态」卡片，按当前平台显示对应账号。
+        /// <para>夸克沿用原有的 <see cref="UpdateAccountCard"/> 数据源；
+        /// UC 用 <see cref="_ucNick"/> / <see cref="_ucAvatarUrl"/> / <see cref="_ucUsed"/>。</para>
+        /// </summary>
+        private void RefreshLoginPlatformView()
+        {
+            bool isUc = string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase);
+            try
+            {
+                if (isUc)
+                {
+                    // 【2026-11-02 修】回退到设置里存的 UC 昵称/容量 —— 冷启动时
+                    // _ucClient 可能是刚重建的、_ucUsed/_ucTotal 还是 0，
+                    // 不这样会让账号卡显示"未登录"，而用户明明已经登录过。
+                    string ucNickShown = !string.IsNullOrEmpty(_ucNick)
+                        ? _ucNick
+                        : (_settings != null ? _settings.UcWho : null);
+
+                    if (!string.IsNullOrEmpty(ucNickShown))
+                    {
+                        UpdateAccountCard(ucNickShown, _ucUsed, _ucTotal);
+                        SetLoginAvatar(ucNickShown,
+                            string.IsNullOrEmpty(_ucAvatarUrl)
+                                ? (_settings != null ? _settings.UcAvatarUrl : null)
+                                : _ucAvatarUrl);
+                    }
+                    else
+                    {
+                        UpdateAccountCard(null, 0, 0);
+                    }
+
+                    // Cookie 输入框回填 UC 自己的 Cookie（用户反馈"粘贴的 cookie 重启后不见了"）
+                    RestoreCookieBoxFor("uc");
+
+                    // UC 的登录方式说明与夸克不同（WebView 而非扫码）
+                    SetQrPlatformHint("uc");
+
+                    // 【2026-11-02 用户要求】「切换到 UC 网盘 就直接加载二维码 不用点击了」。
+                    // 条件：未登录 + 当前没在扫码流程里（按钮可用）——
+                    // 用 QrLoginBtn.IsEnabled 当「流程空闲」的判据，
+                    // 这样不会和用户手动点出来的那次流程打架、也不会重复叠取。
+                    if (string.IsNullOrEmpty(_ucNick)
+                        && QrLoginBtn != null && QrLoginBtn.IsEnabled)
+                    {
+                        Dispatcher.BeginInvoke(
+                            new Action(() => OnQrLogin(QrLoginBtn, null)),
+                            System.Windows.Threading.DispatcherPriority.Background);
+                    }
+                }
+                else
+                {
+                    // 夸克：沿用原有逻辑（_settings.Who + 上次容量）
+                    UpdateAccountCard(_settings.Who, 0, 0);
+                    SetLoginAvatar(_settings.Who, null);
+                    // Cookie 输入框回填夸克自己的 Cookie
+                    RestoreCookieBoxFor("quark");
+                    SetQrPlatformHint("quark");
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// UC 登录入口（2026-11-02 新增）。
+        ///
+        /// <para>【2026-11-02 定稿】UC 与夸克同构，都走扫码 —— 见 <see cref="OnQrLogin"/>。
+        /// 这个方法的按钮已被移除，保留它只为兼容旧调用点（内部转到扫码逻辑）。</para>
+        /// </summary>
+        private Task StartUcLoginAsync(Button src)
+        {
+            OnQrLogin(QrLoginBtn, null);
+            return Task.FromResult(0);
+        }
+
+        /// <summary>
+        /// 更新登录页二维码区的平台相关文案。
+        /// </summary>
+        private void SetQrPlatformHint(string platform)
+        {
+            try
+            {
+                bool isUc = platform == "uc";
+                // 卡片标题：两个平台现在都是扫码登录（UC 用 UC App 扫，不是微信）
+                if (LoginCardTitle != null)
+                    LoginCardTitle.Text = "扫码登录";
+                if (LoginCardIcon != null)
+                {
+                    try
+                    {
+                        LoginCardIcon.Data = (Geometry)FindResource("IconQr");
+                    }
+                    catch { }
+                }
+                // 二维码上方的说明文字
+                if (QrHintText != null)
+                    QrHintText.Text = isUc
+                        ? "用手机「UC 浏览器 / UC 网盘 App」扫描二维码；也可在右侧粘贴 Cookie 登录"
+                        : "用手机「夸克 App」扫描二维码并在手机上确认";
+                // 主按钮文案：两个平台都是扫码
+                if (QrLoginBtnText != null)
+                    QrLoginBtnText.Text = "获取二维码";
+
+                // ★ 切到 UC 时必须把夸克的二维码清掉。
+                // 【用户实测反馈 2026-11-02】切到 UC 后界面上仍显示着刚才那张夸克二维码，
+                // 下方状态还写着"请用夸克 App 扫描二维码" —— 用户会以为程序错乱。
+                //
+                // 【2026-11-02 定稿】UC 最终走的是**扫码 + Cookie 导入**（不再用 WebView2），
+                // 所以二维码区要保留：清掉旧图、把占位框放回来，状态条复位。
+                if (isUc)
+                {
+                    if (QrImage != null) QrImage.Source = null;
+                    if (QrImageBox != null) QrImageBox.Visibility = Visibility.Collapsed;
+                    if (QrPlaceholderBox != null) QrPlaceholderBox.Visibility = Visibility.Visible;
+                    if (QrStatusBox != null) QrStatusBox.Visibility = Visibility.Collapsed;
+                    if (QrStatusText != null) QrStatusText.Text = "";
+
+                    // 已登录 UC 时，把整块登录区换成账号信息卡
+                    bool loggedIn = !string.IsNullOrEmpty(_ucNick);
+                    ShowUcLoggedInPanel(loggedIn);
+
+                    // UC 与夸克一样走扫码 + Cookie 导入，落回常规两栏布局
+                    ApplyLoginLayout(ucFullWidth: false);
+                }
+                else
+                {
+                    // 切回夸克：恢复二维码区与常规两栏
+                    ShowUcLoggedInPanel(false);
+                    if (QrPlaceholderBox != null) QrPlaceholderBox.Visibility = Visibility.Visible;
+                    ApplyLoginLayout(ucFullWidth: false);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 切换登录页的整体布局。
+        /// </summary>
+        /// <param name="ucFullWidth">
+        /// true = UC 未登录态：左列拉满整行、右列（状态/导入导出/小贴士）整体隐藏、
+        /// 网页区撑满剩余高度。false = 常规两栏。
+        /// <para>用户要求原话：「直接把整个登录页 占据下方页面就行 其他信息可以不展示
+        /// 那么小个窗口 看起来很难受」+「这些登录后才展示」。</para>
+        /// </param>
+        private void ApplyLoginLayout(bool ucFullWidth)
+        {
+            try
+            {
+                // ★ 关键：外层根容器是 StackPanel + MaxWidth=960 + Left 对齐，
+                // 宽度被硬限死 → UC 网页被挤成窄条（用户实测截图指出"右侧都是空白"）。
+                // 这里动态放开它的宽度约束。
+                //
+                // ⚠️ 两个坑：
+                //   ① 不能把 StackPanel 换成 Grid —— Grid 不加 RowDefinitions 时
+                //      所有子元素默认挤在 Row0/Column0 **全部重叠**，布局彻底错乱。
+                //   ② MaxWidth 不能设 double.PositiveInfinity —— WPF 会抛
+                //      ArgumentException（必须有限值），用 double.MaxValue。
+                if (LoginPageRoot != null)
+                {
+                    LoginPageRoot.HorizontalAlignment = ucFullWidth
+                        ? HorizontalAlignment.Stretch
+                        : HorizontalAlignment.Left;
+                    LoginPageRoot.MaxWidth = ucFullWidth ? double.MaxValue : 960;
+                }
+
+                if (LoginColumns != null && LoginColumns.ColumnDefinitions.Count >= 2)
+                {
+                    // 左列：常规 Auto（固定 304），UC 全宽时改成 * 拉满
+                    LoginColumns.ColumnDefinitions[0].Width = ucFullWidth
+                        ? new GridLength(1, GridUnitType.Star)
+                        : GridLength.Auto;
+
+                    // ★★★ 右列必须一起收掉 ★★★
+                    // 【2026-11-02 用户实测】只把右列内容设 Collapsed 是不够的：
+                    //   Grid 的 ColumnDefinition 仍然按 Width="*" 占着一半宽度，
+                    //   结果左边内容只拿到一半、右边整片空白（截图可见）。
+                    //   必须把列宽也设成 0，才能真正把空间还给左列。
+                    LoginColumns.ColumnDefinitions[1].Width = ucFullWidth
+                        ? new GridLength(0)
+                        : new GridLength(1, GridUnitType.Star);
+
+                    LoginColumns.HorizontalAlignment = ucFullWidth
+                        ? HorizontalAlignment.Stretch
+                        : HorizontalAlignment.Left;
+                }
+
+                if (LoginLeftCard != null)
+                {
+                    // 卡片宽度：常规固定 304（与二维码尺寸匹配）；UC 全宽时去掉固定宽度
+                    LoginLeftCard.Width = ucFullWidth ? double.NaN : 304;
+                    LoginLeftCard.HorizontalAlignment = ucFullWidth
+                        ? HorizontalAlignment.Stretch
+                        : HorizontalAlignment.Left;
+                }
+
+                if (LoginRightColumn != null)
+                    LoginRightColumn.Visibility = ucFullWidth ? Visibility.Collapsed : Visibility.Visible;
+
+                // 网页区高度：常规 264（二维码），UC 全宽时放开，由 * 行吸收剩余高度
+                if (QrOrWebArea != null)
+                {
+                    if (ucFullWidth)
+                    {
+                        QrOrWebArea.Height = double.NaN;
+                        QrOrWebArea.VerticalAlignment = VerticalAlignment.Stretch;
+                        QrOrWebArea.MinHeight = 460;   // 下限：避免窗口很矮时网页挤成一条
+                    }
+                    else
+                    {
+                        QrOrWebArea.Height = 264;
+                        QrOrWebArea.VerticalAlignment = VerticalAlignment.Center;
+                        QrOrWebArea.MinHeight = 0;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// UC 已登录时，把左侧「登录区」整体换成「账号信息」展示。
+        /// <para>用户要求原话：「登录成功后 再切换成现在布局 并且展示用户的信息」——
+        /// 登录后二维码已经没用了，占着 264px 高度纯属浪费，
+        /// 换成头像 + 昵称 + 容量条更有价值。</para>
+        /// </summary>
+        private void ShowUcLoggedInPanel(bool loggedIn)
+        {
+            try
+            {
+                bool isUc = string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase);
+                if (!isUc) loggedIn = false;
+
+                var qrArea = this.FindName("UcQrArea") as FrameworkElement;
+                var infoArea = this.FindName("UcLoggedInPanel") as FrameworkElement;
+
+                if (qrArea != null) qrArea.Visibility = loggedIn ? Visibility.Collapsed : Visibility.Visible;
+                if (infoArea != null) infoArea.Visibility = loggedIn ? Visibility.Visible : Visibility.Collapsed;
+                if (!loggedIn) return;
+
+                var nickText = this.FindName("UcNickText") as TextBlock;
+                var capText = this.FindName("UcCapacityText") as TextBlock;
+                var capBar = this.FindName("UcCapacityBar") as ProgressBar;
+                var avatarText = this.FindName("UcAvatarText") as TextBlock;
+                var avatarImage = this.FindName("UcAvatarImage") as Image;
+                var avatarBox = this.FindName("UcAvatarBox") as Border;
+
+                if (nickText != null) nickText.Text = _ucNick ?? "UC 用户";
+
+                if (avatarText != null && avatarBox != null)
+                {
+                    avatarText.Text = string.IsNullOrEmpty(_ucNick)
+                        ? "?"
+                        : _ucNick.Trim().Substring(0, 1).ToUpperInvariant();
+                    try { avatarBox.Background = AvatarTintFor(_ucNick ?? "U"); } catch { }
+                }
+                if (avatarImage != null && avatarText != null && !string.IsNullOrEmpty(_ucAvatarUrl))
+                    _ = LoadAvatarAsync(avatarImage, avatarText, _ucAvatarUrl);
+
+                if (capText != null)
+                {
+                    capText.Text = _ucTotal > 0
+                        ? string.Format("已用 {0} / 共 {1}", FmtSize(_ucUsed), FmtSize(_ucTotal))
+                        : "容量未知";
+                }
+                if (capBar != null && _ucTotal > 0)
+                {
+                    double pct = Math.Max(0, Math.Min(100, _ucUsed * 100.0 / _ucTotal));
+                    capBar.Value = pct;
+                    try
+                    {
+                        capBar.Foreground = (Brush)FindResource(
+                            pct >= 90 ? "DangerBrush" : pct >= 70 ? "WarningBrush" : "SuccessBrush");
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>字节数转可读文本（登录页容量展示用）。</summary>
+        private static string FmtSize(long bytes)
+        {
+            if (bytes <= 0) return "0 B";
+            string[] units = { "B", "KB", "MB", "GB", "TB" };
+            double v = bytes;
+            int i = 0;
+            while (v >= 1024 && i < units.Length - 1) { v /= 1024; i++; }
+            return string.Format("{0:0.##} {1}", v, units[i]);
+        }
+
+        /// <summary>
+        /// UC 的登录状态提示文案（扫码/WebView 两条链路语义不同，不能复用夸克那套）。
+        /// <para>夸克是"扫码 → 手机确认"，UC 是"打开网页 → 自己登录 → 自动检测"。</para>
+        /// </summary>
+        private void SetUcStatus(string text, string colorHex)
+        {
+            try
+            {
+                QrStatusBox.Visibility = Visibility.Visible;
+                QrStatusText.Text = text;
+                var brush = ResolveStatusBrush(colorHex);
+                var icon = PickStatusIcon(text, colorHex, out _);
+                QrStatusIcon.Data = icon;
+                QrStatusIcon.Stroke = brush;
+                QrStatusText.Foreground = brush;
+            }
+            catch { }
+        }
+
+        /// <summary>设置登录页头像（有 URL 用图，否则用昵称首字）。</summary>
+        private void SetLoginAvatar(string nick, string avatarUrl)
+        {
+            try
+            {
+                if (LoginAvatarText == null) return;
+                bool hasUrl = !string.IsNullOrEmpty(avatarUrl);
+                if (hasUrl)
+                {
+                    try
+                    {
+                        var bmp = new BitmapImage();
+                        bmp.BeginInit();
+                        bmp.CacheOption = BitmapCacheOption.OnLoad;
+                        bmp.UriSource = new Uri(avatarUrl, UriKind.Absolute);
+                        bmp.EndInit();
+                        LoginAvatarImage.Source = bmp;
+                        LoginAvatarImage.Visibility = Visibility.Visible;
+                        LoginAvatarText.Visibility = Visibility.Collapsed;
+                        return;
+                    }
+                    catch { /* 图拉不到就回退首字 */ }
+                }
+                LoginAvatarImage.Visibility = Visibility.Collapsed;
+                LoginAvatarText.Visibility = Visibility.Visible;
+                LoginAvatarText.Text = string.IsNullOrEmpty(nick) ? "?" : nick.Substring(0, 1);
+            }
+            catch { }
+        }
+
         private async void OnQrLogin(object sender, RoutedEventArgs e)
         {
+            // 【2026-11-02 定稿】UC 与夸克都走扫码，共用同一段逻辑 ——
+            // LoginQrService 已按平台端点参数化（见 QrLoginEndpoints），
+            // 所以这里只需让它按当前 _loginPlatform 选端点即可。
+            // 原来的内嵌 WebView2 分支已移除：扫码 + Cookie 导入两条路已覆盖全部需求。
+
             // 【2026-10-03】原来的「刷新二维码」按钮已删（用户反馈"多余"）——
             // 它和「获取二维码」本来就是同一个处理函数，点哪个都是重新取一张。
             // 现在只留「获取二维码」：过期时提示用户再点一次即可。
@@ -12114,7 +13560,10 @@ namespace GeZi
             }
             try
             {
-                using (var svc = new LoginQrService())
+                // 按当前平台选端点：夸克走 uop.quark.cn，UC 走 api.open.uc.cn
+                bool isUcLogin = string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase);
+                using (var svc = new LoginQrService(
+                    isUcLogin ? QrLoginEndpoints.Uc() : QrLoginEndpoints.Quark()))
                 {
                     var (ok, token, qrUrl, err) = await svc.GetQrCodeAsync();
                     await EndBusyAsync(src, t0);
@@ -12136,7 +13585,9 @@ namespace GeZi
                         switch (r.Stage)
                         {
                             case QrLoginStage.WaitingScan:
-                                SetQrStatus("请用夸克 App 扫描二维码（等待扫码…）", "#333");
+                                SetQrStatus(isUcLogin
+                                    ? "请用「UC 浏览器 / UC 网盘 App」扫描二维码（等待扫码…）"
+                                    : "请用夸克 App 扫描二维码（等待扫码…）", "#333");
                                 break;
                             case QrLoginStage.ScannedWaitConfirm:
                                 SetQrStatus("已扫码，请在手机上点击「确认登录」", "#1B6FB8");
@@ -12346,6 +13797,177 @@ namespace GeZi
                 QrPlaceholderBox.Visibility = Visibility.Visible;
         }
 
+        /// <summary>
+        /// 粘贴 Cookie 后自动登录（2026-11-02 新增）。
+        ///
+        /// <para>用户原话：「我是粘贴在输入框里的 应该检测到内容 就自动获取」——
+        /// 所以输入框里一旦出现"完整 Cookie"，就不该再让用户多按一次「导入并登录」。</para>
+        ///
+        /// <para>【为什么要防抖】粘贴是**一次性灌入整串**，TextChanged 会连续触发多次；
+        /// 且用户可能边输入边改。用 400ms 静默窗口合并，只在"停手了"之后试一次。</para>
+        ///
+        /// <para>【为什么要判据】只有同时含 <c>__pus</c> 与 <c>__puus</c> 才认为值得尝试登录，
+        /// 否则夸克/UC 都会白跑一次网络请求，还会把"不完整"当"已过期"报错。</para>
+        /// </summary>
+        private void OnCookieImportTextChanged(object sender, TextChangedEventArgs e)
+        {
+            try
+            {
+                if (_cookieAutoLoginTimer == null)
+                {
+                    _cookieAutoLoginTimer = new System.Windows.Threading.DispatcherTimer
+                    {
+                        Interval = TimeSpan.FromMilliseconds(400),
+                    };
+                    _cookieAutoLoginTimer.Tick += async (s, a) =>
+                    {
+                        _cookieAutoLoginTimer.Stop();
+                        await TryAutoLoginFromCookieBoxAsync();
+                    };
+                }
+                _cookieAutoLoginTimer.Stop();
+                _cookieAutoLoginTimer.Start();
+            }
+            catch { }
+        }
+
+        // ==================== 【2026-11-02 新增】网盘抽象（P0）====================
+
+        /// <summary>
+        /// 当前下载任务该用哪个网盘（"quark" / "uc"）。
+        /// <para>判据：这次下载的直链是从哪个客户端取来的 —— 就是 <see cref="_loginPlatform"/>。
+        /// 两个平台可以同时登录，但「现在在解析哪个盘的分享」决定任务归属。</para>
+        /// </summary>
+        private string CurrentProviderId()
+        {
+            return string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase)
+                ? "uc" : "quark";
+        }
+
+        /// <summary>
+        /// 造一条下载任务的身份上下文（网盘抽象 P0 的核心入口）。
+        ///
+        /// <para>【为什么必须统一出口】以前下载器把身份硬编码成夸克，
+        /// UC 的直链因此带着夸克 Origin / Cookie 域 —— 必被 OSS 403。
+        /// 现在每个 job 都从这里拿上下文，下载层不再认识任何具体网盘。</para>
+        ///
+        /// <para>【UC 特有的 __pugs】它来自**取链响应**的 Set-Cookie，与本次直链同响应绑定、
+        /// 约 3 小时有效。所以优先用客户端记下的那份；没有就退回当前 Cookie 里可能已有的。</para>
+        /// </summary>
+        private GeZi.Core.Download.DownloadContext BuildDownloadContext()
+        {
+            try
+            {
+                if (string.Equals(CurrentProviderId(), "uc", StringComparison.OrdinalIgnoreCase))
+                {
+                    // 【2026-11-02 修】回退值原来用 _settings.Cookie（**夸克**的 Cookie），
+                    // UC 下那是错的。改为 UC 自己的字段。
+                    string cookie = CurrentPlatformCookie();
+                    string pugs = _ucClient != null ? _ucClient.LastPugs : null;
+                    return GeZi.Core.Download.DownloadContext.UcDefaults(cookie, pugs);
+                }
+            }
+            catch { }
+
+            string qCookie = _client != null && !string.IsNullOrEmpty(_client.CookieStr)
+                ? _client.CookieStr : (_settings != null ? _settings.Cookie : "");
+            return GeZi.Core.Download.DownloadContext.QuarkDefaults(qCookie);
+        }
+
+        /// <summary>当前网盘的 Cookie 串（与 <see cref="BuildDownloadContext"/> 同源，避免两处不一致）。</summary>
+        private string CurrentProviderCookie()
+        {
+            try
+            {
+                if (string.Equals(CurrentProviderId(), "uc", StringComparison.OrdinalIgnoreCase))
+                    return _ucClient != null ? _ucClient.Cookie : _settings.Cookie;
+            }
+            catch { }
+            if (_client != null && !string.IsNullOrEmpty(_client.CookieStr))
+                return _client.CookieStr;
+            return _settings != null ? _settings.Cookie : "";
+        }
+
+        /// <summary>
+        /// 按**指定网盘**造上下文（续传路径专用）。
+        ///
+        /// <para>与 <see cref="BuildDownloadContext"/> 的区别：这里认参数、不认"当前平台"。
+        /// 续传元数据是跨会话跨平台的，用户可能夸克下到一半去用 UC，
+        /// 回头再续夸克那个任务 —— 必须用夸克的上下文，否则取链必错。</para>
+        /// </summary>
+        private GeZi.Core.Download.DownloadContext BuildContextFor(string providerId)
+        {
+            try
+            {
+                if (string.Equals(providerId, "uc", StringComparison.OrdinalIgnoreCase))
+                {
+                    string cookie = _ucClient != null ? _ucClient.Cookie : _settings.Cookie;
+                    string pugs = _ucClient != null ? _ucClient.LastPugs : null;
+                    return GeZi.Core.Download.DownloadContext.UcDefaults(cookie, pugs);
+                }
+            }
+            catch { }
+
+            string qCookie = _client != null && !string.IsNullOrEmpty(_client.CookieStr)
+                ? _client.CookieStr : (_settings != null ? _settings.Cookie : "");
+            return GeZi.Core.Download.DownloadContext.QuarkDefaults(qCookie);
+        }
+
+        /// <summary>按**指定网盘**取 Cookie（续传路径专用，语义同 <see cref="BuildContextFor"/>）。</summary>
+        private string CookieFor(string providerId)
+        {
+            try
+            {
+                if (string.Equals(providerId, "uc", StringComparison.OrdinalIgnoreCase))
+                    return _ucClient != null ? _ucClient.Cookie : _settings.Cookie;
+            }
+            catch { }
+            if (_client != null && !string.IsNullOrEmpty(_client.CookieStr))
+                return _client.CookieStr;
+            return _settings != null ? _settings.Cookie : "";
+        }
+
+        /// <summary>
+        /// 防抖到期后真正尝试一次：识别到完整 Cookie 就自动登录。</summary>
+        private async Task TryAutoLoginFromCookieBoxAsync()
+        {
+            try
+            {
+                if (CookieImportBox == null) return;
+
+                string text = CookieImportBox.Text ?? "";
+                // 太短的输入（还在敲 key 名）不试，避免每敲一个字就发请求
+                if (text.Length < 80) return;
+
+                bool isUc = string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase);
+                string parsed = CookieText.Parse(text);
+
+                if (isUc)
+                {
+                    if (!UcConstants.IsValidCookie(parsed)) return;
+                    if (!string.IsNullOrEmpty(_ucNick)) return;      // 已登录，不重复
+                }
+                else
+                {
+                    // 夸克判据：有 __puus 就值得试
+                    if (parsed.IndexOf("__puus=", StringComparison.Ordinal) < 0) return;
+                    if (!string.IsNullOrEmpty(_settings.Who)) return;
+                }
+
+                // 同一串不重复尝试（失败后用户改了内容才会再试）
+                string sig = isUc + "|" + parsed;
+                if (sig == _lastAutoLoginSig) return;
+                _lastAutoLoginSig = sig;
+
+                Log("检测到完整 Cookie，自动尝试登录…");
+                await ApplyLoginAsync(parsed);
+            }
+            catch (Exception ex)
+            {
+                Log("自动登录失败：" + ex.Message);
+            }
+        }
+
         private async void OnImportCookie(object sender, RoutedEventArgs e)
         {
             var cookie = CookieImportBox.Text.Trim();
@@ -12435,17 +14057,20 @@ namespace GeZi
         /// </summary>
         private void OnExportCookie(object sender, RoutedEventArgs e)
         {
-            if (_client == null)
+            // 【2026-11-02 修】原来只认 _client（夸克），UC 平台下点导出会说"尚未登录"。
+            string cookie = CurrentPlatformCookie();
+            if (string.IsNullOrEmpty(cookie))
             {
-                Log("尚未登录");
+                Log("尚未登录（" + CurrentProviderName() + "）");
                 return;
             }
             try
             {
                 string outFile = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
-                    "GeZi-Cookie-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt");
-                File.WriteAllText(outFile, _client.CookieStr, new UTF8Encoding(false));
+                    "GeZi-Cookie-" + CurrentProviderId() + "-"
+                        + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt");
+                File.WriteAllText(outFile, cookie, new UTF8Encoding(false));
 
                 Log("已导出 Cookie：" + outFile);
                 AppDialog.Show(this,
@@ -12475,6 +14100,7 @@ namespace GeZi
             try { _client?.StopKeepAlive(); } catch { }
             _client?.Dispose();
             _client = null;
+            try { _quarkProvider = null; } catch { }
             _stoken = null;
             _linkCache.Clear();   // 换账号后旧账号的直链必须作废
             _settings.Cookie = "";
@@ -12488,8 +14114,105 @@ namespace GeZi
             Log(string.IsNullOrEmpty(reason) ? "已登出" : reason);
         }
 
+        /// <summary>
+        /// UC 的「导入 Cookie 并登录」（2026-11-02 新增）。
+        ///
+        /// <para>【与夸克的差异】夸克的 <c>account/info</c> 被 TLS 指纹墙挡着，
+        /// 必须借 OpenSSL 桥；UC 没有这堵墙，<c>accounts/info</c> 直接可达，
+        /// 一次请求就能拿到昵称、uid、头像 —— 所以这里不需要桥。</para>
+        ///
+        /// <para>【校验判据】<see cref="UcClient.ValidateAsync"/> 内部会判断
+        /// <c>data</c> 是否为空对象：游客态返回 <c>{"success":true,"data":{}}</c>，
+        /// 只有登录态才带 nickname/uid。所以"data 非空"就是可靠的登录判据。</para>
+        /// </summary>
+        private async Task ApplyUcLoginAsync(string cookie)
+        {
+            UcClient client = null;
+            try
+            {
+                // 先做格式预检：缺 __pus/__puus 直接给出明确原因，不白跑一次网络请求
+                if (!UcConstants.IsValidCookie(cookie))
+                {
+                    Log("UC Cookie 缺少 __pus 或 __puus，无法登录。请确认复制的是 drive.uc.cn 的完整 Cookie。");
+                    SetUcStatus("Cookie 不完整：需要同时含 __pus 与 __puus", "#C0392B");
+                    return;
+                }
+
+                SetUcStatus("正在校验 UC Cookie…", "#333");
+                client = new UcClient(cookie);
+                var (valid, nick) = await client.ValidateAsync();
+
+                if (!valid)
+                {
+                    Log("UC Cookie 校验未通过：" + nick);
+                    SetUcStatus("Cookie 无效或已过期：" + nick, "#C0392B");
+                    client.Dispose();
+                    return;
+                }
+
+                // 校验通过 → 落库 + 更新内存状态
+                try { _ucClient?.Dispose(); } catch { }
+                _ucClient = client;
+                // 【2026-11-02 P1】同步造一个 provider 包装 —— 与 _ucClient 指向同一个底层对象，
+                // 只是让解析/取链等共用路径能走接口层。
+                _ucProvider = new GeZi.Core.Pan.UcProvider(client);
+                _ucNick = string.IsNullOrEmpty(nick) ? "UC 用户" : nick;
+                _ucAvatarUrl = client.AvatarUrl ?? "";
+
+                try
+                {
+                    var (total, used) = await client.GetCapacityAsync();
+                    _ucTotal = total;
+                    _ucUsed = used;
+                }
+                catch { }
+
+                // 存账号档案（Platform="uc"，与夸克账号互不覆盖）
+                string ucKey = "uc-" + _ucNick;
+                AccountStore.Save(ucKey, _ucNick, client.Cookie, "uc", _ucAvatarUrl);
+
+                // ★ 【2026-11-02 修】必须同时写进 _settings —— 这是"当前登录态"的唯一来源。
+                //
+                // 【之前漏了会怎样】左下角账号卡、Cookie 输入框回填、重启后恢复登录态，
+                // 全都读 _settings。只写 AccountStore 的话：
+                //   · 左下角账号卡不显示用户信息（用户实测反馈「显示已登录 但是左下角的用户信息没有」）；
+                //   · 粘贴过的 Cookie 重启后不见了（同上）；
+                //   · 而且 _settings.Cookie 里还留着**夸克**的 Cookie，
+                //     重启时会被当成 UC 的 Cookie 拿去用 —— 更糟。
+                // UC 的 Cookie 单独存一份字段，与夸克的 Cookie 互不覆盖。
+                _settings.UcCookie = client.Cookie;
+                _settings.UcWho = _ucNick;
+                _settings.UcAvatarUrl = _ucAvatarUrl;
+                _settings.CurrentAccountKey = ucKey;
+                _settings.LoginPlatform = "uc";
+                SettingsStore.Save(_settings);
+
+                Log(string.Format("UC 网盘登录成功：{0}（容量 {1} / {2}）",
+                    _ucNick, FmtSize(_ucUsed), FmtSize(_ucTotal)));
+
+                // 刷新界面：切到已登录形态
+                ApplyPlatformVisual();
+                RefreshLoginPlatformView();
+                SetUcStatus("UC 网盘登录成功：" + _ucNick, "#2E7D32");
+            }
+            catch (Exception ex)
+            {
+                Log("UC 登录失败：" + ex.Message);
+                SetUcStatus("UC 登录失败：" + ex.Message, "#C0392B");
+                try { client?.Dispose(); } catch { }
+            }
+        }
+
         private async Task ApplyLoginAsync(string cookie)
         {
+            // 【2026-11-02】UC 平台走独立分支：UC 的校验方式与夸克不同
+            // （夸克要 OpenSSL 桥补昵称/头像，UC 直接 account/info 就能拿到完整数据）。
+            if (string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase))
+            {
+                await ApplyUcLoginAsync(cookie);
+                return;
+            }
+
             try
             {
                 var client = new QuarkClient(cookie);
@@ -12515,6 +14238,8 @@ namespace GeZi
                     try { _client?.StopKeepAlive(); } catch { }
                     _client?.Dispose();
                     _client = client;
+                    // 【2026-11-02 P1】同步 provider 包装
+                    _quarkProvider = new GeZi.Core.Pan.QuarkProvider(_client);
                     // 保活心跳连续失败 → 登录很可能已失效。事件在后台线程上触发，
                     // 必须切回 UI 线程再动界面。
                     _client.LoginExpired += () =>
@@ -12711,28 +14436,149 @@ namespace GeZi
         /// </summary>
         private async void OnCapacityTick()
         {
-            if (_client == null || _loginExpired) return;
+            // 【2026-11-02 修】原来只判 _client（夸克）→ UC 平台下永不刷新，
+            // 界面就一直卡在「容量获取中…」。改为按当前平台是否有 provider 来判。
+            if (CurrentProvider == null || _loginExpired) return;
             try { await RefreshCapacityAsync(); } catch { }
         }
 
+        /// <summary>
+        /// 刷新账号卡上的容量。
+        /// <para>【2026-11-02 修·回归】原来只认 <c>_client</c>（夸克）。UC 平台下
+        /// <c>_client</c> 为 null → 直接 return → 界面永远停在「容量获取中…」。
+        /// 现在按当前平台的 provider 取，并且取不到时**要显式落一个文案**，
+        /// 不能把"获取中"这种中间态一直挂在界面上。</para>
+        /// </summary>
         private async Task RefreshCapacityAsync()
         {
-            if (_client == null)
+            var provider = CurrentProvider;
+            if (provider == null)
+            {
+                UpdateAccountCard(CurrentNick(), 0, 0);
                 return;
+            }
             try
             {
-                var (total, used) = await _client.GetCapacityAsync();
+                var (total, used) = await provider.GetCapacityAsync();
+
+                // 【2026-11-02 新增】拉到就把结果缓存进设置 —— 下次启动能立刻显示，
+                // 不必等到网络请求回来才有数字。
                 if (total > 0)
                 {
-                    // 容量条已经显示了用量，这里只更新卡片（昵称保持当前值）。
-                    UpdateAccountCard(_settings.Who, used, total);
+                    try
+                    {
+                        if (string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase))
+                        {
+                            _ucTotal = total;
+                            _ucUsed = used;
+                            _settings.UcTotalCapacity = total;
+                            _settings.UcUsedCapacity = used;
+                            SettingsStore.Save(_settings);
+                        }
+                    }
+                    catch { }
+                }
+
+                // 【2026-11-02 修】原来固定传 _settings.Who（**夸克**的昵称）——
+                // UC 平台下会把夸克昵称显示到 UC 的账号卡上。
+                UpdateAccountCard(CurrentNick(), total > 0 ? used : 0, total > 0 ? total : 0);
+            }
+            catch
+            {
+                UpdateAccountCard(CurrentNick(), 0, 0);
+            }
+        }
+
+        /// <summary>
+        /// 把指定平台已保存的 Cookie 回填到输入框（2026-11-02 新增）。
+        ///
+        /// <para>【为什么需要】用户反馈「之前粘贴的 cookie 重启后不见了」。
+        /// Cookie 输入框是两平台共用的，重启后它是空的；而设置里其实存着 Cookie。
+        /// 切到某个平台时把它那份回填进来，用户就能看见、也能直接再点「导入并登录」。</para>
+        ///
+        /// <para>⚠️ 只在该平台的草稿为空时回填，避免覆盖用户正在编辑的内容。</para>
+        /// </summary>
+        private void RestoreCookieBoxFor(string platformId)
+        {
+            try
+            {
+                if (CookieImportBox == null) return;
+
+                // 【2026-11-02 修】原来的判据有两个坑：
+                //   ① 草稿里存了空串也算"有草稿" → 直接 return，真实 Cookie 永远填不进来；
+                //   ② 输入框非空就 return → 切平台后框里还是上一个平台的内容。
+                // 现在只在「用户真的在这个框里输入过内容」时才跳过。
+                string draft;
+                if (_cookieDrafts.TryGetValue(platformId ?? "", out draft)
+                    && !string.IsNullOrEmpty(draft)
+                    && string.Equals(draft, CookieImportBox.Text, StringComparison.Ordinal))
+                {
+                    // 框里正是该平台已保存的草稿 → 已经对了，不用动
+                    return;
+                }
+
+                string cookie = null;
+                if (string.Equals(platformId, "uc", StringComparison.OrdinalIgnoreCase))
+                {
+                    cookie = _ucClient != null && !string.IsNullOrEmpty(_ucClient.Cookie)
+                        ? _ucClient.Cookie
+                        : (_settings != null ? _settings.UcCookie : null);
                 }
                 else
                 {
-                    UpdateAccountCard(_settings.Who, 0, 0);
+                    cookie = _client != null && !string.IsNullOrEmpty(_client.CookieStr)
+                        ? _client.CookieStr
+                        : (_settings != null ? _settings.Cookie : null);
+                }
+
+                if (string.IsNullOrEmpty(cookie)) return;
+                CookieImportBox.Text = cookie;
+                _cookieDrafts[platformId ?? ""] = cookie;
+                // 这是"已经登录过的" Cookie，不该再触发一次自动登录
+                _lastAutoLoginSig = CurrentProviderId() + "|" + cookie;
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 当前平台的昵称（2026-11-02 新增）。
+        /// <para>UC 用 <c>_ucNick</c>（回退 <c>_settings.UcWho</c>），夸克用 <c>_settings.Who</c>。
+        /// 以前各处一律传 <c>_settings.Who</c>，UC 平台下会显示成夸克的昵称。</para>
+        /// </summary>
+        private string CurrentNick()
+        {
+            try
+            {
+                if (string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!string.IsNullOrEmpty(_ucNick)) return _ucNick;
+                    return _settings != null ? (_settings.UcWho ?? "") : "";
                 }
             }
             catch { }
+            return _settings != null ? (_settings.Who ?? "") : "";
+        }
+
+        /// <summary>
+        /// 当前平台的 Cookie（内存优先，回退设置里存的那份）。2026-11-02 新增。
+        /// <para>与 <see cref="CurrentProviderCookie"/> 的区别：这个**不依赖客户端实例**，
+        /// 冷启动时也能拿到（用于回填 Cookie 输入框、恢复登录态）。</para>
+        /// </summary>
+        private string CurrentPlatformCookie()
+        {
+            try
+            {
+                if (string.Equals(_loginPlatform, "uc", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_ucClient != null && !string.IsNullOrEmpty(_ucClient.Cookie))
+                        return _ucClient.Cookie;
+                    return _settings != null ? (_settings.UcCookie ?? "") : "";
+                }
+                if (_client != null && !string.IsNullOrEmpty(_client.CookieStr))
+                    return _client.CookieStr;
+            }
+            catch { }
+            return _settings != null ? (_settings.Cookie ?? "") : "";
         }
 
         // ---------------- 窗口关闭 / 托盘驻留 ----------------
@@ -12757,7 +14603,7 @@ namespace GeZi
             var action = _settings.OnCloseButton;
             if (action == CloseAction.Ask)
             {
-                bool dontAsk;
+                bool dontAsk, dismissed;
                 var r = AppDialog.ShowWithDontAsk(this,
                     "要让鸽子下载自用版继续在后台下载吗？\n\n" +
                     "· 最小化到托盘：窗口收进通知区，下载继续跑；\n" +
@@ -12765,7 +14611,24 @@ namespace GeZi
                     "· 直接退出程序：立即结束进程（已下部分会保留，下次可续传）。",
                     "关闭窗口",
                     "最小化到托盘", "直接退出程序",
-                    MessageBoxImage.Question, out dontAsk);
+                    MessageBoxImage.Question, out dontAsk, out dismissed);
+
+                // 🚨【2026-11-03 修·用户实测】点弹窗右上角 X / 按 Esc = **误点，不退出**。
+                //
+                // 【用户原话】「打开软件点 X 图标弹出弹窗选项，最小化和直接退出。
+                //   但是此时如果点选项弹窗的 X 的话就直接退出了。正常软件逻辑应该是
+                //   关闭弹窗不退出，视作用户误点击」
+                //
+                // 【根因】OnCancel（X / Esc）返回 Cancel，而「直接退出程序」这个次按钮
+                //   的 Tag **也是** Cancel —— 两种意图同一个返回值，下面那行三元判断
+                //   只能把"关弹窗"一并算成"选了退出"，于是误点一下就退进程。
+                //   现在 AppDialog 用 dismissed 把两者分开，这里先拦掉误点。
+                if (dismissed)
+                {
+                    e.Cancel = true;          // 主窗保持打开
+                    Log("已取消关闭（点了弹窗的 ×，按误点处理，程序继续运行）。");
+                    return;
+                }
 
                 action = (r == MessageBoxResult.OK)
                     ? CloseAction.MinimizeToTray : CloseAction.Exit;
@@ -13219,7 +15082,8 @@ namespace GeZi
 
                 AccountText.Text = nick;
                 AccountText.ToolTip = nick;   // 昵称过长被截断时仍可悬停看全
-                AccountHintText.Text = "夸克网盘";
+                // 【2026-11-02 修】原来硬编码 "夸克网盘" —— UC 登录后也显示成夸克，误导用户。
+                AccountHintText.Text = CurrentProviderName();
 
                 if (total > 0)
                 {
@@ -13264,7 +15128,10 @@ namespace GeZi
                     CapacityBar.Value = 0;
                     CapacityBar.Foreground = (Brush)FindResource("BorderBrushStrong");
                     CapacityBar.ToolTip = null;
-                    CapacityText.Text = "容量获取中…";
+                    // 【2026-11-02 修】原来这里写"容量获取中…"，但 UC 平台下以前永远走不到
+                    // 刷新逻辑，这句就**永久挂在界面上**，看起来像卡死。
+                    // 现在改成"容量未知" —— 它是终态描述，不会让人以为还在转圈。
+                    CapacityText.Text = "容量未知";
                 }
 
                 SyncLoginPageState(nick, used, total);
@@ -13300,9 +15167,11 @@ namespace GeZi
                 var ignoredLoginAvatar = LoadAvatarAsync(
                     LoginAvatarImage, LoginAvatarText, _settings.AvatarUrl);
                 LoginWhoText.Text = nick;
+                // 【2026-11-02 修】拿不到容量时显示"容量未知"而不是"获取中" ——
+                // 后者是中间态，会让人以为程序还在转圈，实际可能永远拿不到。
                 LoginSubText.Text = total > 0
                     ? "已用 " + Util.FormatSize(used) + " / 共 " + Util.FormatSize(total)
-                    : "已登录（容量获取中…）";
+                    : "已登录（容量未知）";
             }
             catch { }
         }

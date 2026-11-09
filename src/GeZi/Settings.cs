@@ -345,6 +345,61 @@ namespace GeZi
         /// <summary>上次浏览的分享 ID（仅分享模式有意义，对应 URL 里的 /s/&lt;pwd_id&gt;）。</summary>
         public string LastSharePwdId { get; set; }
 
+        /// <summary>
+        /// 上次浏览的分享属于哪个网盘（"quark" / "uc"）。2026-11-02 新增。
+        /// <para>【为什么必须记】启动时恢复浏览位置要**用对平台的客户端**去重解析分享。
+        /// 不记的话，上次看的是 UC 分享、这次启动却拿夸克去请求 → 必然失败 →
+        /// 用户看到的就是「无法恢复之前的浏览历史」。</para>
+        /// <para>空值按夸克处理，兼容老配置。</para>
+        /// </summary>
+        public string LastBrowseProviderId { get; set; }
+
+        /// <summary>
+        /// 上次浏览的**真实分享链接**（2026-11-02 新增）。
+        ///
+        /// <para>【为什么必须存原始链接】以前各处都用 <c>"https://pan.quark.cn/s/" + pwdId</c>
+        /// 反推链接，于是 UC 的分享也被"变成"夸克链接，平台信息就丢了。
+        /// 存下用户真正粘贴的那条链接，恢复时直接按它的域名判断平台 —— 这才是可靠依据。</para>
+        /// </summary>
+        public string LastShareUrl { get; set; }
+
+        /// <summary>
+        /// 登录页当前选中的平台（"quark" / "uc"）。2026-11-02 新增。
+        /// <para>以前这个值是 MainWindow 里的字段、硬编码默认 "uc" 且不持久化，
+        /// 于是每次启动都跳回默认平台，与用户上次用的不一致。
+        /// 现在记住用户的选择。</para>
+        /// </summary>
+        public string LoginPlatform { get; set; }
+
+        // ==================== 【2026-11-02】UC 账号（与夸克互不覆盖）====================
+
+        /// <summary>
+        /// UC 网盘的登录 Cookie。
+        /// <para>【为什么单独一个字段】原来只有 <see cref="Cookie"/> 一个（夸克的）。
+        /// UC 登录后如果覆盖它，夸克的登录态就没了；不覆盖又没地方存 UC 的 ——
+        /// 于是左下角账号卡、重启恢复全都拿不到 UC 的 Cookie，
+        /// 用户实测反馈「显示已登录 但是左下角的用户信息没有」「粘贴的 cookie 重启后不见了」。
+        /// 现在两个平台各存各的。</para>
+        /// </summary>
+        public string UcCookie { get; set; }
+
+        /// <summary>UC 网盘的昵称。</summary>
+        public string UcWho { get; set; }
+
+        /// <summary>UC 网盘的头像 URL。</summary>
+        public string UcAvatarUrl { get; set; }
+
+        /// <summary>
+        /// UC 网盘上次已知的总容量（字节）。2026-11-02 新增。
+        /// <para>【为什么要缓存】重启后到"真正拉到新容量"之间有段时间，
+        /// 期间界面只能显示"容量未知"。缓存上一次的值可以先显示出来，
+        /// 拉到新值再覆盖 —— 用户不至于每次启动都看到一片空白。</para>
+        /// </summary>
+        public long UcTotalCapacity { get; set; }
+
+        /// <summary>UC 网盘上次已知的已用容量（字节）。</summary>
+        public long UcUsedCapacity { get; set; }
+
         /// <summary>上次浏览的分享提取码（可能为空）。</summary>
         public string LastSharePasscode { get; set; }
 

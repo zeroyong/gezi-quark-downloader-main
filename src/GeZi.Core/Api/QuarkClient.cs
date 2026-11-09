@@ -640,11 +640,10 @@ namespace GeZi.Core.Api
         }
 
         /// <summary>目录的**一页**：条目 + 接口那边还有没有下一页。</summary>
-        public sealed class DirPage
-        {
-            public readonly List<QuarkFileEntry> Items = new List<QuarkFileEntry>();
-            public bool HasMore;
-        }
+        // 【2026-11-02 P1】原来的内嵌 DirPage 类已提升为顶层类型
+        // （GeZi.Core.Models.DirPage）。分页读取是所有网盘共有的能力，
+        // 内嵌在具体客户端里会让接口层无法表达它。
+        // 本文件已 using GeZi.Core.Models，所以下面的 DirPage 指顶层类型。
 
         /// <summary>一次向接口要多少条。与原循环里写死的 50 一致。</summary>
         private const int DirPageSize = 50;

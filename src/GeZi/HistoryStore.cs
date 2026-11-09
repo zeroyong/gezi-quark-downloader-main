@@ -70,6 +70,29 @@ namespace GeZi
         /// 会变成谎话（明明是上周解析的，却写着"今天"）。
         /// </summary>
         [DataMember(Order = 7)] public bool Pinned { get; set; }
+
+        /// <summary>
+        /// 这条分享属于哪个网盘（"quark" / "uc"）。2026-11-02 新增。
+        /// <para>【为什么必须记】历史记录里的链接统一存成 <c>https://pan.quark.cn/s/&lt;pwdId&gt;</c>
+        /// （夸克格式），URL 本身**不能**反推真实平台。所以点历史记录时必须靠这个字段
+        /// 切回原平台，否则会拿错客户端去解析（夸克登录态去请求 UC 分享 → 必失败）。</para>
+        /// <para>空值按夸克处理，兼容老记录。</para>
+        /// </summary>
+        [DataMember(Order = 8)] public string ProviderId { get; set; }
+
+        /// <summary>平台 id，永不为 null（老记录回退 "quark"）。</summary>
+        public string EffectiveProviderId
+        {
+            get { return string.IsNullOrEmpty(ProviderId) ? "quark" : ProviderId; }
+        }
+
+        /// <summary>
+        /// 这条分享的**原始链接**（用户真正粘贴的那条，含平台域名）。2026-11-02 新增。
+        /// <para>【为什么必须存】以前点历史记录时用 <c>"https://pan.quark.cn/s/" + PwdId</c>
+        /// 反推链接，UC 的分享也会被拼成夸克链接 —— 平台信息丢失。
+        /// 存下真实链接，恢复时直接按域名判断平台，不再靠猜。</para>
+        /// </summary>
+        [DataMember(Order = 9)] public string ShareUrl { get; set; }
     }
 
     /// <summary>
@@ -317,7 +340,7 @@ namespace GeZi
         ///    不能因为他又点了一次这条链接就悄悄取消。
         /// </summary>
         public static void AddShareHistory(string pwdId, string passcode, string startFid,
-            string name, bool isFolder)
+            string name, bool isFolder, string providerId = null, string shareUrl = null)
         {
             if (string.IsNullOrEmpty(pwdId)) return;
             try
@@ -325,11 +348,16 @@ namespace GeZi
                 var s = Load();
                 if (s == null) return;      // 读不到就不写，别用空表覆盖
                 bool wasPinned = false;
+                string prevProvider = null;
+                string prevUrl = null;
                 for (int i = s.Shares.Count - 1; i >= 0; i--)
                 {
                     if (string.Equals(s.Shares[i].PwdId, pwdId, StringComparison.Ordinal))
                     {
                         wasPinned = wasPinned || s.Shares[i].Pinned;
+                        // 保留旧记录里的平台/链接（新的一次没传就沿用）
+                        if (string.IsNullOrEmpty(prevProvider)) prevProvider = s.Shares[i].ProviderId;
+                        if (string.IsNullOrEmpty(prevUrl)) prevUrl = s.Shares[i].ShareUrl;
                         s.Shares.RemoveAt(i);
                     }
                 }
@@ -341,6 +369,8 @@ namespace GeZi
                     Name = name ?? "",
                     IsFolder = isFolder,
                     Pinned = wasPinned,
+                    ProviderId = string.IsNullOrEmpty(providerId) ? prevProvider : providerId,
+                    ShareUrl = string.IsNullOrEmpty(shareUrl) ? prevUrl : shareUrl,
                     Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                 });
                 if (s.Shares.Count > MaxShareHistory)
@@ -487,8 +517,15 @@ namespace GeZi
         /// </summary>
         [DataMember(Order = 20)] public string SourceFid { get; set; }
 
-        /// <summary>分享内源文件的文件名（源 fid 也失效时按名字定位）。2026-10-22 新增。</summary>
+        /// <summary>分享内**源文件**的文件名（源 fid 也失效时按名字定位）。2026-10-22 新增。</summary>
         [DataMember(Order = 21)] public string SourceName { get; set; }
+
+        /// <summary>
+        /// 这条任务属于哪个网盘（"quark" / "uc"）。2026-11-02 新增。
+        /// <para>续传时必须靠它选回正确的客户端 —— 否则切过平台之后，
+        /// 旧任务会拿当前全局客户端去取链，轻则 403，重则认错文件。空值按夸克处理。</para>
+        /// </summary>
+        [DataMember(Order = 22)] public string ProviderId { get; set; }
 
         /// <summary>能不能"点一下就续传"——规则与 <see cref="PendingTask.CanResume"/> 一致。</summary>
         public bool CanResume
@@ -526,6 +563,7 @@ namespace GeZi
                 ShareRelDir = ShareRelDir,
                 SourceFid = SourceFid,
                 SourceName = SourceName,
+                ProviderId = ProviderId,
             };
         }
     }
@@ -592,6 +630,12 @@ namespace GeZi
 
         /// <summary>分享内源文件的文件名（源 fid 也失效时按名字定位）。2026-10-22 新增。</summary>
         [DataMember(Order = 19)] public string SourceName { get; set; }
+
+        /// <summary>
+        /// 这条任务属于哪个网盘（"quark" / "uc"）。2026-11-02 新增。
+        /// <para>续传时靠它选回正确的客户端；空值按夸克处理（兼容老记录）。</para>
+        /// </summary>
+        [DataMember(Order = 20)] public string ProviderId { get; set; }
 
         /// <summary>
         /// 是否具备"可自动重取链"的完整信息。

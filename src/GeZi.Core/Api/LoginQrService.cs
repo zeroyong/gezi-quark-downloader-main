@@ -51,13 +51,29 @@ namespace GeZi.Core.Api
         public string Ticket;
     }
 
-    /// <summary>夸克扫码登录：轮询 uop 接口换取登录 Cookie，不呼出内置浏览器。</summary>
+    /// <summary>
+    /// 扫码登录：轮询 cas 接口换取登录 Cookie，不呼出内置浏览器。
+    ///
+    /// <para>【2026-11-02 扩展支持 UC】夸克与 UC 的扫码接口路径完全一致，
+    /// 只有域名 / client_id / 扫码落地页不同。所以这里把这三样抽成
+    /// <see cref="QrLoginEndpoints"/>，一份逻辑同时服务两个平台。</para>
+    /// </summary>
     public class LoginQrService : IDisposable
     {
         private readonly HttpClient _http;
 
+        /// <summary>当前平台端点（默认夸克，保持既有调用点零改动）。</summary>
+        private readonly QrLoginEndpoints _ep;
+
         public LoginQrService()
+            : this(QrLoginEndpoints.Quark())
         {
+        }
+
+        /// <summary>按指定平台端点构造（UC 用 <see cref="QrLoginEndpoints.Uc"/>）。</summary>
+        public LoginQrService(QrLoginEndpoints endpoints)
+        {
+            _ep = endpoints ?? QrLoginEndpoints.Quark();
             var handler = new HttpClientHandler
             {
                 UseCookies = false,
@@ -67,12 +83,16 @@ namespace GeZi.Core.Api
             _http = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
         }
 
+        /// <summary>当前平台显示名（错误提示用）。</summary>
+        public string PlatformName => _ep.PlatformName;
+
         /// <summary>获取二维码 token 和扫码 URL（把 qrUrl 展示给用户或打开浏览器即可）。</summary>
         public async Task<(bool ok, string token, string qrUrl, string error)> GetQrCodeAsync()
         {
             try
             {
-                string url = QuarkConstants.QrLoginGetToken + "?client_id=532&v=1.2&request_id=" + Guid.NewGuid().ToString("N");
+                string url = _ep.GetTokenUrl + "?client_id=" + _ep.ClientId
+                    + "&v=1.2&request_id=" + Guid.NewGuid().ToString("N");
                 var res = await GetJsonAsync(url).ConfigureAwait(false);
                 var members = AsDict(Get(AsDict(Get(AsDict(res), "data")), "members"));
                 string token = AsString(Get(members, "token")) ?? "";
@@ -81,10 +101,10 @@ namespace GeZi.Core.Api
                     string msg = AsString(Get(AsDict(res), "message")) ?? "无 token";
                     return (false, "", "", "获取扫码登录二维码失败: " + msg);
                 }
-                string qrUrl = QuarkConstants.QrLoginScanBase
+                string qrUrl = _ep.ScanBase
                     + "?token=" + Uri.EscapeDataString(token)
-                    + "&client_id=532&ssb=weblogin&uc_param_str="
-                    + "&uc_biz_str=S:custom|OPT:SAREA@0|OPT:IMMERSIVE@1|OPT:BACK_BTN_STYLE@0";
+                    + "&client_id=" + _ep.ClientId
+                    + _ep.ScanExtraQuery;
                 return (true, token, qrUrl, "");
             }
             catch (Exception ex)
@@ -120,7 +140,7 @@ namespace GeZi.Core.Api
                 string ticket = null;
                 try
                 {
-                    string url = QuarkConstants.QrLoginGetTicket + "?client_id=532&v=1.2&token="
+                    string url = _ep.GetTicketUrl + "?client_id=" + _ep.ClientId + "&v=1.2&token="
                         + Uri.EscapeDataString(token) + "&request_id=" + Guid.NewGuid().ToString("N");
                     var res = await GetJsonAsync(url).ConfigureAwait(false);
                     status = AsLong(Get(AsDict(res), "status"));
@@ -199,6 +219,15 @@ namespace GeZi.Core.Api
         /// </summary>
         public async Task<(bool ok, string cookie, string error)> ExchangeTicketAsync(string ticket)
         {
+            // ---- 【2026-11-02 新增】UC 走独立路径 ----
+            // UC 没有夸克那种 TLS 指纹墙（实测 api.open.uc.cn / drive.uc.cn 在 .NET 栈可达），
+            // 所以不需要 OpenSSL 桥，纯 HttpClient + CookieContainer 就够。
+            // 单独一条路径的好处：完全不碰夸克那套已经调好的逻辑，风险为零。
+            if (_ep.PlatformName == "UC")
+            {
+                return await ExchangeUcAsync(ticket).ConfigureAwait(false);
+            }
+
             // ---- 路径 1：OpenSSL 桥（正路） ----
             var viaBridge = await ExchangeViaBridgeAsync(ticket).ConfigureAwait(false);
             if (viaBridge.HasValue)
@@ -335,6 +364,115 @@ namespace GeZi.Core.Api
 
         // 上一次 OpenSSL 桥的失败原因（通道不可用时也会填）。用于拼装最终错误文案。
         private string _bridgeFailure;
+
+        /// <summary>
+        /// UC 的 service_ticket 兑换（2026-11-02 新增）。
+        ///
+        /// <para>【为什么不复用夸克那套】夸克要走 OpenSSL 桥是因为 <c>pan.quark.cn</c> 按
+        /// TLS ClientHello 指纹过滤；UC 没有这堵墙 —— 实测 <c>api.open.uc.cn</c> 与
+        /// <c>drive.uc.cn</c> 在 .NET HttpClient 下都可达。所以这里用最朴素的
+        /// HttpClient + CookieContainer 即可，不需要任何原生依赖。</para>
+        ///
+        /// <para>【流程】
+        /// ① GET <c>api.open.uc.cn/cas/login?st={ticket}&amp;lw=scan</c> —— 用 ticket 激活会话；
+        /// ② 依次访问 <c>drive.uc.cn</c> 与 <c>pc-api.uc.cn</c> 的业务接口 —— 触发服务端
+        ///    下发 <c>__pus</c> / <c>__puus</c>（这两个才是网盘接口认的会话字段）；
+        /// ③ 汇总 uc.cn 各域的 Cookie 返回。</para>
+        ///
+        /// <para>【判据保守】只认 <c>__puus</c>。实测即使 ticket 无效，<c>cas/login</c> 也会
+        /// 下发 <c>_UP_*</c> 系列 Cookie，拿它当成功证据会把失败伪装成成功。
+        /// 真正的成败由调用方的 <c>ValidateAsync</c> 用业务接口验。</para>
+        /// </summary>
+        private async Task<(bool ok, string cookie, string error)> ExchangeUcAsync(string ticket)
+        {
+            var problems = new List<string>();
+            try
+            {
+                var jar = new CookieContainer { Capacity = 500, PerDomainCapacity = 200 };
+                using (var handler = new HttpClientHandler
+                {
+                    CookieContainer = jar,
+                    UseCookies = true,
+                    AllowAutoRedirect = true,
+                    AutomaticDecompression = DecompressionMethods.None,
+                })
+                using (var http = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan })
+                {
+                    string stQ = Uri.EscapeDataString(ticket);
+                    var hdr = new Dictionary<string, string>
+                    {
+                        { "User-Agent", UcConstants.UserAgent },
+                        { "Referer", UcConstants.DownloadReferer },
+                        { "Origin", UcConstants.WebOrigin },
+                        { "Accept", "text/html,application/xhtml+xml,*/*;q=0.8" },
+                    };
+
+                    // ① 用 ticket 激活 CAS 会话
+                    try
+                    {
+                        await GetRawAsync(http, _ep.CasLoginUrl + "?st=" + stQ + "&lw=scan",
+                            hdr, 20).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        problems.Add("cas/login 失败: " + RootMessage(ex));
+                    }
+
+                    // ② 触发网盘会话字段下发（__pus / __puus）
+                    //    这几条按"先首页、再业务接口"的顺序，模拟真实浏览器的访问序列。
+                    string[] enrich =
+                    {
+                        UcConstants.WebOrigin + "/",
+                        UcConstants.MemberUrl,
+                        UcConstants.ApiBase + "/1/clouddrive/config?pr=UCBrowser&fr=pc",
+                    };
+                    foreach (var u in enrich)
+                    {
+                        try
+                        {
+                            await GetRawAsync(http, u, hdr, 20).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            // 401/403 属预期（有些接口未登录会拒），只记不中断 —— 只要有一步下发 Cookie 就够
+                            problems.Add(new Uri(u).Host + " 失败: " + RootMessage(ex));
+                        }
+                    }
+
+                    // ③ 汇总 uc.cn 各域 Cookie
+                    var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    string[] domains =
+                    {
+                        "https://drive.uc.cn", "https://api.open.uc.cn",
+                        "https://pc-api.uc.cn", "https://su.uc.cn",
+                        "https://broccoli.uc.cn",
+                    };
+                    foreach (var d in domains)
+                    {
+                        try
+                        {
+                            foreach (Cookie c in jar.GetCookies(new Uri(d)))
+                                dict[c.Name] = c.Value;
+                        }
+                        catch { }
+                    }
+                    string cookie = JoinCookies(dict);
+
+                    // ④ 判据：只认 __puus
+                    if (dict.ContainsKey("__puus"))
+                        return (true, cookie, "");
+
+                    string detail = problems.Count > 0 ? ("；明细: " + string.Join(" | ", problems)) : "";
+                    return (false, cookie,
+                        "UC 扫码成功但未取回网盘会话（缺少 __puus）。可能是票据已过期或账号未激活网盘。"
+                        + "请重新扫码；若反复失败，改用「导入 Cookie」。" + detail);
+                }
+            }
+            catch (Exception ex)
+            {
+                return (false, "", "UC 换取登录态异常: " + RootMessage(ex));
+            }
+        }
 
         /// <summary>调用 Python 桥换 Cookie。返回 null 表示"本机没有可用 Python，此路不通"。</summary>
         private static Task<PanAccountBridge.ExchangeOutcome?> ExchangeViaBridgeAsync(string ticket)

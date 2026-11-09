@@ -53,8 +53,49 @@ namespace GeZi.Core.Support
         public CookieContainer Jar => _jar;
         public HttpClient Http => _http;
 
-        public QuarkSession(string cookie = null, DecompressionMethods decompression = DecompressionMethods.None)
+        /// <summary>
+        /// 本次会话的 Cookie 归属域（种子 Cookie 塞进哪个域，以及按域遍历读回时的域表）。
+        ///
+        /// <para>【2026-11-02 关键修复】这里原来是硬编码的 <c>.quark.cn</c>，
+        /// 导致 UC 的 Cookie 全被塞进 quark 域 —— 发往 <c>pc-api.uc.cn</c> 时
+        /// CookieContainer 判定域不匹配，**一个 Cookie 都不附带**，
+        /// 请求实际是游客态，<c>account/info</c> 返回空 data，
+        /// 表现为「Cookie 无效或已过期」（而同一份 Cookie 手写头却能通）。
+        /// 所以域必须按平台参数化。</para>
+        /// </summary>
+        private readonly string[] _cookieDomains;
+
+        /// <summary>夸克侧域表（默认）。</summary>
+        private static readonly string[] QuarkDomains =
         {
+            "https://pan.quark.cn", "https://drive-pc.quark.cn", "https://drive-m.quark.cn",
+            "https://drive.quark.cn", "https://drive-h.quark.cn", "https://uop.quark.cn",
+            "https://su.quark.cn", "https://quark.cn",
+        };
+
+        /// <summary>UC 侧域表（2026-11-02 新增）。</summary>
+        private static readonly string[] UcDomains =
+        {
+            "https://drive.uc.cn", "https://pc-api.uc.cn", "https://api.open.uc.cn",
+            "https://su.uc.cn", "https://uc.cn",
+        };
+
+        public QuarkSession(string cookie = null, DecompressionMethods decompression = DecompressionMethods.None)
+            : this(cookie, null, decompression)
+        {
+        }
+
+        /// <param name="cookieDomain">
+        /// 种子 Cookie 的归属域。null/空 → 夸克域表（保持既有调用点零改动）；
+        /// UC 客户端传 <c>UcConstants.CookieSeedDomain</c>（即 <c>.uc.cn</c>）。
+        /// </param>
+        public QuarkSession(string cookie, string cookieDomain, DecompressionMethods decompression)
+        {
+            bool isUc = !string.IsNullOrEmpty(cookieDomain) &&
+                        cookieDomain.IndexOf("uc.cn", StringComparison.OrdinalIgnoreCase) >= 0;
+            _cookieDomains = isUc ? UcDomains : QuarkDomains;
+            _seedDomain = isUc ? cookieDomain : ".quark.cn";
+
             _jar = new CookieContainer { Capacity = 500, PerDomainCapacity = 200 };
             if (!string.IsNullOrEmpty(cookie))
                 SeedCookies(cookie);
@@ -78,12 +119,8 @@ namespace GeZi.Core.Support
 
         // ---------------- Cookie ----------------
 
-        private static readonly string[] CookieDomains =
-        {
-            "https://pan.quark.cn", "https://drive-pc.quark.cn", "https://drive-m.quark.cn",
-            "https://drive.quark.cn", "https://drive-h.quark.cn", "https://uop.quark.cn",
-            "https://su.quark.cn", "https://quark.cn",
-        };
+        /// <summary>种子 Cookie 的归属域（夸克 <c>.quark.cn</c> / UC <c>.uc.cn</c>）。</summary>
+        private readonly string _seedDomain;
 
         public static Dictionary<string, string> ParseCookies(string s)
         {
@@ -112,7 +149,7 @@ namespace GeZi.Core.Support
             {
                 try
                 {
-                    _jar.Add(new Cookie(kv.Key, kv.Value, "/", ".quark.cn"));
+                    _jar.Add(new Cookie(kv.Key, kv.Value, "/", _seedDomain));
                 }
                 catch
                 {
@@ -125,7 +162,7 @@ namespace GeZi.Core.Support
         public string BuildCookieString()
         {
             var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var d in CookieDomains)
+            foreach (var d in _cookieDomains)
             {
                 CookieCollection cookies;
                 try
@@ -151,7 +188,7 @@ namespace GeZi.Core.Support
 
         public bool HasCookie(string name)
         {
-            foreach (var d in CookieDomains)
+            foreach (var d in _cookieDomains)
             {
                 try
                 {

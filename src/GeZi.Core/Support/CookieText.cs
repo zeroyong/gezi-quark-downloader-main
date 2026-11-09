@@ -299,5 +299,144 @@ namespace GeZi.Core.Support
             }
             return sb.ToString();
         }
+
+        // ==================== 【2026-11-02 新增】UC 会话字段操作 ====================
+        //
+        // UC 与夸克共用 __pus / __puus 两个会话字段，但 UC 多一个 __pugs：
+        //   · __puus 约 3 小时过期，刷新时要"先删再请求"逼服务端下发新的；
+        //   · __pugs 是游客态取链时随响应下发、与本次直链绑定的下载凭证，缺它 403。
+        // 这三个方法只做纯字符串操作，不碰网络，便于单测。
+
+        /// <summary>
+        /// 从 Cookie 串里移除指定字段（保留其余）。
+        /// <para>用于 <c>__puus</c> 刷新：先去掉旧值再请求 config，
+        /// 服务端才会在 Set-Cookie 里下发新的。</para>
+        /// </summary>
+        public static string WithoutField(string cookie, string field)
+        {
+            if (string.IsNullOrEmpty(cookie) || string.IsNullOrEmpty(field))
+                return cookie ?? "";
+
+            var sb = new StringBuilder();
+            foreach (var part in cookie.Split(';'))
+            {
+                var p = part.Trim();
+                if (p.Length == 0) continue;
+                int eq = p.IndexOf('=');
+                if (eq > 0)
+                {
+                    var k = p.Substring(0, eq).Trim();
+                    if (string.Equals(k, field, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                }
+                if (sb.Length > 0) sb.Append("; ");
+                sb.Append(p);
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 把一条 <c>Set-Cookie</c> 响应头里的指定字段合并进 Cookie 串（存在则替换，不存在则追加）。
+        /// <para>典型用法：把响应里新的 <c>__puus</c> 合并回原 Cookie，保持会话新鲜。</para>
+        /// </summary>
+        public static void MergeSessionField(ref string cookie, string setCookieLine, params string[] fields)
+        {
+            if (string.IsNullOrEmpty(setCookieLine) || fields == null || fields.Length == 0)
+                return;
+
+            // Set-Cookie 形如 "name=value; Path=/; Domain=...; Max-Age=..."，
+            // 只取第一个分号之前的部分。
+            string kv = setCookieLine;
+            int semi = kv.IndexOf(';');
+            if (semi >= 0) kv = kv.Substring(0, semi);
+            kv = kv.Trim();
+
+            int eq = kv.IndexOf('=');
+            if (eq <= 0) return;
+            string name = kv.Substring(0, eq).Trim();
+            string value = kv.Substring(eq + 1).Trim();
+
+            bool matched = false;
+            foreach (var f in fields)
+            {
+                if (string.Equals(name, f, StringComparison.OrdinalIgnoreCase))
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return;
+
+            cookie = SetField(cookie, name, value);
+        }
+
+        /// <summary>设置/替换 Cookie 里的某个字段（不存在则追加到末尾）。</summary>
+        public static string SetField(string cookie, string field, string value)
+        {
+            if (string.IsNullOrEmpty(field))
+                return cookie ?? "";
+
+            var sb = new StringBuilder();
+            bool replaced = false;
+            if (!string.IsNullOrEmpty(cookie))
+            {
+                foreach (var part in cookie.Split(';'))
+                {
+                    var p = part.Trim();
+                    if (p.Length == 0) continue;
+                    int eq = p.IndexOf('=');
+                    if (eq > 0 && string.Equals(p.Substring(0, eq).Trim(), field, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!replaced)
+                        {
+                            if (sb.Length > 0) sb.Append("; ");
+                            sb.Append(field).Append('=').Append(value ?? "");
+                            replaced = true;
+                        }
+                        continue;   // 丢弃重复项
+                    }
+                    if (sb.Length > 0) sb.Append("; ");
+                    sb.Append(p);
+                }
+            }
+            if (!replaced)
+            {
+                if (sb.Length > 0) sb.Append("; ");
+                sb.Append(field).Append('=').Append(value ?? "");
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 从响应的 Set-Cookie 头里取出某个字段的值（只取一条，返回第一个命中）。
+        /// <para>用于 <c>__pugs</c>：取链响应下发的那个值必须与本次直链配对使用。</para>
+        /// </summary>
+        public static string ExtractField(System.Net.Http.HttpResponseMessage res, string field)
+        {
+            if (res == null || string.IsNullOrEmpty(field))
+                return "";
+
+            try
+            {
+                System.Collections.Generic.IEnumerable<string> values;
+                if (!res.Headers.TryGetValues("Set-Cookie", out values))
+                    return "";
+
+                foreach (var line in values)
+                {
+                    if (string.IsNullOrEmpty(line)) continue;
+                    string kv = line;
+                    int semi = kv.IndexOf(';');
+                    if (semi >= 0) kv = kv.Substring(0, semi);
+                    kv = kv.Trim();
+                    int eq = kv.IndexOf('=');
+                    if (eq <= 0) continue;
+                    if (string.Equals(kv.Substring(0, eq).Trim(), field, StringComparison.OrdinalIgnoreCase))
+                        return kv.Substring(eq + 1).Trim();
+                }
+            }
+            catch { }
+            return "";
+        }
     }
 }
