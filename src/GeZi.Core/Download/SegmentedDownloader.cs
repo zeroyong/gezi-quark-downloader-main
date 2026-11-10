@@ -455,6 +455,20 @@ namespace GeZi.Core.Download
         private const int CrawlSeconds = 20;
 
         /// <summary>
+        /// 收尾速度过低时，最多换几次直链（2026-11-09 新增）。
+        ///
+        /// <para>【为什么必须有上限】用户实测：任务在 99.5% 反复
+        /// 「速度过低已中止 → 换链 → 又速度过低 → 再中止」，
+        /// 永远下不完。因为换链拿到的是**同一个 CDN、同一批慢节点**，
+        /// 下一轮必然再次 crawl —— 这是自我强化的死循环。</para>
+        ///
+        /// <para>取 2：换两次还不行，就说明不是"这条直链被调度到慢节点"，
+        /// 而是这个文件本身在 CDN 侧就是慢的。继续换只是浪费时间和请求配额，
+        /// 不如让它慢跑到底（数据最终会全部到位）。</para>
+        /// </summary>
+        private const int MaxCrawlRefresh = 2;
+
+        /// <summary>
         /// 单个 HTTP 请求的总超时（秒）。
         ///
         /// <para>【2026-11-09 新增·对齐 YunX】原来 HttpClient 是
@@ -551,8 +565,185 @@ namespace GeZi.Core.Download
         private const int PreemptOverallSlowMinSamples = 4;
 
         /// <summary>
-        /// 下载**中途**把当前片的剩余部分让出去（2026-11-02 新增，2026-11-09 重写）。
+        /// 把"长尾分片"切细，喂给空转的 worker（2026-11-09 新增）。
         ///
+        /// <para>【它解决什么】用户日志的铁证：
+        /// <c>[诊断·收尾] 剩3片/567KB 活跃=3/36 速度=1.9KB/s</c>，
+        /// 三片各剩 186KB，而 33 个 worker 全闲着。
+        /// 一片只能被一个 worker 下，所以不切细就永远只有 3 路在跑。</para>
+        ///
+        /// <para>【为什么不能靠 worker 内的让片】那个检查在 ReadAsync 之前，
+        /// 而实测单次读会阻塞 29 秒 → 检查节拍被网络绑架，实际几乎不触发。
+        /// 这个函数由 reporter 循环（稳定 200ms）调用，不受阻塞影响。</para>
+        ///
+        /// <para>【与 worker 内让片的区别】worker 内的让片要处理"我正在读的这片"，
+        /// 所以必须掐断自己；这里切的是**没有被任何 worker 认领的那部分尾部**，
+        /// 不需要掐断任何人。具体做法：</para>
+        /// <list type="number">
+        /// <item>找出所有未完成片；</item>
+        /// <item>对每一片，把它"尚未被认领的尾部"切出来 —— 即从 <c>W</c> 之后开始切，
+        ///       但**只切出后面若干份**，自己保留第一份继续下；</item>
+        /// <item>新片进队列，闲着的 worker 立刻来领。</item>
+        /// </list>
+        ///
+        /// <para>⚠️ 安全性：只改 <c>part.E</c>（收缩）与追加新片，**不动任何已写字节 W**。
+        /// 旧片在收缩前发出、正在接收的响应会多送一些数据 —— 但写入循环有"实时边界截断"
+        /// 保护（见那处注释），超出部分直接丢弃，不会重复计数。</para>
+        /// </summary>
+        private void ShrinkLongTailParts(
+            DownloadPlan plan,
+            System.Collections.Concurrent.ConcurrentQueue<int> queue,
+            object splitLock,
+            int activeNow, int workerCount, int partCapacity,
+            double speedBps)
+        {            if (plan == null || workerCount <= 1) return;
+
+            // ---- 先算全局剩余量（照搬 YunX 的 `remaining = total - nextStart`）----
+            //
+            // 【YunX 的 ElasticAllocator.take() 关键一行】
+            //     val block = if (remaining <= w * base) (remaining / w).coerceIn(MIN_TAIL_BLOCK, base)
+            // 其中 remaining 是"**还没被任何人领走**的字节"。
+            // 它按字节顺序发块，领走就不管了 —— 所以每块大小天然随当时剩余量自适应，
+            // worker 领到的块永远是"剩余量 / worker 数"这个量级。
+            //
+            // GeZi 是固定分片模型（.qmeta 记每片 W，不能重排），只能在事后把
+            // "已经领走但还没下完"的片切细。所以这里用一个等价判据：
+            //     **每片剩余量 vs 全局剩余量 / worker 数**
+            // 只有当某片的剩余量明显大于"公平份额"时才切它。
+            long totalRemain = 0;
+            var candidates = new List<(int idx, long remain)>();
+            for (int i = 0; i < plan.Parts.Count; i++)
+            {
+                var p = plan.Parts[i];
+                long sz = p.E - p.S + 1;
+                long left = sz - Volatile.Read(ref p.W);
+                if (left <= 0) continue;
+                totalRemain += left;
+                if (left >= YieldMinRemainBytes)
+                    candidates.Add((i, left));
+            }
+            if (candidates.Count == 0 || totalRemain <= 0) return;
+
+            int idle = Math.Max(0, workerCount - activeNow);
+            if (idle <= 0) return;
+
+            // 公平份额：每个 worker 应该摊到多少字节。
+            // 与 YunX 的 `remaining / w` 完全等价。
+            long fairShare = Math.Max(TailShrinkMinBytes, totalRemain / Math.Max(1, workerCount));
+
+            // 【对齐 YunX 的 baseBlockSize()】块大小还要看**实际速度**：
+            //     val perWorker = recentSpeedBps / w
+            //     (perWorker * TARGET_SECONDS).coerceIn(MIN_ELASTIC_BLOCK, MAX_ELASTIC_BLOCK)
+            // 含义是"每块 ≈ 单 worker 下 5 秒的量"。
+            //
+            // 为什么重要：慢速收尾时（用户实测 1.9 KB/s / 3 路 = 每路约 650 B/s），
+            // 若块还按 186KB 分，一路要磨 4~5 分钟；按"5 秒的量"分，一路只需 5 秒 ——
+            // **块越细，更多连接都能参与，长尾自然被摊薄**。
+            if (speedBps > 0)
+            {
+                long perWorkerBps = Math.Max(1, (long)(speedBps / Math.Max(1, workerCount)));
+                long speedBased = perWorkerBps * 5;          // 5 秒的量
+                if (speedBased < TailShrinkMinBytes) speedBased = TailShrinkMinBytes;
+                if (speedBased < fairShare) fairShare = speedBased;   // 取更小者 → 块更细
+            }
+
+            // 只切"剩余量超过公平份额"的片 —— 那些正是"一片顶别人好几倍"的长尾。
+            // 按剩余量降序处理，优先解决最胖的那几个。
+            candidates.Sort((a, b) => b.remain.CompareTo(a.remain));
+
+            int added = 0;
+            foreach (var c in candidates)
+            {
+                if (idle <= 0) break;
+                if (plan.Parts.Count >= partCapacity) break;
+
+                var p = plan.Parts[c.idx];
+                long w = Volatile.Read(ref p.W);
+                long sz = p.E - p.S + 1;
+                if (w >= sz) continue;                 // 已完成，跳过
+
+                long cutAt = p.S + w;                  // 只切还没下的部分
+                long tailBytes = p.E - cutAt + 1;
+                if (tailBytes < YieldMinRemainBytes) continue;
+
+                // 这张片最多该占几个 worker：剩余量 / 公平份额（至少 1）
+                int share = (int)Math.Min(idle + 1, Math.Max(1, tailBytes / fairShare));
+                if (share < 2) continue;               // 不需要切，它已经不胖了
+
+                // 均分成 share 份，每份不低于 64KB（YunX MIN_TAIL_BLOCK）
+                long sliceBytes = tailBytes / share;
+                if (sliceBytes < TailShrinkMinBytes)
+                {
+                    sliceBytes = TailShrinkMinBytes;
+                    share = (int)Math.Min(idle + 1, tailBytes / sliceBytes);
+                    if (share < 2) continue;
+                }
+
+                long oldEnd = p.E;
+                int thisAdded = 0;
+                long s2 = cutAt;
+                for (int k = 0; k < share && s2 <= oldEnd; k++)
+                {
+                    long e2 = (k == share - 1) ? oldEnd : Math.Min(oldEnd, s2 + sliceBytes - 1);
+                    if (e2 < s2) break;
+                    lock (splitLock)
+                    {
+                        if (plan.Parts.Count >= partCapacity) break;
+                        plan.Parts.Add(new PartPlan { S = s2, E = e2, W = 0 });
+                        queue.Enqueue(plan.Parts.Count - 1);
+                    }
+                    thisAdded++;
+                    s2 = e2 + 1;
+                }
+
+                if (thisAdded > 0)
+                {
+                    // ★ 收缩原片右边界到"已写位置"，否则与新片区间重叠、会下两遍。
+                    //
+                    // 🚨🚨【2026-11-09 修·1 字节分片】
+                    // 用户日志出现 `片17[0 B/1 B 剩1 B worker#16]` 这种畸形分片。
+                    // 根因就在这里：若某片**一个字节都没写过**（cutAt == p.S），
+                    // 那么 `p.E = cutAt - 1` 会小于 p.S，而原来那句
+                    // `if (p.E < p.S) p.E = p.S;` 会把范围补成 [p.S, p.S]
+                    // —— **长度恰好 1 字节**。
+                    // 后果：worker 领到它、ReadAsync 只请求 1 字节，而那个位置早已被
+                    // 新切出去的片覆盖 → 两个请求抢同一字节；慢连接上这 1 字节要磨很久，
+                    // AllPartsDone() 因此永远不成立（日志里反复出现 0 B/1 B 的片）。
+                    //
+                    // 【正确做法】一个字节都没写过 = 整片都已经让出去了 →
+                    // 直接标记"已完成"（W = size），而不是缩成 1 字节。
+                    if (cutAt <= p.S)
+                    {
+                        long szNow = p.E - p.S + 1;
+                        Volatile.Write(ref p.W, szNow);
+                    }
+                    else
+                    {
+                        p.E = cutAt - 1;
+                        long newSize = p.E - p.S + 1;
+                        if (Volatile.Read(ref p.W) > newSize)
+                            Volatile.Write(ref p.W, newSize);
+                    }
+
+                    added += thisAdded;
+                    idle -= thisAdded;
+                    Log?.Invoke(string.Format(
+                        "[尾部切细] 全局剩 {0}，每路公平份额 {1}；片{2} 剩 {3}（超份额 {4} 倍）"
+                        + " → 均分切出 {5} 片，每片约 {6}",
+                        Fmt(totalRemain), Fmt(fairShare), c.idx, Fmt(c.remain),
+                        (c.remain / Math.Max(1, fairShare)), thisAdded, Fmt(sliceBytes)));
+                }
+            }
+
+            if (added > 0)
+            {
+                Log?.Invoke(string.Format(
+                    "[尾部切细] 本轮共切出 {0} 片（活跃 {1}/{2}），队列现有 {3} 个待领",
+                    added, activeNow, workerCount, queue.Count));
+            }
+        }
+
+
         /// <para>【为什么需要】原有的"动态窃取 + 尾部收缩"都只在**领片那一瞬间**生效。
         /// 一旦某条连接拿到一个大片开始读，中途就再也不会切 —— 于是当其他连接都下完、
         /// 只剩这一条在磨时，总速度会崩到几 B/s。用户实测：「UC网盘的 又出现 尾部掉速
@@ -671,12 +862,20 @@ namespace GeZi.Core.Download
                 if (newEnd >= part.S)
                 {
                     part.E = newEnd;                 // 剩余部分已全部交给新片
+                    // 收缩后若 W 已超过新长度（收缩前写了超出的部分），同步归位
+                    long szNew = part.E - part.S + 1;
+                    if (Volatile.Read(ref part.W) > szNew)
+                        Volatile.Write(ref part.W, szNew);
                 }
                 else
                 {
-                    // 一个字节都没写过 → 整片都让出去了，收到 part.S 位置避免空范围
-                    part.E = part.S;
-                    Volatile.Write(ref part.W, 0);
+                    // 🚨【2026-11-09 修·1 字节分片】一个字节都没写过 = 整片都让出去了。
+                    // 原来写 `part.E = part.S; part.W = 0;` → 范围 [S,S] 长度 1 字节且 W=0，
+                    // 于是产生 `片N[0 B/1 B]` 这种畸形分片：worker 会去请求那 1 字节，
+                    // 而它早已被新片覆盖 → 两个请求抢同一字节，且慢速时磨很久，
+                    // AllPartsDone() 永远不成立（用户日志里反复出现 0 B/1 B）。
+                    // 正解：直接标记整片已完成。
+                    Volatile.Write(ref part.W, part.E - part.S + 1);
                 }
 
                 return true;
@@ -2783,6 +2982,8 @@ namespace GeZi.Core.Download
                 /// 但最终给用户的失败说明必须区分开。</para>
                 /// </summary>
                 int crawlFlag = 0;
+                // 【2026-11-09】累计因"收尾速度过低"触发的换链次数（防死循环，见 MaxCrawlRefresh）
+                int crawlRefreshCount = 0;
                 // 慢速爬行计时（Environment.TickCount 毫秒，0 = 未在爬行）
                 long lastCrawlMs = 0;
                 // 【2026-11-09】收尾诊断日志的限频戳（每 5 秒最多打一行）
@@ -2985,6 +3186,39 @@ namespace GeZi.Core.Download
                             try { PreemptSlowChunks(speed, Volatile.Read(ref workerCountBox)); }
                             catch { /* 抢占失败绝不能影响下载本身 */ }
                         }
+
+                        // ==================== 【2026-11-09 新增·尾部切细】====================
+                        // 用户日志（决定性证据）：
+                        //   [诊断·收尾] 剩3片/567KB 活跃=**3/36** 速度=1.9KB/s
+                        //     片3[剩186.3KB worker#3]；片10[剩194.4KB worker#8]；片11[剩186.3KB worker#9]
+                        //   → 36 个 worker 里 33 个闲着，而每片还剩 186KB 没下！
+                        //
+                        // 【为什么 worker 里的让片没救场】让片检查写在 worker 的读循环里，
+                        // 位置在 ReadAsync **之前**。而日志显示一次 ReadAsync 会阻塞 29 秒
+                        // ——于是检查频率实际被"读返回的速度"绑架，最多每 29 秒才轮到一次，
+                        // 而 crawl 判定只等 20 秒就换链。**让片的节拍器根本转不起来。**
+                        //
+                        // 【修法】把"发现长尾就切细"这件事交给这个 200ms 的 reporter 循环
+                        // （它的节拍是稳定的，不受任何网络阻塞影响）。
+                        // 只做一件事：把"剩余量还很大"的未完成分片切成小片放回队列，
+                        // 让那 33 个闲着的 worker 立刻有活干。
+                        //
+                        // 安全性：只切 **W 还没有任何进展** 或 **队列为空且活跃偏低** 的片，
+                        // 且切分只是"追加新片 + 收缩旧片右边界"，不动已写字节。
+                        // 与 worker 内的让片是**互补**关系：那个处理"正在读的那一片"，
+                        // 这个处理"全局的长尾形态"。
+                        if (!draining && queue.Count == 0)
+                        {
+                            int actNow = Volatile.Read(ref activeConns);
+                            int wkAll = Volatile.Read(ref workerCountBox);
+                            // 有空转 worker 才谈得上"切细喂它们"
+                            if (wkAll > 1 && actNow * 2 < wkAll)
+                            {
+                                try { ShrinkLongTailParts(plan, queue, splitLock, actNow, wkAll, partCapacity, speed); }
+                                catch { /* 切细是优化，失败不影响下载 */ }
+                            }
+                        }
+                        // =================================================================
 
                         // 每 5 秒采一次样（结构化快照给诊断面板用）。
                         // 关键是看 活跃连接数：
@@ -3248,18 +3482,54 @@ namespace GeZi.Core.Download
                                 else if (Environment.TickCount - lastCrawlMs >= CrawlSeconds * 1000
                                          && Interlocked.CompareExchange(ref stalledFlag, 1, 0) == 0)
                                 {
-                                    _lastRemainParts = remainForCrawl;
-                                    Interlocked.Exchange(ref crawlFlag, 1);
-                                    Log?.Invoke(string.Format(
-                                        "收尾阶段速度过低: 只剩 {0} 片，但速度只有 {1}/s 已持续 {2} 秒。"
-                                        + "这是夸克 CDN 把这几片调度到了慢节点（与你的网络无关）—— "
-                                        + "正在换一条新直链以避开它，已下载部分全部保留，换链后自动续传。",
-                                        remainForCrawl, Fmt((long)speed), CrawlSeconds));
-                                    AddError("crawl: 收尾阶段速度过低");
-                                    Interlocked.Exchange(ref cancelled, 1);
-                                    lastAdvance = now;
-                                    lastCrawlMs = 0;
-                                    try { watchdog.Cancel(); } catch { }
+                                    // 🚨🚨【2026-11-09 修·必须】换链次数必须设上限，否则死循环。
+                                    //
+                                    // 【用户实测】日志里连续出现：
+                                    //   收尾阶段速度过低已中止（已保留断点，换新直链后自动续传）
+                                    //   分享直链获取失败 / 自动重新解析分享失败 / take 失败
+                                    //   → 又 收尾阶段速度过低已中止 …
+                                    // 任务在 99.5% 反复中止-换链-再中止，永远下不完。
+                                    //
+                                    // 【根因】crawl 只等 20 秒就杀任务，但**换链拿到的是同一个 CDN、
+                                    // 同一批慢节点**，下一轮必然再 crawl —— 这是自我强化的死循环。
+                                    // YunX 没有这种"因慢而杀任务再重来"的设计，它靠的是
+                                    // **弹性块 + 慢连接抢占**在同一个任务内消化掉长尾。
+                                    //
+                                    // 【修法】① 先让"尾部切细"跑够几轮（它每 200ms 就在切）；
+                                    //        ② 只有切细也救不动、且已换链次数未达上限时才换链；
+                                    //        ③ 达到上限后**不再 kill**，让它慢跑到底（比反复重来强）。
+                                    if (crawlRefreshCount >= MaxCrawlRefresh)
+                                    {
+                                        // 已达上限：不再中止任务。
+                                        // 让它以当前速度慢慢下完 —— 数据会全部到位，只是慢。
+                                        if (lastCrawlMs != 0
+                                            && Environment.TickCount - lastCrawlMs >= CrawlSeconds * 1000)
+                                        {
+                                            Log?.Invoke(string.Format(
+                                                "收尾阶段速度仍然很低（剩 {0} 片，{1}/s），"
+                                                + "但已换过 {2} 次直链仍未改善 —— "
+                                                + "这属于 CDN 对这几片的调度问题，继续换链也不会变快。"
+                                                + "已停止换链，让它慢慢下完（数据不会丢）。",
+                                                remainForCrawl, Fmt((long)speed), crawlRefreshCount));
+                                            lastCrawlMs = Environment.TickCount;  // 重计时，避免刷屏
+                                        }
+                                    }
+                                    else
+                                    {
+                                        crawlRefreshCount++;
+                                        _lastRemainParts = remainForCrawl;
+                                        Interlocked.Exchange(ref crawlFlag, 1);
+                                        Log?.Invoke(string.Format(
+                                            "收尾阶段速度过低: 只剩 {0} 片，速度 {1}/s 已持续 {2} 秒"
+                                            + "（第 {3}/{4} 次换链）。已保留断点，换新直链后续传。",
+                                            remainForCrawl, Fmt((long)speed), CrawlSeconds,
+                                            crawlRefreshCount, MaxCrawlRefresh));
+                                        AddError("crawl: 收尾阶段速度过低");
+                                        Interlocked.Exchange(ref cancelled, 1);
+                                        lastAdvance = now;
+                                        lastCrawlMs = 0;
+                                        try { watchdog.Cancel(); } catch { }
+                                    }
                                 }
                             }
                             else
@@ -4172,6 +4442,8 @@ namespace GeZi.Core.Download
                                                         // 原来按字节（每 512KB）→ 8 B/s 时要 17 小时才检查一次，
                                                         // 收尾慢速期永远不触发，方向完全反了。
                                                         long nextYieldMs = NowMs() + YieldCheckMs;
+                                                        // 【2026-11-09】让片判据诊断的限频戳
+                                                        long diagYieldMs = 0;
                                                         while (true)
                                                         {
                                                             cancelToken.ThrowIfCancellationRequested();
@@ -4183,6 +4455,34 @@ namespace GeZi.Core.Download
                                                             if (nowMs >= nextYieldMs)
                                                             {
                                                                 nextYieldMs = nowMs + YieldCheckMs;
+
+                                                                // 【2026-11-09 诊断】让片为什么没生效？
+                                                                // 用户日志显示「活跃=3/36、剩3片各186KB、一条[让片]都没有」，
+                                                                // 说明这里 either 没进判断、either 进了但提前 return。
+                                                                // 把四个门槛的实际取值打出来，一眼就能看出卡在哪一条。
+                                                                // ⚠️ 只在"确实该切"或"差一点该切"时打，避免刷屏。
+                                                                if (diagYieldMs == 0 || nowMs - diagYieldMs >= 5000)
+                                                                {
+                                                                    long remHere0 = (part.E - part.S + 1) - Volatile.Read(ref part.W);
+                                                                    int actNow0 = Volatile.Read(ref activeConns);
+                                                                    // 只有"活跃偏低 + 剩余量接近门槛"才值得记录，
+                                                                    // 否则 29 个 worker 每 5 秒各打一行，日志会被冲垮。
+                                                                    bool worthLog = actNow0 * 4 < workerCount * 3
+                                                                        && remHere0 >= YieldMinRemainBytes / 2
+                                                                        && queue.Count == 0;
+                                                                    if (worthLog)
+                                                                    {
+                                                                        diagYieldMs = nowMs;
+                                                                        Log?.Invoke(string.Format(
+                                                                            "[诊断·让片判据] 片{0} 活跃={1}/{2} 本片剩={3} 队列={4} "
+                                                                            + "| 需: 活跃<{5} 剩>={6} → {7}",
+                                                                            idx, actNow0, workerCount, Fmt(remHere0),
+                                                                            queue.Count, (workerCount * 3 / 4),
+                                                                            Fmt(YieldMinRemainBytes),
+                                                                            remHere0 >= YieldMinRemainBytes ? "应切" : "剩太少不切"));
+                                                                    }
+                                                                }
+
                                                                 // 【2026-11-09 修】让片现在会**掐断自己**并返回 true。
                                                                 // 这时必须放弃本片、回领片循环 —— 不能继续把整片下完，
                                                                 // 否则切出去的区间会被下两遍（done 虚高、超总大小）。
@@ -5035,3 +5335,4 @@ namespace GeZi.Core.Download
         public DateTime Timestamp { get; set; }
     }
 }
+

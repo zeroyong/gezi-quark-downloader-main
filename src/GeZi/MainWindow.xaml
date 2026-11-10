@@ -2053,8 +2053,8 @@
                                          而后者受**账号配额**限制（夸克实测 512 为最优总量）。
                                          用户自己很难算：7 个文件 × 256 路 = 1792 条，
                                          远超配额后反而只有几百 KB/s。
-                                         打开这个开关后，程序按 总预算 512 自动把
-                                         「单文件并发」和「同时任务数」配对，用户不用管。
+                                         打开这个开关后，程序按 总预算 512 ÷ 你设的同时任务数
+                                         自动算出「单文件并发」；任务数始终由你决定。
                                          关掉则完全按上面两项手填值走（保留给想自己调的人）。 -->
                                     <Grid Margin="0,0,0,10">
                                         <Grid.ColumnDefinitions>
@@ -2064,7 +2064,7 @@
                                         <TextBlock Text="自动调度" Style="{StaticResource FieldLabel}"/>
                                         <StackPanel Grid.Column="1" Orientation="Horizontal">
                                             <CheckBox x:Name="AutoTuneCheck"
-                                                      Content="自动计算并发（推荐）"
+                                                      Content="自动计算单文件并发（推荐）"
                                                       Style="{StaticResource AppCheckBox}"
                                                       VerticalAlignment="Center"
                                                       Checked="OnAutoTuneChanged"

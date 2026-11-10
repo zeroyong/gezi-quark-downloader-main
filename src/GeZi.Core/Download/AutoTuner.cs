@@ -103,11 +103,16 @@ namespace GeZi.Core.Download
 
         /// <summary>
         /// 同时任务数上限。
-        /// 为什么是 8：超过 8 个任务时，<c>预算/任务数</c> 会让每个任务分到 &lt;64 路，
-        /// 而单个大文件想跑满通常需要 32~64 路；再往上加只会让每个任务都跑不快。
-        /// 另外任务多 = 磁盘随机写更重、进度条更跳、失败重试更乱。
+        ///
+        /// <para>【2026-11-09 改：8 → 5】用户原话：
+        /// 「自动计算 就是自动根据当前任务数 计算对应并发啊 不过最多不超过5个 现在是3个」。
+        /// 明确要求上限 5。</para>
+        ///
+        /// <para>为什么不能再多：预算 512 时，5 个任务各分到 ~102 路；
+        /// 8 个任务就只剩 64 路，而单个大文件想跑满通常需要 32~64 路以上。
+        /// 另外任务多 = 磁盘随机写更重、进度条更跳、失败重试更乱。</para>
         /// </summary>
-        public const int MaxConcurrent = 8;
+        public const int MaxConcurrent = 5;
 
         /// <summary>同时任务数下限。</summary>
         public const int MinConcurrent = 1;
@@ -126,6 +131,41 @@ namespace GeZi.Core.Download
 
             /// <summary>给用户看的一句话解释（为什么是这个组合）。</summary>
             public string Reason { get; set; }
+        }
+
+        /// <summary>
+        /// 按**用户指定的任务数**反算单文件并发（2026-11-09 新增）。
+        ///
+        /// <para>【为什么需要它】用户纠正过自动调度的语义：
+        /// 「自动计算 就是自动根据当前任务数 计算对应并发啊」。</para>
+        ///
+        /// <para>原来 <see cref="Compute"/> 是"把两个数一起算出来"，自动模式下
+        /// 连「同时下载任务数」都被程序接管，用户改不动。但用户的模型是：
+        /// <b>任务数是我自己的意图，并发才是你要帮我算的那个数</b>。</para>
+        ///
+        /// <para>所以这里只做一件事：<c>并发 = 预算 ÷ 任务数</c>，
+        /// 再夹到 [<see cref="MinThreads"/>, <see cref="RecommendedMaxThreads"/>]。
+        /// 与 <see cref="Compute"/> 里对同一个 conc 的算法**完全一致**，
+        /// 保证"手动设任务数 → 自动算并发"和"自动算出来的组合"永远不会打架。</para>
+        /// </summary>
+        /// <param name="concurrent">用户指定的同时任务数（会被夹到合法范围）。</param>
+        /// <param name="budget">总连接预算。</param>
+        public static Plan ForConcurrent(int concurrent, int budget = Budget)
+        {
+            if (budget < 1) budget = 1;
+            int conc = Clamp(concurrent, MinConcurrent, MaxConcurrent);
+
+            int perTask = budget / Math.Max(1, conc);
+            int threads = Math.Min(perTask, RecommendedMaxThreads);
+            threads = Clamp(threads, MinThreads, RecommendedMaxThreads);
+
+            return new Plan
+            {
+                Threads = threads,
+                Concurrent = conc,
+                Reason = "同时 " + conc + " 个任务 × 每个 " + threads + " 路 ≈ "
+                    + (threads * conc) + " 条连接（预算 " + budget + "）。",
+            };
         }
 
         /// <summary>

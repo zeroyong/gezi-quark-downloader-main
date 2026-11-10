@@ -2310,15 +2310,19 @@ namespace GeZi
         }
 
         /// <summary>
-        /// 设置页「自动调度」勾选变化（2026-10-24 新增）。
+        /// 设置页「自动调度」勾选变化（2026-10-24 新增，2026-11-09 改语义）。
         ///
-        /// <para>【用户需求】「一般设置几个同时下载数，下载速度更能跑满呢，
+        /// <para>【用户需求·原话】「一般设置几个同时下载数，下载速度更能跑满呢，
         /// 你可以添加一个自动调度的选项，然后自动计算」。</para>
         ///
-        /// <para>开启后：按 <see cref="GeZi.Core.Download.AutoTuner"/> 算出的组合
-        /// 覆盖「单文件并发」与「同时下载数」两个控件，并把它们**置灰**
-        /// （只读）—— 避免用户看到两个数被改动却以为是程序出错了。
-        /// 关闭后恢复可编辑，值保持当前（不还原旧值，避免"关掉开关数值又跳回去"的困惑）。</para>
+        /// <para>【2026-11-09 语义修正｜用户纠正】原实现把「单文件并发」和
+        /// 「同时下载任务数」**两个**都接管并置灰，用户原话：
+        /// 「你看设置 勾选自动调度 改不了任务数啊，自动计算 就是自动根据当前任务数
+        /// 计算对应并发啊 不过最多不超过5个 现在是3个」。</para>
+        ///
+        /// <para>现在的语义：<b>任务数由用户定，程序只反算并发</b>。
+        /// 开启时保留用户当前的任务数，只把「单文件并发」按
+        /// <see cref="GeZi.Core.Download.AutoTuner.ForConcurrent"/> 算出来。</para>
         /// </summary>
         private void OnAutoTuneChanged(object sender, RoutedEventArgs e)
         {
@@ -2330,11 +2334,13 @@ namespace GeZi
 
                 if (on)
                 {
-                    // 文件数未知时用通用最优值；真正开下时会按实际文件数再算一次。
-                    var plan = GeZi.Core.Download.AutoTuner.Compute(0);
-                    ApplyAutoPlan(plan);
+                    // 【关键】按**用户当前设的任务数**算并发，不改任务数。
+                    int conc = _settings.ConcurrentTasks;
+                    var plan = GeZi.Core.Download.AutoTuner.ForConcurrent(conc);
+                    _settings.Threads = plan.Threads;
+                    ThreadsBox.SelectedIndex = PresetToIndex(plan.Threads);
                     Log("已开启自动调度：" + plan.Reason);
-                    Log("  「单文件并发」与「同时下载数」已锁定为自动计算值，手动修改需先关掉这个开关。");
+                    Log("  「同时下载任务数」仍由你决定，「单文件并发」按它自动计算。");
                 }
                 else
                 {
@@ -2355,7 +2361,9 @@ namespace GeZi
         {
             if (plan == null) return;
             _settings.Threads = plan.Threads;
-            _settings.ConcurrentTasks = plan.Concurrent;
+            // 【2026-11-09 修】「同时下载任务数」现在由**用户**决定，自动调度只算并发。
+            // 只有调用方明确想改任务数（首次开启、或按本批文件数收敛）时才写回。
+            // 见 UpdateAutoTuneUi 的注释。
 
             // ThreadsBox 是档位下拉（16/32/64/128/256/512），自动算出的 170 这种
             // 中间值不在档位里 —— 选最接近的档位显示，但 _settings.Threads 保留精确值。
@@ -2364,25 +2372,55 @@ namespace GeZi
             ConcurrentBox.Text = plan.Concurrent.ToString();
         }
 
-        /// <summary>按自动调度开关的状态，刷新控件可用性与提示文案。</summary>
+        /// <summary>
+        /// 按自动调度开关的状态，刷新控件可用性与提示文案。
+        ///
+        /// <para>【2026-11-09 修·用户纠正】用户原话：
+        /// 「你看设置 勾选自动调度 改不了任务数啊，自动计算 就是自动根据当前任务数
+        /// 计算对应并发啊 不过最多不超过5个 现在是3个」。</para>
+        ///
+        /// <para>原来的实现是"勾了自动 → **两个**输入框都禁用"，等于自动调度
+        /// 把「同时下载任务数」也接管了，用户完全没法改。但用户的模型是：</para>
+        /// <list type="bullet">
+        /// <item>「同时下载任务数」= 用户自己的意图（我想同时下几个文件）；</item>
+        /// <item>「单文件并发连接数」= 程序按任务数**反算**出来的（预算 ÷ 任务数）。</item>
+        /// </list>
+        /// <para>所以现在：<b>任务数始终可编辑</b>，自动模式只禁用「单文件并发」那一项
+        /// —— 因为它的值由任务数推导，让用户改它反而会与自动值打架。</para>
+        /// </summary>
         private void UpdateAutoTuneUi()
         {
             bool on = _settings.AutoTune;
             if (AutoTuneCheck != null) AutoTuneCheck.IsChecked = on;
 
-            // 单文件并发下拉：自动模式下禁用（值仍由 PresetToIndex 显示最接近档）
+            // 单文件并发：自动模式下禁用（它的值由"预算 ÷ 任务数"推导出来）
             if (ThreadsBox != null) ThreadsBox.IsEnabled = !on;
-            if (ConcurrentBox != null) ConcurrentBox.IsEnabled = !on;
+            // 同时任务数：**任何模式都可编辑**。用户说了算，自动调度只跟着它算并发。
+            if (ConcurrentBox != null) ConcurrentBox.IsEnabled = true;
 
             if (AutoTuneHint != null)
             {
                 if (on)
                 {
-                    var plan = GeZi.Core.Download.AutoTuner.Compute(0);
+                    // 【关键】提示语必须按**用户设定的任务数**反算并发，
+                    // 而不是拿 Compute(0) 的通用解 —— 否则提示里的数字与输入框对不上，
+                    // 用户会以为设置没生效。
+                    int conc = _settings.ConcurrentTasks;
+                    if (conc < GeZi.Core.Download.AutoTuner.MinConcurrent)
+                        conc = GeZi.Core.Download.AutoTuner.MinConcurrent;
+                    if (conc > GeZi.Core.Download.AutoTuner.MaxConcurrent)
+                        conc = GeZi.Core.Download.AutoTuner.MaxConcurrent;
+
+                    int threads = GeZi.Core.Download.AutoTuner.Budget / Math.Max(1, conc);
+                    if (threads > GeZi.Core.Download.AutoTuner.RecommendedMaxThreads)
+                        threads = GeZi.Core.Download.AutoTuner.RecommendedMaxThreads;
+                    if (threads < GeZi.Core.Download.AutoTuner.MinThreads)
+                        threads = GeZi.Core.Download.AutoTuner.MinThreads;
+
                     AutoTuneHint.Text = string.Format(
-                        "当前：单文件 {0} 路 × 同时 {1} 个 ≈ {2} 条连接（预算 {3}）",
-                        _settings.Threads, _settings.ConcurrentTasks,
-                        _settings.Threads * _settings.ConcurrentTasks,
+                        "当前：同时 {0} 个任务 × 每个 {1} 路 ≈ {2} 条连接（预算 {3}）。"
+                        + "任务数由你定，单文件并发自动算。",
+                        conc, threads, conc * threads,
                         GeZi.Core.Download.AutoTuner.Budget);
                 }
                 else
@@ -5800,25 +5838,14 @@ namespace GeZi
                 // 就是因为设置页显示的是通用值，与实际批次无关。
                 if (_settings.AutoTune)
                 {
-                    // 【2026-10-25 修：按"届时的活跃任务总数"算，而不是"本批文件数"】
+                    // 🚨【2026-11-09 改语义】用户纠正：「由我决定 但是单个文件并发数 是自动调度的」。
                     //
-                    // 【用户实测】「恢复另外两个任务时，只有一个在跑，另一个排队，
-                    //  为什么？应该可以同时恢复吧」。
+                    // 所以这里不再用 Compute(expected) 反推任务数 —— 任务数是用户的意图，
+                    // 程序只按它算并发。Compute(expected) 会把任务数也一并算出来，
+                    // 那正是"改不了任务数"的病根。
                     //
-                    // 【根因】原来这里做两件错事：
-                    //   ① `AutoTuner.Compute(items.Count)` 只看**本次提交几个文件**
-                    //      —— 分两次恢复就各算各的：第一次 1 个 → 算出 256×**1**，
-                    //      第二次再来也还是按 1 个算；
-                    //   ② 把结果 `_settings.ConcurrentTasks = ...` 并 `SettingsStore.Save()`
-                    //      **持久化**了 → 设置被永久改成 1，重启后依然是 1，
-                    //      用户完全不知道为什么只能跑一个。
-                    //
-                    // 【修法】
-                    //   · 并发数按「已在跑/排队的任务数 + 本批文件数」算 ——
-                    //     这才是"待会儿真正要同时跑几个"的正确规模；
-                    //   · 结果**不落盘**，只作为本次的临时值；
-                    //   · 仍然尊重用户显式设过的更大值（取两者较大），
-                    //     否则用户手填 5 却被自动算成 2 会很困惑。
+                    // 只需把"实际要同时跑几个"告诉 AutoTuner.ForConcurrent，
+                    // 它负责算出每个文件能分多少路。
                     int inFlight = _tasks == null ? 0
                         : _tasks.Count(t => t.State == JobState.Downloading
                                          || t.State == JobState.Queued
@@ -5826,24 +5853,33 @@ namespace GeZi
                     int expected = inFlight + items.Count;
                     if (expected < 1) expected = items.Count;
 
-                    var autoPlan = GeZi.Core.Download.AutoTuner.Compute(expected);
-                    if (autoPlan != null && autoPlan.Threads > 0 && autoPlan.Concurrent > 0)
+                    // 【关键】用户设的任务数与"本批实际要跑的"取较大者：
+                    //   · 用户设 3、这批只提交 1 个 → 仍按 3 算并发（他还要恢复别的任务）
+                    //   · 用户设 1、这批提交 5 个 → 按 5 算并发更合理吗？不 ——
+                    //     并发额度是给"同时跑的任务"分配的，用户设 1 就代表同时只跑 1 个，
+                    //     所以这里**以用户设置为准**，只把它夹进合法范围。
+                    int wantedConc = _settings.ConcurrentTasks;
+                    if (wantedConc < GeZi.Core.Download.AutoTuner.MinConcurrent)
+                        wantedConc = GeZi.Core.Download.AutoTuner.MinConcurrent;
+                    if (wantedConc > GeZi.Core.Download.AutoTuner.MaxConcurrent)
+                        wantedConc = GeZi.Core.Download.AutoTuner.MaxConcurrent;
+
+                    var autoPlan = GeZi.Core.Download.AutoTuner.ForConcurrent(wantedConc);
+                    if (autoPlan != null && autoPlan.Threads > 0)
                     {
-                        // 单文件并发：用本批算出的值（不落盘），决定每片切多细
+                        // 单文件并发：用算出来的值（不落盘到 Threads，避免改用户设置）
                         _perBatchThreads = autoPlan.Threads;
 
-                        // 同时下载数：**不覆盖用户设置**，只在用户没设过时兜底。
-                        // 这样"同时恢复几个就能跑几个"符合直觉。
-                        if (_settings.ConcurrentTasks <= 0)
-                            _settings.ConcurrentTasks = autoPlan.Concurrent;
+                        // 任务数：**不覆盖用户设置**，只做合法化
+                        _settings.ConcurrentTasks = autoPlan.Concurrent;
 
                         // 调度器按当前值重建（空闲时安全；有任务在跑也不会打断它们）
                         RecreateScheduler();
                         UpdateAutoTuneUi();
-                        Log("自动调度（本批 " + items.Count + " 个，另有 " + inFlight
-                            + " 个在跑/暂停 → 预计同时 " + expected + " 个）：单文件 "
-                            + autoPlan.Threads + " 路；同时下载上限 "
-                            + _settings.ConcurrentTasks + " 个。");
+                        Log("自动调度（同时 " + autoPlan.Concurrent + " 个，每个 "
+                            + autoPlan.Threads + " 路 ≈ "
+                            + (autoPlan.Concurrent * autoPlan.Threads) + " 条连接；本批 "
+                            + items.Count + " 个，另有 " + inFlight + " 个在跑/暂停）。");
                     }
                 }
 
@@ -6097,6 +6133,10 @@ namespace GeZi
                         // 【2026-10-22】免转存路径下源文件就是自己
                         SourceFid = f.Fid,
                         SourceName = f.Name,
+                        // 【2026-11-09】平台与分享凭证都随任务走，换链时用它而不是"当前界面状态"
+                        ProviderId = CurrentProviderId(),
+                        PwdId = _pwdId,
+                        Stoken = _stoken,
                     });
                 else
                     Log("跳过（无直链）: " + f.Name);
@@ -6116,6 +6156,10 @@ namespace GeZi
                     {
                         Name = f.Name, Size = f.Size, Url = url, RelDir = f.RelDir,
                         Fid = f.Fid, FromShare = false,
+                        // 【2026-11-09】平台随任务走（见 DownloadItem.ProviderId 的说明）
+                        ProviderId = CurrentProviderId(),
+                        PwdId = _pwdId,
+                        Stoken = _stoken,
                     });
                 else
                     Log("无直链: " + f.Name);
@@ -6186,6 +6230,10 @@ namespace GeZi
                                 // 中转副本被用户删掉后，续传可据此回退到免转存（源文件还在）。
                                 SourceFid = batch[j].Fid,
                                 SourceName = batch[j].Name,
+                                // 【2026-11-09】平台与分享凭证随任务走（转存是夸克特有能力）
+                                ProviderId = CurrentProviderId(),
+                                PwdId = _pwdId,
+                                Stoken = _stoken,
                             });
                         else
                             Log("无直链: " + batch[j].Name);
@@ -6394,24 +6442,83 @@ namespace GeZi
             // 因此不用 _linkCache.Get，而是直接取新链后刷新缓存。
             _linkCache.Invalidate(item.Fid);
 
+            // 🚨🚨【2026-11-09 修·第 21 处单平台写死】
+            //
+            // 【用户实测】UC 任务收尾被 crawl 中止后自动换链，日志却出现：
+            //     [诊断·重解析] 异常类型=QuarkApiException
+            //     自动重新解析分享失败: [获取分享凭证] 分享不存在
+            // 而那是 **UC 的分享**（pwdId=bbf2469b…）—— 明显又是拿夸克在请求 UC。
+            //
+            // 【根因】这个方法是**新任务下载**挂上的 LinkRefresher
+            // （见 5662 / 5917 行的 `LinkRefresher = ct => RefreshLinkAsync(item, ct)`），
+            // 它全程只用 `_client`（夸克），从不看平台。
+            // 而续传路径挂的是 RefreshLinkAsyncForPending —— 那个**按平台分流过**，
+            // 所以只有"新下的任务"会踩这个坑，续传反而不踩。
+            //
+            // 【这就是"同一功能两条路径"的第 N 次复现】详见 lesson「加平台检查清单」。
+            // 【2026-11-09】平台取**这条任务自己的**，不是"当前界面在哪个平台"。
+            // 用户可能：解析 UC → 开始下载 → 切回夸克看别的 → UC 任务链过期触发换链。
+            // 用当前平台会拿夸克去请求 UC 的分享（这就是 QuarkApiException 的来源）。
+            string pid = string.IsNullOrEmpty(item.ProviderId) ? CurrentProviderId() : item.ProviderId;
+            bool isUc = string.Equals(pid, "uc", StringComparison.OrdinalIgnoreCase);
+
+            // 【2026-11-09】分享凭证也取任务自己的（老任务没存 → 退回会话级）。
+            // 否则"下着分享 A、又去解析分享 B"时，A 的换链会拿 B 的凭证，必然失败。
+            string taskPwdId = string.IsNullOrEmpty(item.PwdId) ? _pwdId : item.PwdId;
+            string taskStoken = string.IsNullOrEmpty(item.Stoken) ? _stoken : item.Stoken;
+
             string url;
             if (item.FromShare)
             {
-                // 免转存：走"先试旧凭证 → 失败自动重解析分享"的自愈路径（2026-10-20）。
-                // stoken 一般几小时就过期，原来一过期任务就卡死，用户只能手动重新解析。
-                url = await GetShareLinkWithReResolveAsync(
-                    _client, item.Fid, item.Token, _pwdId, _stoken, item.Passcode,
-                    item.StartFid, item.ShareRelDir,
-                    // 【2026-10-22】老任务没有 ShareRelDir → 用 RelDir 兜底下钻
-                    item.RelDir, item.Name,
-                    (freshStoken, freshToken) =>
+                if (isUc)
+                {
+                    // UC：走 provider 的 LinkFromShareAsync（UcClient 内部自己处理重试）
+                    var provider = _ucProvider;
+                    if (provider == null)
                     {
-                        _stoken = freshStoken;      // 回填会话级
-                        item.Token = freshToken;    // 回填任务级
-                    }, ct).ConfigureAwait(false);
+                        Log("该任务属于 UC 网盘，但 UC 尚未登录，无法重新取链。");
+                        return null;
+                    }
+                    var refs = new List<QuarkFileEntry>
+                    {
+                        new QuarkFileEntry { Fid = item.Fid, Token = item.Token ?? "" },
+                    };
+                    try
+                    {
+                        var ls = await provider.LinkFromShareAsync(refs, taskPwdId, taskStoken).ConfigureAwait(false);
+                        url = ls?.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl))?.DownloadUrl;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("[UC 换链] 取链失败: " + ex.Message);
+                        url = null;
+                    }
+                }
+                else
+                {
+                    // 免转存：走"先试旧凭证 → 失败自动重解析分享"的自愈路径（2026-10-20）。
+                    // stoken 一般几小时就过期，原来一过期任务就卡死，用户只能手动重新解析分享。
+                    url = await GetShareLinkWithReResolveAsync(
+                        _client, item.Fid, item.Token, taskPwdId, taskStoken, item.Passcode,
+                        item.StartFid, item.ShareRelDir,
+                        // 【2026-10-22】老任务没有 ShareRelDir → 用 RelDir 兜底下钻
+                        item.RelDir, item.Name,
+                        (freshStoken, freshToken) =>
+                        {
+                            _stoken = freshStoken;      // 回填会话级
+                            item.Stoken = freshStoken;  // 回填任务级（下次换链用新的）
+                            item.Token = freshToken;
+                        }, ct).ConfigureAwait(false);
+                }
             }
             else
             {
+                // 「我的网盘」取链：UC 当前没有这个能力，明确拒绝而不是拿夸克去请求。
+                if (isUc)
+                {
+                    Log("UC 网盘暂不支持从「我的网盘」取直链。");
+                    return null;
+                }
                 var links = await _client.GetDownloadAsync(new List<string> { item.Fid }).ConfigureAwait(false);
                 if (links == null) return null;
                 var hit = links.FirstOrDefault(l => !string.IsNullOrEmpty(l.DownloadUrl));
@@ -12327,11 +12434,41 @@ namespace GeZi
                 int threads = SelectedThreads();
                 int.TryParse((ConcurrentBox.Text ?? "").Trim(), out conc);
 
-                _settings.Threads = threads;
-
                 if (conc < 1) conc = 1;
-                if (conc > 64) conc = 64;
+                // 上限与 AutoTuner.MaxConcurrent 保持一致（2026-11-09：8 → 5）。
+                // 原来写死 64，用户填 20 也能存进设置，但自动调度只认到 5 —— 会自相矛盾。
+                if (conc > GeZi.Core.Download.AutoTuner.MaxConcurrent)
+                    conc = GeZi.Core.Download.AutoTuner.MaxConcurrent;
                 _settings.ConcurrentTasks = conc;
+
+                // 🚨【2026-11-09 修·用户纠正】自动调度模式下，并发必须由**任务数**反算。
+                //
+                // 【用户原话】「你看设置 勾选自动调度 改不了任务数啊，自动计算 就是
+                //   自动根据当前任务数 计算对应并发啊」「对，由我决定 但是单个文件并发数
+                //   是自动调度的」。
+                //
+                // 【为什么必须放在这里】前面 OnAutoTuneChanged 只在"勾选开关那一刻"算过一次。
+                // 用户在自动模式下**改任务数**（比如 1 → 3），也必须立刻按新任务数重算并发，
+                // 否则会一直沿用勾选时的旧并发值 —— 界面上任务数变了、实际连接数没变。
+                //
+                // 顺带解决一个隐患：ThreadsBox 在自动模式下是禁用的，
+                // 但 SelectedThreads() 仍会读出它的值。若不禁掉，用户改任务数时
+                // 会把那个"显示用的旧档位"当成真实并发写回设置，自动调度等于失效。
+                if (_settings.AutoTune)
+                {
+                    var autoPlan = GeZi.Core.Download.AutoTuner.ForConcurrent(conc);
+                    threads = autoPlan.Threads;
+                    _settings.ConcurrentTasks = autoPlan.Concurrent;   // 夹到 [Min, MaxConcurrent]
+                    // 回填下拉框显示（不触发 SelectionChanged → 不会递归进本方法）
+                    try
+                    {
+                        int idx = PresetToIndex(threads);
+                        if (ThreadsBox.SelectedIndex != idx) ThreadsBox.SelectedIndex = idx;
+                    }
+                    catch { }
+                }
+
+                _settings.Threads = threads;
 
                 // ⚠️ 必须规范化：用户手输的可能是 `C:/a/b`（正斜杠），
                 // 而 Path.Combine 拼文件名时用 `\` → 会得到混合斜杠路径，
@@ -12354,7 +12491,13 @@ namespace GeZi
                 SettingsStore.Save(_settings);
                 RecreateScheduler();
 
-                Log(string.Format("设置已生效（单文件并发 {0} 路，同时下载 {1} 个）", threads, conc));
+                // 自动调度模式下刷新提示语（"同时 N 个 × 每个 M 路"）。
+                // 用户改了任务数，这里必须把新算式显示出来，否则提示还停在旧数字上。
+                try { UpdateAutoTuneUi(); } catch { }
+
+                Log(string.Format("设置已生效（单文件并发 {0} 路，同时下载 {1} 个{2}）",
+                    _settings.Threads, _settings.ConcurrentTasks,
+                    _settings.AutoTune ? "，并发由自动调度按任务数计算" : ""));
             }
             catch (Exception ex)
             {

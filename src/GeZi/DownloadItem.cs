@@ -74,5 +74,31 @@ namespace GeZi
 
         /// <summary>文件相对于分享根目录的相对路径（形如 "A\B"）。逐级下钻用。</summary>
         public string ShareRelDir;
+
+        /// <summary>
+        /// 这条任务所属分享的 pwdId / stoken（2026-11-09 新增）。
+        ///
+        /// <para>【为什么要冗余存一份】<c>RefreshLinkAsync</c> 原来读的是**会话级**的
+        /// <c>_pwdId</c> / <c>_stoken</c>。但用户可能：下着分享 A 的任务，
+        /// 又去解析分享 B（此时 _pwdId/_stoken 被覆盖成 B 的）——
+        /// 这时 A 的任务链过期触发换链，就会拿 B 的凭证去取 A 的文件，必然失败。</para>
+        ///
+        /// <para>fast 修复：把分享凭证也变成"任务的属性"，随任务走。</para>
+        /// </summary>
+        public string PwdId;
+        public string Stoken;
+
+        /// <summary>
+        /// 这条任务属于哪个网盘（"quark" / "uc"），2026-11-09 新增。
+        ///
+        /// <para>【为什么必须有】换链回调 <c>RefreshLinkAsync(item, ct)</c> 原来用
+        /// <c>CurrentProviderId()</c> 判断平台 —— 那是"**当前界面**在哪个平台"，
+        /// 不是一个任务的固有属性。用户完全可能：解析 UC 分享 → 开始下载 →
+        /// 切回夸克看别的 → 此时 UC 任务链过期触发换链，用"当前平台"就会拿夸克
+        /// 去请求 UC 的分享，报 <c>QuarkApiException / 分享不存在</c>。</para>
+        ///
+        /// <para>平台是任务的属性，不是界面的状态 —— 所以存在这里，随任务走。</para>
+        /// </summary>
+        public string ProviderId;
     }
 }
