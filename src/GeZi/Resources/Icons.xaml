@@ -34,6 +34,11 @@
     <!-- 文件 -->
     <Geometry x:Key="IconFile">M6,3.5 H14 L18.5,8 V20.5 H6 Z M14,3.5 V8 H18.5</Geometry>
 
+    <!-- 收藏星标（2026-11-10，解析历史行内「收藏」按钮用）
+         五角星：从正上方顶点开始，按 72° 交替取外/内顶点。
+         空心描边 = 未收藏；填充 = 已收藏（填充与否由代码控制 Fill/Stroke）。 -->
+    <Geometry x:Key="IconStar">M12,3 L14.7,8.6 L20.9,9.5 L16.4,13.8 L17.5,19.9 L12,16.9 L6.5,19.9 L7.6,13.8 L3.1,9.5 L9.3,8.6 Z</Geometry>
+
     <!-- 进度 / 活动 -->
     <Geometry x:Key="IconActivity">M3,12 H7 L9.5,6 L14.5,18 L17,12 H21</Geometry>
 

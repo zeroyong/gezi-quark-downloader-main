@@ -446,6 +446,40 @@
          只在悬停时浮出来。用 Opacity 而不是 Visibility —— 否则悬停那一下
          名字会因为可用宽度变化而重新裁剪，看着像闪了一下。
          ============================================================ -->
+    <!-- 解析历史行内的「收藏」星标按钮（2026-11-10 新增）
+         设计要点：
+         · 常态几乎透明，只有 hover 时才显形 —— 不抢名字的注意力；
+         · 已收藏时星标本身是实心主色（由代码控制 Fill），这里只管按钮外壳；
+         · 尺寸固定 26×26，避免撑高行。 -->
+    <Style x:Key="HistoryStarButton" TargetType="Button">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Width" Value="26"/>
+        <Setter Property="Height" Value="26"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd" CornerRadius="7"
+                            Background="{TemplateBinding Background}"
+                            SnapsToDevicePixels="True">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource SurfaceAltBrush}"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="Bd" Property="Background"
+                                    Value="{DynamicResource PrimaryLightBrush}"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <Style x:Key="HistoryRowButton" TargetType="Button">
         <Setter Property="Background" Value="Transparent"/>
         <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}"/>

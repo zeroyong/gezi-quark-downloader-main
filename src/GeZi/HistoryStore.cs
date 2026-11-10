@@ -93,6 +93,24 @@ namespace GeZi
         /// 存下真实链接，恢复时直接按域名判断平台，不再靠猜。</para>
         /// </summary>
         [DataMember(Order = 9)] public string ShareUrl { get; set; }
+
+        /// <summary>
+        /// 用户「收藏」的标记（2026-11-10 新增）。
+        ///
+        /// <para>【和 <see cref="Pinned"/> 是两件不同的事】用户原话：
+        /// 「不是 收藏分开 置顶是另一个动作」。两者语义确实不同：</para>
+        /// <list type="bullet">
+        /// <item><b>置顶</b>：一条记录最多置顶一个"当前要反复用的"，
+        ///       它只是**排序**上浮到最前，作用范围是本次使用期。</item>
+        /// <item><b>收藏</b>：可以收藏很多条，是**长期保留的书签**，
+        ///       在面板里单独成组展示（「收藏」组），与置顶组并列。</item>
+        /// </list>
+        ///
+        /// <para>排序优先级：收藏组 → 置顶组 → 今天 → 昨天 → 更早。
+        /// 收藏的即使很久没打开过也不会被 MaxShareHistory 挤掉
+        /// （见 <c>AddShareHistory</c> 里的淘汰逻辑）。</para>
+        /// </summary>
+        [DataMember(Order = 10)] public bool Starred { get; set; }
     }
 
     /// <summary>
@@ -315,18 +333,25 @@ namespace GeZi
 
         // ---------------- 解析历史（按 h 唤出的面板用） ----------------
 
-        /// <summary>解析历史：**置顶的在最前**，其余按时间倒序（新的在前）。</summary>
+        /// <summary>
+        /// 解析历史，排序优先级：**收藏 → 置顶 → 其余按时间倒序（新的在前）**。
+        ///
+        /// <para>【2026-11-10 改】原来只有置顶，现在用户要求收藏单独一组。
+        /// 收藏排在置顶之前：收藏是"长期书签"（用户主动长期保留的），
+        /// 置顶是"当前要反复用的"，前者意图更强。</para>
+        /// </summary>
         public static List<ShareHistoryEntry> GetShareHistory()
         {
             var s = Load() ?? EmptyState();
             var list = new List<ShareHistoryEntry>(s.Shares);
             list.Reverse();   // 存储是"旧的在前"，给 UI 时翻成"新的在前"
-            if (list.TrueForAll(x => !x.Pinned))
+            if (list.TrueForAll(x => !x.Pinned && !x.Starred))
                 return list;
 
-            // 置顶的提到最前；两段内部都保持"新的在前"
-            var result = list.FindAll(x => x.Pinned);
-            result.AddRange(list.FindAll(x => !x.Pinned));
+            // 收藏 → 置顶 → 其余；三段内部都保持"新的在前"
+            var result = list.FindAll(x => x.Starred);
+            result.AddRange(list.FindAll(x => !x.Starred && x.Pinned));
+            result.AddRange(list.FindAll(x => !x.Starred && !x.Pinned));
             return result;
         }
 
@@ -348,6 +373,7 @@ namespace GeZi
                 var s = Load();
                 if (s == null) return;      // 读不到就不写，别用空表覆盖
                 bool wasPinned = false;
+                bool wasStarred = false;
                 string prevProvider = null;
                 string prevUrl = null;
                 for (int i = s.Shares.Count - 1; i >= 0; i--)
@@ -355,6 +381,9 @@ namespace GeZi
                     if (string.Equals(s.Shares[i].PwdId, pwdId, StringComparison.Ordinal))
                     {
                         wasPinned = wasPinned || s.Shares[i].Pinned;
+                        // 【2026-11-10】收藏状态同样必须带过来 —— 用户重新解析一次这条分享，
+                        // 不该把"我收藏过它"这件事悄悄抹掉。
+                        wasStarred = wasStarred || s.Shares[i].Starred;
                         // 保留旧记录里的平台/链接（新的一次没传就沿用）
                         if (string.IsNullOrEmpty(prevProvider)) prevProvider = s.Shares[i].ProviderId;
                         if (string.IsNullOrEmpty(prevUrl)) prevUrl = s.Shares[i].ShareUrl;
@@ -369,12 +398,33 @@ namespace GeZi
                     Name = name ?? "",
                     IsFolder = isFolder,
                     Pinned = wasPinned,
+                    Starred = wasStarred,
                     ProviderId = string.IsNullOrEmpty(providerId) ? prevProvider : providerId,
                     ShareUrl = string.IsNullOrEmpty(shareUrl) ? prevUrl : shareUrl,
                     Time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                 });
+                // ---- 容量淘汰：只淘汰**既没收藏也没置顶**的最旧记录 ----
+                //
+                // 【2026-11-10 修】原来直接 `RemoveRange(0, 超出数)`，会把最旧的删掉 ——
+                // 包括用户**收藏过的**那些。收藏意味着"我要长期留着"，
+                // 被新解析的记录挤掉等于收藏功能失效。
+                // 现在从最旧开始找，跳过 starred/pinned 的，直到数量回到上限。
                 if (s.Shares.Count > MaxShareHistory)
-                    s.Shares.RemoveRange(0, s.Shares.Count - MaxShareHistory);
+                {
+                    int over = s.Shares.Count - MaxShareHistory;
+                    for (int i = 0; i < s.Shares.Count && over > 0; )
+                    {
+                        if (!s.Shares[i].Starred && !s.Shares[i].Pinned)
+                        {
+                            s.Shares.RemoveAt(i);
+                            over--;
+                        }
+                        else i++;
+                    }
+                    // 极端情况：全都被收藏/置顶了 → 仍然超出上限，只能硬删最旧的
+                    if (s.Shares.Count > MaxShareHistory)
+                        s.Shares.RemoveRange(0, s.Shares.Count - MaxShareHistory);
+                }
                 Save(s);
             }
             catch { }
@@ -392,6 +442,24 @@ namespace GeZi
                 {
                     if (string.Equals(e.PwdId, pwdId, StringComparison.Ordinal))
                         e.Pinned = pinned;
+                }
+                Save(s);
+            }
+            catch { }
+        }
+
+        /// <summary>收藏 / 取消收藏某条解析历史（2026-11-10 新增，与置顶无关）。</summary>
+        public static void SetShareStarred(string pwdId, bool starred)
+        {
+            if (string.IsNullOrEmpty(pwdId)) return;
+            try
+            {
+                var s = Load();
+                if (s == null) return;
+                foreach (var e in s.Shares)
+                {
+                    if (string.Equals(e.PwdId, pwdId, StringComparison.Ordinal))
+                        e.Starred = starred;
                 }
                 Save(s);
             }

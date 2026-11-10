@@ -128,6 +128,30 @@ namespace GeZi
         /// </summary>
         public List<string> PartsDirsKnown { get; set; } = new List<string>();
 
+        /// <summary>
+        /// 尚未清理的**网盘中转文件** fid 清单（2026-11-10 新增）。
+        ///
+        /// <para>【为什么必须持久化】用户提问：「UC 网盘下载是会把文件转存到网盘再下载吗，
+        /// 那么下载完成有自动清理吗 毕竟网盘空间有限」。</para>
+        ///
+        /// <para>原来的待清理队列只在内存里，于是：</para>
+        /// <list type="bullet">
+        /// <item>程序崩溃/被强杀 → 队列丢失，网盘里的中转文件永久残留；</item>
+        /// <item>下载时未登录（_client 为空）→ 直接跳过清理，且没有任何补救；</item>
+        /// <item>清理请求失败（网络抖动）→ 只打一行日志就算了。</item>
+        /// </list>
+        ///
+        /// <para>现在把它落盘：每次登录成功后自动扫一遍并清理，清干净才移除。
+        /// 这样"网盘空间被中转文件慢慢吃光"这个隐性 bug 才算真正堵住。</para>
+        ///
+        /// <para>⚠️ 这里只存**转存产生的中转副本** fid，绝不能混入分享源文件或用户原文件
+        /// （那两类 fid 若被误删，是删掉用户真实数据）。写入方只有转存路径。</para>
+        /// </summary>
+        public List<string> PendingPanCleanup { get; set; } = new List<string>();
+
+        /// <summary>待清理中转文件的清单上限，防止异常情况下无限增长。</summary>
+        public const int PendingPanCleanupMax = 500;
+
         /// <summary>历史分片目录清单的长度上限（与 Python 版一致）。</summary>
         public const int PartsDirsMax = 20;
 

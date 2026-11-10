@@ -122,8 +122,33 @@
                      宁可报错也不交付一个残缺文件。
                    · 已确认：分片目录 .qparts 与 .qmeta 均保留完好，
                      点重试会从断点续传补齐缺失部分，**已下载的 2.4GB 不会重下**。
-                   · 用户实测重试成功（见修复记录截图）。 -->
-    <Version>2.8.9</Version>
+                   · 用户实测重试成功（见修复记录截图）。
+           2.9.0：① 新增 UC 网盘支持（扫码 / Cookie 导入，与夸克同一套抽象）。
+                    · 新增 IPanProvider / PanRegistry / DownloadContext / PanCapabilities，
+                      为以后接更多网盘打好地基；能力不足时抛 NotSupportedException，
+                      绝不静默返回空（谎报能力会让用户点到"点了没反应"的按钮）。
+                    · 彻底移除 WebView2（安装包回到 3.2MB）。
+                 ② 修复「尾部掉速」的三个真根因：
+                    · HttpClient 完全禁用超时 → CDN 挂住连接时 ReadAsync 永久阻塞，
+                      而 net48 流读取不响应 CancellationToken，抢占也掐不断。
+                      改为每次 Read 独立计时 20 秒（对齐 Gopeed 的 TimeoutReader）。
+                    · 让片会重复下载 → 原做法在请求还在收数据时改 part.E，
+                      服务端仍按旧 Range 送到底 → done 虚高（曾出现 31.34MB / 29.49MB）。
+                    · 空转 worker 永久退出 → 收尾期 78 条 worker 全走光，只剩 1/79 连接。
+                 ③ 新增「互助」机制（对齐 Gopeed helpOtherConnection）：
+                    worker 干完自己的活不退出，主动接管别人剩余区间的一半。
+                 ④ 删除「收尾速度过低就换链」——它会把任务卡在 99.5% 无限循环
+                    （换链拿到的是同一个 CDN、同一批慢节点，下一轮必然再触发）。
+                 ⑤ 修复 UC 任务换链走夸克路径（报 QuarkApiException / 分享不存在）。
+                 ⑥ 修复 1 字节畸形分片（导致 AllPartsDone 永远不成立、文件永远下不完）。
+                 ⑦ 修复关闭窗口时点弹窗 × 会直接退出程序（应视为误点）。
+                 ⑧ 网盘中转文件清理：失败/取消的任务也会清理，且待清理清单持久化，
+                    下次登录自动补删 —— 不再让中转文件悄悄吃光网盘空间。
+                 ⑨ 解析历史新增「收藏」按钮（与「置顶」是两个独立动作），
+                    悬浮行时才显示，已收藏的常驻显示实心星。
+                 ⑩ 自动调度语义修正：「同时下载任务数」由用户决定，
+                    「单文件并发」按它自动反算（预算 ÷ 任务数）。 -->
+    <Version>2.9.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <StartupObject>GeZi.App</StartupObject>
     <!-- 【2026-10-03】应用图标：exe 文件图标 + 任务栏/Alt-Tab 图标。

@@ -97,12 +97,25 @@ function Build-And-Run {
     $logText = ($log | Out-String)
 
     $hasError = $logText -match 'error [A-Z]{2,}\d+'
-    $producedExe = $logText -match 'GeZi\.exe'
-    $failed = $hasError -or (-not $producedExe)
+
+    # [2026-11-10 fix] Decide success by OBJECTIVE FACTS, not by parsing the log.
+    #
+    # The old check was `$logText -match 'GeZi\.exe'`. In a Chinese locale dotnet
+    # localizes its output, so that path line can be wrapped or mangled and the
+    # regex silently misses -> a successful build prints "BUILD FAILED" and the
+    # app never restarts. Symptom: "I changed the code and nothing happened".
+    #
+    # New rule: success == no compiler error AND GeZi.exe exists.
+    # (Incremental builds may not relink, so mtime alone is not reliable.)
+    $exeOk = (Test-Path $exe)
+    $failed = $hasError -or (-not $exeOk)
 
     if ($failed) {
         $log | Where-Object { $_ -match 'error [A-Z]{2,}\d+' } | ForEach-Object {
             Write-Host "  $_" -ForegroundColor Red
+        }
+        if (-not $hasError) {
+            Write-Host "  (no compiler errors, but the exe is missing - is GeZi.exe still running?)" -ForegroundColor Yellow
         }
         Write-Host "[$ts] BUILD FAILED - fix the error and save again" -ForegroundColor Red
         return

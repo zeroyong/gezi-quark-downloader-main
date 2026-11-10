@@ -2,7 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
-        Title="鸽子下载自用版 · 夸克网盘直链助手"
+        Title="鸽子下载自用版 · 夸克 / UC 网盘直链助手"
         Icon="/Resources/app.ico"
         Height="780" Width="1120" MinHeight="640" MinWidth="900"
         WindowStartupLocation="CenterScreen"
@@ -147,7 +147,7 @@
                                                 <!-- ⚠️ 用 RenderTransform 而不是 Margin 做这 1.5px 的垂直微调：
                                                      Margin 会**参与布局** —— 按钮 18 高，一旦加上下
                                                      margin 就会把这一行从 20 顶到 21，把下面的副标题
-                                                     「夸克网盘直链助手」整行推下去。
+                                                     「夸克 / UC 网盘直链助手」整行推下去。
                                                      RenderTransform 只挪渲染，布局尺寸一点不变。 -->
                                                 <Path.RenderTransform>
                                                     <TranslateTransform X="0" Y="1.5"/>
@@ -155,7 +155,7 @@
                                             </Path>
                                         </Button>
                                     </StackPanel>
-                                    <TextBlock Text="夸克网盘直链助手" FontSize="10.5"
+                                    <TextBlock Text="夸克 / UC 网盘直链助手" FontSize="10.5"
                                                Foreground="{DynamicResource TextTertiaryBrush}"/>
                                 </StackPanel>
                             </StackPanel>

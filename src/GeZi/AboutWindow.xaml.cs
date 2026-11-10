@@ -58,11 +58,13 @@ namespace GeZi
         /// </remarks>
         private static readonly string[] Features =
         {
+            "支持两个网盘：夸克网盘 + UC 网盘，顶上切换即可",
             "解析分享链接：链接、提取码、整段分享文案都能直接粘",
             "免转存下载：不往自己网盘写中转文件，省网盘空间、不留垃圾",
             "扫码登录：浏览「我的网盘」，支持转存与删除",
             "高速下载：单文件最多 512 个连接，支持断点续传",
-            "两种写入方式：共写同一文件（省空间）/ 独立分片（可边下边看）",
+            "抗尾部掉速：收尾时自动把剩余量摊给全部连接，不是干等",
+            "解析历史收藏：常用分享一键收藏，长期保留不被挤掉",
             "导出直链：纯直链、curl、aria2c 三种格式",
             "多账号：可保存多个账号，随时一键切换",
             "托盘常驻 + 悬浮小窗：窗口关掉也在后台继续下",
@@ -76,7 +78,9 @@ namespace GeZi
             try
             {
                 var ver = Assembly.GetExecutingAssembly().GetName().Version;
-                VersionText.Text = "夸克网盘 · 直链助手 · v" + (ver != null ? ver.ToString(3) : "2.2.0");
+                // 【2026-11-10】2.9.0 起支持 UC，标题不再写死"夸克网盘"。
+                VersionText.Text = "夸克 / UC 网盘 · 直链助手 · v"
+                    + (ver != null ? ver.ToString(3) : "2.9.0");
             }
             catch { }
 

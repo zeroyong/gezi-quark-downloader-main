@@ -555,6 +555,11 @@ namespace GeZi
                     new Action(async () =>
                     {
                         try { await RefreshCapacityAsync(); } catch { }
+                        // 【2026-11-10】顺带补删上次没清掉的网盘中转文件。
+                        // 用户提问「下载完成有自动清理吗 毕竟网盘空间有限」——
+                        // 原来待清理队列只在内存，程序一关就丢，那些中转文件
+                        // 会永久占着网盘空间且没有任何入口能清。
+                        try { await FlushPendingPanCleanupAsync(); } catch { }
                     }),
                     System.Windows.Threading.DispatcherPriority.Background);
 
@@ -2759,8 +2764,10 @@ namespace GeZi
             string lastGroup = null;
             foreach (var it in items)
             {
-                // 置顶的单独成组排在最前（GetShareHistory 已经把置顶的排到前面了）
-                string g = it.Pinned ? "置顶" : HistoryGroupOf(it.Time);
+                // 【2026-11-10】分组优先级：收藏 → 置顶 → 今天 → 昨天 → 更早。
+                // GetShareHistory 已经把三段排好了（收藏在前、置顶次之），
+                // 这里只负责在"变了组"时插一个组标题。
+                string g = it.Starred ? "收藏" : (it.Pinned ? "置顶" : HistoryGroupOf(it.Time));
                 if (!string.Equals(g, lastGroup, StringComparison.Ordinal))
                 {
                     HistoryListPanel.Children.Add(new TextBlock
@@ -2857,17 +2864,71 @@ namespace GeZi
 
             // ⚠️ 外层用 Grid 而不是横向 StackPanel：名称那个省略号只在**宽度被约束**时才生效，
             //    StackPanel 会用无限宽去量孩子，长名字就直接撑出去、不截断。
+            //
+            // 【2026-11-10 新增第 3 列】右侧放「收藏」（= 置顶）星标按钮。
+            // 用户原话：「给解析历史 右侧添加收藏按钮 然后在置顶下面展示 也可以取消收藏」。
+            // 之所以做成行内按钮而不是只留右键菜单：右键要"先想到才能点到"，
+            // 而收藏是高频轻动作，应该一眼可见、一点即中。
             var row = new Grid { VerticalAlignment = VerticalAlignment.Center };
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             row.ColumnDefinitions.Add(new ColumnDefinition
             {
                 Width = new GridLength(1, GridUnitType.Star),
             });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
             meta.Margin = new Thickness(12, 0, 0, 0);
             Grid.SetColumn(icon, 0);
             Grid.SetColumn(meta, 1);
             row.Children.Add(icon);
             row.Children.Add(meta);
+
+            // ---- 收藏星标（与"置顶"是两个独立动作）----
+            // 用户原话：「不是 收藏分开 置顶是另一个动作」「忘记说了 应该悬浮时 才展示收藏按钮」。
+            // 收藏 = 长期书签，在「收藏」分组里展示；置顶 = 排序上浮，仍在右键菜单里。
+            //
+            // 【悬浮才展示的实现方式】星标在按钮的 Content 里，属于**模板外部**，
+            // 所以 WPF 模板触发器（TargetName）管不到它 —— 只能用代码挂行的
+            // MouseEnter / MouseLeave。这也更直观：行的 hover 直接控制星标透明度。
+            //
+            // ⚠️ 已收藏的那一条**始终显示**：否则用户不 hover 时整行和普通记录一模一样，
+            //    "我收藏过哪些"就完全看不出来了，等于收藏功能没有反馈。
+            var star = new Button
+            {
+                Tag = it,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(10, 0, 0, 0),
+                ToolTip = it.Starred ? "取消收藏" : "收藏（在「收藏」分组里长期保留）",
+                Opacity = it.Starred ? 1.0 : 0.0,
+            };
+            try { star.Style = (Style)FindResource("HistoryStarButton"); } catch { }
+
+            var starPath = new ShapePath
+            {
+                // 已收藏 = 实心星（主色）；未收藏 = 空心星（次要色）
+                Data = (Geometry)FindResource("IconStar"),
+                Stretch = Stretch.Uniform,
+                Width = 15, Height = 15,
+                StrokeThickness = 1.8,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                StrokeLineJoin = PenLineJoin.Round,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            if (it.Starred)
+            {
+                starPath.SetResourceReference(System.Windows.Shapes.Shape.FillProperty, "PrimaryBrush");
+                starPath.SetResourceReference(System.Windows.Shapes.Shape.StrokeProperty, "PrimaryBrush");
+            }
+            else
+            {
+                starPath.SetResourceReference(System.Windows.Shapes.Shape.StrokeProperty, "TextTertiaryBrush");
+            }
+            star.Content = starPath;
+            star.Click += OnHistoryStarClick;
+            Grid.SetColumn(star, 2);
+            row.Children.Add(star);
 
             var btn = new Button
             {
@@ -2878,7 +2939,61 @@ namespace GeZi
             };
             btn.Click += OnHistoryItemClick;
             btn.ContextMenu = MakeHistoryMenu(it);
+
+            // 【悬浮才显示收藏星标】星标在 Content 里、不在模板中，
+            // 所以不能用模板触发器，只能挂在行按钮的鼠标进出上。
+            // 用淡入（120ms）而不是硬切：硬切会让星标"啪"地跳出来，很毛躁。
+            bool starredNow = it.Starred;
+            var starFade = new System.Windows.Media.Animation.DoubleAnimation
+            {
+                Duration = TimeSpan.FromMilliseconds(120),
+                FillBehavior = System.Windows.Media.Animation.FillBehavior.HoldEnd,
+            };
+            btn.MouseEnter += (s, e) =>
+            {
+                starFade.To = 1.0;
+                star.BeginAnimation(UIElement.OpacityProperty, starFade);
+            };
+            btn.MouseLeave += (s, e) =>
+            {
+                // 已收藏的保持可见（否则看不出收藏了什么）
+                if (starredNow) return;
+                starFade.To = 0.0;
+                star.BeginAnimation(UIElement.OpacityProperty, starFade);
+            };
+
             return btn;
+        }
+
+        /// <summary>
+        /// 点行内星标 = **收藏 / 取消收藏**（不是置顶；置顶在右键菜单里，是两个独立动作）。
+        ///
+        /// <para>【为什么必须 e.Handled = true】这个星标按钮**嵌在整行的大按钮里**，
+        /// WPF 的路由事件会从星标冒泡到外层行按钮 —— 不拦截的话，
+        /// 点收藏会**顺带触发"重新解析这条分享"**（面板关闭、跳去解析），
+        /// 用户就再也看不到收藏生效了。</para>
+        /// </summary>
+        private void OnHistoryStarClick(object sender, RoutedEventArgs e)
+        {
+            e.Handled = true;      // ⚠️ 必须：阻止冒泡到外层行按钮（否则会同时触发重新解析）
+
+            var btn = sender as Button;
+            var it = btn != null ? btn.Tag as ShareHistoryEntry : null;
+            if (it == null || string.IsNullOrEmpty(it.PwdId)) return;
+
+            try
+            {
+                bool want = !it.Starred;
+                HistoryStore.SetShareStarred(it.PwdId, want);
+                RebuildHistoryPanel();
+                Log(want
+                    ? "已收藏：" + (it.Name ?? it.PwdId) + "（在「收藏」分组里长期保留）"
+                    : "已取消收藏：" + (it.Name ?? it.PwdId));
+            }
+            catch (Exception ex)
+            {
+                Log("收藏操作失败: " + ex.Message);
+            }
         }
 
         /// <summary>行上右键：置顶 / 取消置顶、删除这条记录。</summary>
@@ -7577,12 +7692,103 @@ namespace GeZi
         /// </summary>
         private async Task CleanupOneAsync(string fid)
         {
-            if (string.IsNullOrEmpty(fid) || _client == null || !_settings.AutoClean)
+            if (string.IsNullOrEmpty(fid))
                 return;
+
+            // 【2026-11-10】未登录 / 关了自动清理 → 记进**持久化**待清理清单，
+            // 等下次登录成功时自动补删。原来这里直接 return，那个中转文件就永久
+            // 留在网盘里了（用户提问「网盘空间有限」正是这个隐患）。
+            if (_client == null || !_settings.AutoClean)
+            {
+                RememberPanCleanup(fid);
+                return;
+            }
             var fids = new List<string> { fid };
-            await _client.DeleteAsync(fids);
-            await _client.PurgeRecycleAsync(fids);
-            Log("已清理网盘转存文件 1 个");
+            try
+            {
+                await _client.DeleteAsync(fids);
+                await _client.PurgeRecycleAsync(fids);
+                ForgetPanCleanup(fid);
+                Log("已清理网盘转存文件 1 个");
+            }
+            catch (Exception ex)
+            {
+                // 删失败也要留痕，等下次登录重试
+                RememberPanCleanup(fid);
+                Log("清理转存文件失败（已记下，下次登录会重试）: " + ex.Message);
+            }
+        }
+
+        /// <summary>把某个中转文件记进**持久化**待清理清单（去重、有上限）。</summary>
+        private void RememberPanCleanup(string fid)
+        {
+            if (string.IsNullOrEmpty(fid)) return;
+            try
+            {
+                if (_settings.PendingPanCleanup == null)
+                    _settings.PendingPanCleanup = new List<string>();
+                if (_settings.PendingPanCleanup.Contains(fid)) return;
+                _settings.PendingPanCleanup.Add(fid);
+                while (_settings.PendingPanCleanup.Count > AppSettings.PendingPanCleanupMax)
+                    _settings.PendingPanCleanup.RemoveAt(0);
+                SettingsStore.Save(_settings);
+            }
+            catch { }
+        }
+
+        /// <summary>清理成功后从持久化清单里移除。</summary>
+        private void ForgetPanCleanup(string fid)
+        {
+            if (string.IsNullOrEmpty(fid)) return;
+            try
+            {
+                if (_settings.PendingPanCleanup == null) return;
+                if (_settings.PendingPanCleanup.Remove(fid))
+                    SettingsStore.Save(_settings);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 登录成功 / 启动时，把之前没删掉的网盘中转文件补删一遍（2026-11-10 新增）。
+        ///
+        /// <para>【它解决什么】原来待清理队列只在内存，程序一关就丢 ——
+        /// 用户下载时若没登录、或清理请求失败，那些中转文件就**永久占着网盘空间**，
+        /// 而且没有任何入口能发现/清理它们（用户提问「毕竟网盘空间有限」正是这个）。</para>
+        /// </summary>
+        private async Task FlushPendingPanCleanupAsync()
+        {
+            try
+            {
+                if (_client == null || !_settings.AutoClean) return;
+                var list = _settings.PendingPanCleanup;
+                if (list == null || list.Count == 0) return;
+
+                int ok = 0, fail = 0;
+                // 逐批删（一次最多 50 个，避免请求体过大）
+                while (list.Count > 0)
+                {
+                    var batch = list.Take(50).ToList();
+                    try
+                    {
+                        await _client.DeleteAsync(batch);
+                        await _client.PurgeRecycleAsync(batch);
+                        foreach (var f in batch) { list.Remove(f); ok++; }
+                        SettingsStore.Save(_settings);
+                    }
+                    catch (Exception ex)
+                    {
+                        fail += batch.Count;
+                        Log("补清理网盘中转文件失败（保留待下次重试）: " + ex.Message);
+                        break;
+                    }
+                }
+                if (ok > 0)
+                    Log("已补清网盘里 " + ok + " 个中转文件，释放了网盘空间。");
+                if (fail > 0)
+                    Log("还有 " + fail + " 个中转文件没删掉，下次登录会再试。");
+            }
+            catch { }
         }
 
         private async Task CleanupTransferredAsync()
@@ -7722,15 +7928,34 @@ namespace GeZi
             // 【用户要求】下载完一个文件就立刻删掉网盘里那份中转文件，而不是等整批结束。
             // 这样即使中途关程序/崩溃，也已下载完的文件不会残留中转件。
             // 只清本任务自己的 TransferredFid（转存路径才有；免转存/我的网盘为 null）。
-            if (u.State == JobState.Completed && !string.IsNullOrEmpty(item.Job.TransferredFid))
+            //
+            // 【2026-11-10 修·用户提问「下载完成有自动清理吗 毕竟网盘空间有限」】
+            // 原来**只判 Completed** —— 失败和取消的任务，其转存副本会永久留在网盘里：
+            //   · 下载失败（网络停滞、分享失效）→ 中转文件还在，但任务已经不会再跑
+            //   · 用户取消 → 同上
+            // 而中转文件对用户没有半点用处（内容在分享里还有），纯粹是垃圾。
+            // 现在改成：只要任务**结束了**（完成/失败/取消）就清理 ——
+            // 唯一例外是 Paused（暂停后还会续传，副本删了就得重新转存）。
+            //
+            // ⚠️ 为什么不用 Pending 记录跨重启清理：那个列表在内存里，
+            //    程序被强删就丢了。这里只做"尽力而为"的即时清理，
+            //    真正兜底的是"取消任务时直接走 CleanupCanceledTaskAsync"（见那里）。
+            bool finished = u.State == JobState.Completed
+                         || u.State == JobState.Failed
+                         || u.State == JobState.Cancelled;
+            if (finished && !string.IsNullOrEmpty(item.Job.TransferredFid))
             {
                 string fid = item.Job.TransferredFid;
                 item.Job.TransferredFid = null;   // 防重复清理
+                string why = u.State == JobState.Completed ? ""
+                           : (u.State == JobState.Failed ? "（下载失败）" : "（已取消）");
                 _ = Task.Run(async () =>
                 {
                     try
                     {
                         await CleanupOneAsync(fid);
+                        if (!string.IsNullOrEmpty(why))
+                            Log("已清理网盘里的中转文件" + why + "，不占你的网盘空间了。");
                         // 从兜底队列里摘掉，避免批结束又删一次（其实再删一次也无害，只是省一次请求）
                         lock (_cleanupLock)
                             _pendingCleanup.RemoveAll(e => e.Fid == fid);
@@ -14416,6 +14641,10 @@ namespace GeZi
                     AccountsBtn.Visibility = Visibility.Visible;
                     Log("登录成功: " + nick);
                     await RefreshCapacityAsync();
+                    // 【2026-11-10】登录成功是补删网盘中转文件的最好时机：
+                    // 此刻凭证一定有效，删得掉。用户关心「网盘空间有限」，
+                    // 那些中转文件本来就该在下载结束后立刻消失。
+                    try { await FlushPendingPanCleanupAsync(); } catch { }
                 }
                 else
                 {
