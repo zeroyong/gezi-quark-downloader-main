@@ -58,6 +58,24 @@ namespace GeZi
 {
     public partial class MainWindow : Window
     {
+        // ============================================================
+        // 侧栏页面索引（2026-11-11 抽出常量）
+        //
+        // 【为什么不再写死数字】这一版在「下载」与「任务」之间插入了「资源」页，
+        // 后面所有页面索引都 +1，而代码里有 3 处按数字判断当前页
+        // （z 键进多选、切走任务页退选择模式、进设置页刷更新卡）。
+        // 直接改数字能修好这一次，但下次再插页面又会全错一遍 ——
+        // 所以改成常量，顺序调整只需要动这里一行。
+        // ⚠️ 改动顺序时必须同步 MainWindow.xaml 里 NavList 与 TabControl 的两处顺序。
+        // ============================================================
+        // 【2026-11-11 用户指定顺序】1 下载 / 2 任务 / 3 账号(登录) / 4 资源 / 5 设置。
+        // 数字键 1-4 依次对应前四页；设置页沿用 q，不占数字位。
+        private const int TabDownload = 0;    // 1 · 下载
+        private const int TabTasks = 1;       // 2 · 任务
+        private const int TabLogin = 2;       // 3 · 登录（账号）
+        private const int TabResources = 3;   // 4 · 资源
+        private const int TabSettings = 4;    // q · 设置
+
         private readonly ObservableCollection<ShareFileItem> _files = new ObservableCollection<ShareFileItem>();
         private readonly ObservableCollection<TaskItem> _tasks = new ObservableCollection<TaskItem>();
 
@@ -203,6 +221,20 @@ namespace GeZi
         /// </summary>
         private string _clipboardLastPwdId;
 
+        /// <summary>上一次因剪贴板自动解析处理该分享的**时刻**（UtcNow 毫秒）。</summary>
+        private long _clipboardLastAtMs;
+
+        /// <summary>
+        /// 同一个 pwdId 在这个时间窗内视为"同一次复制产生的重复通知"，直接忽略。
+        ///
+        /// <para>【2026-11-11 修】原来是**永久**去重（`_clipboardLastPwdId` 相同就直接 return），
+        /// 于是第一次自动解析如果失败（未登录、网络抖动…），用户把**同一条链接**再复制一遍
+        /// 也永远不会重试 —— 表现就是「有时候复制了链接没反应」，而且连日志都没有。
+        /// 现在只挡 2 秒内的连发通知：足以吸收一次复制产生的多条 WM_CLIPBOARDUPDATE，
+        /// 又能在用户重新复制时正常重试。</para>
+        /// </summary>
+        private const int ClipboardDedupWindowMs = 2000;
+
         /// <summary>
         /// 从剪贴板文本里圈出候选 URL 的正则。
         ///
@@ -261,7 +293,7 @@ namespace GeZi
             // 反过来把 NavList 同步到位，两边永远不会不同步。
             UpdateAccountCard(null, 0, 0);
             NavList.SelectedIndex = 0;
-            Tabs.SelectedIndex = 0;
+            Tabs.SelectedIndex = TabDownload;
             Tabs.SelectionChanged += OnTabsSelectionChanged;
 
             // 窗口句柄一（重）建好，就把「跨进程激活消息钩子 + 剪贴板监听」挂上去。
@@ -364,6 +396,17 @@ namespace GeZi
                 (s2, e2) => LogAggregateProgress(),
                 Dispatcher);
             _progressLogTimer.Start();
+
+            // ---- 已下载大小渐变滚动（2026-11-13）----
+            // 50ms 逐帧推进各任务的显示平滑值。只需要的帧推一次：
+            //   · Start() 时若本就空闲会被第一帧立刻 Stop()，几乎零开销；
+            //   · OnJobUpdate 每来一次进度就 KickSmoothTimer() 有没有留在跑的在推。
+            _smoothProgressTimer = new System.Windows.Threading.DispatcherTimer(
+                TimeSpan.FromMilliseconds(50),
+                System.Windows.Threading.DispatcherPriority.Background,
+                (s3, e3) => PumpSmoothProgress(),
+                Dispatcher);
+            _smoothProgressTimer.Stop();
 
             // 定时刷容量（用户要求）。与保活心跳同频 5 分钟 —— 下载会改变已用空间，
             // 光靠启动那一次拉取，卡片上的容量会一直是旧的。
@@ -541,6 +584,7 @@ namespace GeZi
                     RefreshLoginPlatformView();
                     // 【2026-11-02】启动时按当前模式决定「清空当前目录」是否显示
                     UpdateEmptyDirButtonVisibility(ShareMode);
+                    UpdateUploadButtonVisibility();
                 }
                 catch { }
 
@@ -832,6 +876,17 @@ namespace GeZi
 
         /// <summary>进度汇总日志的定时器。</summary>
         private System.Windows.Threading.DispatcherTimer _progressLogTimer;
+
+        // ---- 已下载大小「渐变滚动」定时器（2026-11-13）----
+        // 用户反馈：「主要是下载多少的 大小进度 它是渐变往上加的 我们的比较突兀」。
+        // 真实 Done 500ms 一跳（高速时一次几 MB），这里用 50ms 定时器逐帧推进
+        // 每个任务的 TaskItem.AdvanceDisplay()，让「已下 / 总量」数字平滑往上滚。
+        // 空闲时（无任务在下载）自动停 —— 避免一个常驻 50ms 定时器空转。
+        /// <summary>「已下大小」渐变滚动的定时器。</summary>
+        private System.Windows.Threading.DispatcherTimer _smoothProgressTimer;
+
+        /// <summary>上一帧是否还有任务在平滑中（决定定时器启停）。</summary>
+        private bool _smoothNeeded;
 
         /// <summary>上一行汇总日志的内容，用于去重（没变化就不重复打）。</summary>
         private string _lastProgressLog;
@@ -1213,6 +1268,7 @@ namespace GeZi
             // 用户原话：「下载页的清空当前目录 为啥分享页面也展示 它只适用于：夸克网盘 /我的网盘
             // 这样容易误导人」。所以这里直接隐藏。
             UpdateEmptyDirButtonVisibility(nowShare);
+            UpdateUploadButtonVisibility();
 
             // ① 先把**离开的那个模式**的导航状态存下来
             CaptureNav(nowShare ? _driveNav : _shareNav);
@@ -1261,6 +1317,421 @@ namespace GeZi
             }
             catch { }
         }
+
+        // ============================================================
+        // 上传（2026-11-10 新增）
+        // ============================================================
+
+        /// <summary>上传进度窗口（null = 没有进行中的上传）。</summary>
+        private UploadProgressWindow _uploadWindow;
+
+        /// <summary>上传队列（整个程序一份，同一时刻只允许一批在跑）。</summary>
+        private readonly GeZi.Core.Upload.UploadQueue _uploadQueue =
+            new GeZi.Core.Upload.UploadQueue();
+
+        /// <summary>
+        /// 「上传」按钮的可见性。
+        ///
+        /// <para>三条同时成立才显示：① 当前是「我的网盘」模式（分享里不能写文件）；
+        /// ② 当前网盘声明了 <see cref="GeZi.Core.Pan.PanCapabilities.Upload"/>；
+        /// ③ 已登录。</para>
+        ///
+        /// <para>⚠️ 按能力位隐藏，不是"显示出来再报不支持" —— 这是项目里定过的规则。</para>
+        /// </summary>
+        private void UpdateUploadButtonVisibility()
+        {
+            try
+            {
+                if (DriveUploadBtn == null) return;
+                bool ok = !ShareMode
+                          && CurrentHasCaps(GeZi.Core.Pan.PanCapabilities.Upload)
+                          && IsPlatformLoggedIn(_loginPlatform);
+                DriveUploadBtn.Visibility = ok ? Visibility.Visible : Visibility.Collapsed;
+            }
+            catch { }
+        }
+
+        /// <summary>点「上传」：选文件 → 逐批上传到当前目录。</summary>
+        private async void OnUploadClick(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (ShareMode)
+                {
+                    AppDialog.Show(this, "分享浏览页不能上传",
+                        "上传只能写进你自己的网盘。请切到「我的网盘」再试。",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+                if (_uploadQueue.IsRunning)
+                {
+                    AppDialog.Show(this, "已有上传任务", "请等当前这批传完，或先取消。",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                var provider = CurrentProvider;
+                if (provider == null || !IsPlatformLoggedIn(_loginPlatform))
+                {
+                    AppDialog.Show(this, "请先登录", "上传需要登录态。",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+                if (!provider.Meta.Has(GeZi.Core.Pan.PanCapabilities.Upload))
+                {
+                    // 正常不会走到这里（按钮已按能力位隐藏），留着兜底并如实说明
+                    AppDialog.Show(this, "当前网盘不支持上传",
+                        provider.Meta.DisplayName + " 还没有接入上传功能。",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                var dlg = new Microsoft.Win32.OpenFileDialog
+                {
+                    Title = "选择要上传的文件（可多选）",
+                    Multiselect = true,
+                    CheckFileExists = true,
+                    Filter = "所有文件|*.*",
+                };
+                bool? picked = dlg.ShowDialog(this);
+                if (picked != true || dlg.FileNames == null || dlg.FileNames.Length == 0)
+                    return;
+
+                // 目标目录在开始时固定：上传期间用户可能切目录、返回上级，
+                // 不能让它传着传着换地方（对标实现也是这么做的）。
+                string targetFid = string.IsNullOrEmpty(_curFid) ? "0" : _curFid;
+                string targetPath = CurrentPathText();
+
+                await RunUploadBatchAsync(provider, dlg.FileNames, targetFid, targetPath);
+            }
+            catch (Exception ex)
+            {
+                Log("[上传] 启动失败: " + ex.Message);
+                AppDialog.Show(this, "上传失败", ex.Message,
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
+        /// <summary>当前路径的可读文本（用于日志和完成提示）。</summary>
+        private string CurrentPathText()
+        {
+            try
+            {
+                var names = new List<string>();
+                // 面包屑的名字集合在 DrivePathBar 的子元素里
+                if (DrivePathBar != null)
+                {
+                    foreach (var child in DrivePathBar.Children)
+                    {
+                        var tb = child as System.Windows.Controls.TextBlock;
+                        if (tb != null && !string.IsNullOrEmpty(tb.Text)) names.Add(tb.Text);
+                        var btn = child as System.Windows.Controls.Button;
+                        if (btn != null)
+                        {
+                            var inner = btn.Content as System.Windows.Controls.TextBlock;
+                            if (inner != null && !string.IsNullOrEmpty(inner.Text))
+                                names.Add(inner.Text);
+                        }
+                    }
+                }
+                if (names.Count == 0) return "根目录";
+                return string.Join(" / ", names);
+            }
+            catch { return "当前目录"; }
+        }
+
+        // ============================================================
+        // 拖拽上传（2026-11-10 新增）
+        // ============================================================
+
+        /// <summary>
+        /// 拖东西进窗口时的反馈。
+        ///
+        /// <para>【两种拖入都要认】拖**文件**进来 = 上传（本窗口的新能力）；
+        /// 拖**链接**进来 = 解析分享。光标要如实反映"这一下松手会发生什么"，
+        /// 否则用户不知道能不能放、放了会怎样。</para>
+        /// </summary>
+        private void OnWindowDragOver(object sender, DragEventArgs e)
+        {
+            try
+            {
+                if (e.Data.GetDataPresent(DataFormats.FileDrop))
+                {
+                    // 文件：只有「我的网盘」模式且网盘支持上传才受理
+                    bool canUpload = !ShareMode
+                                     && CurrentHasCaps(GeZi.Core.Pan.PanCapabilities.Upload);
+                    e.Effects = canUpload ? DragDropEffects.Copy : DragDropEffects.None;
+                }
+                else if (e.Data.GetDataPresent(DataFormats.UnicodeText)
+                         || e.Data.GetDataPresent(DataFormats.Text))
+                {
+                    e.Effects = DragDropEffects.Link;
+                }
+                else
+                {
+                    e.Effects = DragDropEffects.None;
+                }
+            }
+            catch { e.Effects = DragDropEffects.None; }
+            e.Handled = true;
+        }
+
+        /// <summary>松手：按拖入内容分流到「上传」或「解析分享」。</summary>
+        private async void OnWindowDrop(object sender, DragEventArgs e)
+        {
+            try
+            {
+                // ① 拖的是文件 → 确认后上传
+                if (e.Data.GetDataPresent(DataFormats.FileDrop))
+                {
+                    var paths = e.Data.GetData(DataFormats.FileDrop) as string[];
+                    if (paths == null || paths.Length == 0) return;
+
+                    await HandleDroppedFilesAsync(paths);
+                    return;
+                }
+
+                // ② 拖的是文本 → 当分享链接处理（复用已有的自动识别）
+                string text = null;
+                if (e.Data.GetDataPresent(DataFormats.UnicodeText))
+                    text = e.Data.GetData(DataFormats.UnicodeText) as string;
+                else if (e.Data.GetDataPresent(DataFormats.Text))
+                    text = e.Data.GetData(DataFormats.Text) as string;
+
+                if (!string.IsNullOrEmpty(text))
+                {
+                    text = text.Trim();
+                    Log("[拖拽] 收到文本，长度 " + text.Length);
+
+                    // 【2026-11-13】拖进来的文本如果是内联图片（data:image/...;base64），
+                    // 先识别二维码再说 —— 它不是链接，FindShareUrlIn 永远找不到。
+                    if (QrDecoder.LooksLikeInlineImageText(text))
+                    {
+                        HandleInlineImageTextAsync(text);
+                        return;
+                    }
+
+                    await HandleDroppedLinkAsync(text);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("[拖拽] 处理失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>拖入的文件 → 确认框 → 上传。</summary>
+        private async Task HandleDroppedFilesAsync(string[] paths)
+        {
+            if (ShareMode)
+            {
+                AppDialog.Show(this, "分享浏览页不能上传",
+                    "上传只能写进你自己的网盘。\n请先切到「我的网盘」再拖入文件。",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var provider = CurrentProvider;
+            if (provider == null || !IsPlatformLoggedIn(_loginPlatform))
+            {
+                AppDialog.Show(this, "请先登录", "上传需要登录态。",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (!provider.Meta.Has(GeZi.Core.Pan.PanCapabilities.Upload))
+            {
+                AppDialog.Show(this, "当前网盘不支持上传",
+                    provider.Meta.DisplayName + " 还没有接入上传功能。",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (_uploadQueue.IsRunning)
+            {
+                AppDialog.Show(this, "已有上传任务", "请等当前这批传完，或先取消。",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            // 只收文件，目录跳过；不存在的路径也过滤掉
+            var files = new List<string>();
+            int skippedDir = 0;
+            foreach (var p in paths)
+            {
+                try
+                {
+                    if (Directory.Exists(p)) { skippedDir++; continue; }
+                    if (File.Exists(p)) files.Add(p);
+                }
+                catch { }
+            }
+            if (files.Count == 0)
+            {
+                AppDialog.Show(this, "没有可上传的文件",
+                    skippedDir > 0
+                        ? "拖入的是文件夹。目前只支持拖文件（文件夹请逐个选中后上传）。"
+                        : "拖入的路径读不到。",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            // 确认框：说清「传什么、传到哪」，并给出总量
+            long totalBytes = 0;
+            foreach (var f in files)
+            {
+                try { totalBytes += new FileInfo(f).Length; } catch { }
+            }
+
+            string targetPath = CurrentPathText();
+            string detail;
+            if (files.Count == 1)
+            {
+                detail = "文件：" + Path.GetFileName(files[0])
+                         + "\n大小：" + FormatFileSize(totalBytes)
+                         + "\n传送到：" + targetPath;
+            }
+            else
+            {
+                detail = "共 " + files.Count + " 个文件，合计 " + FormatFileSize(totalBytes)
+                         + "\n传送到：" + targetPath
+                         + (skippedDir > 0 ? "\n（已跳过 " + skippedDir + " 个文件夹）" : "");
+            }
+            detail += "\n\n网盘已有相同内容时会自动秒传，不消耗上行流量。";
+
+            var choice = AppDialog.Show(this, "上传到网盘？", detail,
+                MessageBoxButton.OKCancel, MessageBoxImage.Question);
+            if (choice != MessageBoxResult.OK) return;
+
+            string targetFid = string.IsNullOrEmpty(_curFid) ? "0" : _curFid;
+            await RunUploadBatchAsync(provider, files, targetFid, targetPath);
+        }
+
+        /// <summary>拖入的文本里如果有分享链接，直接解析。</summary>
+        private async Task HandleDroppedLinkAsync(string text)
+        {
+            string url = FindShareUrlIn(text);
+            if (string.IsNullOrEmpty(url))
+            {
+                AppDialog.Show(this, "没识别到分享链接",
+                    "拖入的内容里没有受支持的网盘分享链接。",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            // 交给现有的解析入口，避免重复实现平台判断/校验逻辑
+            try
+            {
+                LinkBox.Text = url;
+                Log("[拖拽] 解析链接：" + url);
+                OnParseClick(this, null);
+            }
+            catch (Exception ex)
+            {
+                Log("[拖拽] 解析链接失败: " + ex.Message);
+            }
+            await Task.CompletedTask;
+        }
+
+        /// <summary>从一段文本里挑出受支持的分享链接（支持多行/带说明文字的粘贴）。</summary>
+        private static string FindShareUrlIn(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            foreach (var raw in text.Split(new[] { '\r', '\n', ' ', '\t' },
+                StringSplitOptions.RemoveEmptyEntries))
+            {
+                string token = raw.Trim();
+                var info = ShareUrlParser.Parse(token);
+                if (info != null && !string.IsNullOrEmpty(info.PwdId)) return token;
+            }
+            return null;
+        }
+
+        private static string FormatFileSize(long bytes)
+        {
+            if (bytes < 1024) return bytes + " B";
+            if (bytes < 1024L * 1024) return (bytes / 1024.0).ToString("0.0") + " KB";
+            if (bytes < 1024L * 1024 * 1024) return (bytes / 1048576.0).ToString("0.0") + " MB";
+            return (bytes / 1073741824.0).ToString("0.00") + " GB";
+        }
+
+        /// <summary>跑一批上传：开进度窗 → 逐文件传 → 收尾刷新目录。</summary>
+        private async Task RunUploadBatchAsync(GeZi.Core.Pan.IPanProvider provider,
+            IList<string> files, string targetFid, string targetPath)
+        {
+            if (files == null || files.Count == 0) return;
+
+            Log("[上传] 开始，" + files.Count + " 个文件 → " + targetPath
+                + "（fid=" + targetFid + "）");
+
+            _uploadWindow = new UploadProgressWindow(this, () =>
+            {
+                try { _uploadQueue.Cancel(); } catch { }
+                Log("[上传] 用户点了取消");
+            });
+
+            // 节流在 UploadQueue 里做；这里只负责把进度搬到 UI 线程
+            var progress = new Progress<GeZi.Core.Upload.UploadProgress>(p =>
+            {
+                if (_uploadWindow != null) _uploadWindow.Apply(p);
+            });
+
+            try
+            {
+                _uploadWindow.Show();
+                UpdateUploadButtonVisibility();
+
+                var outcome = await _uploadQueue.RunAsync(
+                    files, targetFid,
+                    (path, name, report, ct) => provider.UploadAsync(path, targetFid, report, ct),
+                    progress);
+
+                Log("[上传] 结束：" + outcome.SummaryText);
+
+                // 先把结果写在窗口上、让用户看到，再**等他点关闭**，
+                // 而不是 MarkDone 之后立刻 Close（那样结果一闪而过，
+                // 用户根本不知道传成功没有）。
+                var win = _uploadWindow;
+                if (win != null)
+                {
+                    win.MarkDone(outcome.SummaryText);
+                    if (outcome.Uploaded > 0)
+                    {
+                        // 成功：稍等片刻自动关，用户不用多点一次
+                        try
+                        {
+                            await Task.Delay(900);
+                            win.Close();
+                        }
+                        catch { }
+                    }
+                    // 失败 / 取消：留在屏幕上等用户自己关（他要看清原因）
+                }
+
+                // 成功（或被取消但已经传进去一些）就刷新，让用户立刻看见文件
+                if (outcome.Uploaded > 0)
+                {
+                    try { OnRefresh(this, null); } catch { }
+                }
+
+                if (outcome.Uploaded == 0 && !outcome.Cancelled && !string.IsNullOrEmpty(outcome.Error))
+                {
+                    AppDialog.Show(this, "上传失败", outcome.Error,
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("[上传] 异常: " + ex.GetType().Name + ": " + ex.Message);
+                if (_uploadWindow != null) { try { _uploadWindow.Close(); } catch { } }
+                AppDialog.Show(this, "上传失败", ex.Message,
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            finally
+            {
+                _uploadWindow = null;
+                UpdateUploadButtonVisibility();
+            }
+        }
+
 
         /// <summary>把当前导航状态存进指定快照。</summary>
         private void CaptureNav(NavSnapshot into)
@@ -1925,6 +2396,54 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 【2026-11-13 新增】把「图片数据本身」的文本（<c>data:image/png;base64,…</c> 或纯 base64）
+        /// 解成二维码里的内容，再交给 <see cref="ApplyScannedText"/> 分流。
+        ///
+        /// <para>【用户需求】原话：「就是类似 这种 data:image/png;base64,iVBORw0KGg
+        /// 只是图片链接 需要转成网址」。这类内容有三个特点，决定了实现方式：</para>
+        ///   · 极长（几十 KB 起）→ 绝不能塞进 LinkBox（单行框会卡、内容也完全看不懂），
+        ///     所以粘贴/拖拽入口先拦下来；
+        ///   · base64 解码 + 多轮图像变换要上百毫秒 → 必须后台跑，不能卡 UI 线程；
+        ///   · 解出来可能是分享链接，也可能是别的网址/文本 → 统一交给 ApplyScannedText
+        ///     （它会判断"像不像分享链接"，不像就只填不解析并说明原因）。
+        /// </summary>
+        private async void HandleInlineImageTextAsync(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+
+            try
+            {
+                Log("检测到内联图片数据（" + text.Length + " 字符），后台识别二维码…");
+                ShowDownloadHint("正在识别粘贴进来的二维码图片…");
+
+                var r = await Task.Run(() => QrDecoder.DecodeInlineImage(text));
+
+                if (r == null)
+                {
+                    ShowDownloadHint("识别失败：解码器没有返回结果。");
+                    Log("内联图片识别失败：解码器返回 null");
+                    return;
+                }
+
+                if (!r.Ok)
+                {
+                    string why = string.IsNullOrEmpty(r.Error) ? "没识别到二维码。" : r.Error;
+                    ShowDownloadHint("识别失败：" + why);
+                    Log("内联图片识别失败：" + why);
+                    return;
+                }
+
+                Log("内联图片识别成功（" + r.Format + "，" + r.Attempt + "）：" + r.Text);
+                ApplyScannedText(r.Text);
+            }
+            catch (Exception ex)
+            {
+                Log("处理内联图片失败: " + ex.Message);
+                ShowDownloadHint("识别失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// 【粘贴时自动精简】用户常把夸克分享的**整段文案**粘进来，形如：
         /// 「我用夸克网盘给你分享了「xxx.pdf」，点击链接或复制整段内容，打开「夸克APP」即可获取。
         ///   链接：https://pan.quark.cn/s/20ef19d26112  提取码：abcd」
@@ -1946,6 +2465,16 @@ namespace GeZi
                 string text = e.SourceDataObject.GetData(DataFormats.UnicodeText) as string;
                 if (string.IsNullOrEmpty(text))
                     return;
+
+                // 【2026-11-13】粘进来的是「图片数据本身」（data:image/png;base64,… 或纯 base64 图）
+                // → 绝不能塞进这个单行框：几十 KB 的内容会让界面卡住，而且用户看到的就是一坨乱码。
+                // 直接拦下、后台解出二维码里的网址。用户原话：「只是图片链接 需要转成网址」。
+                if (QrDecoder.LooksLikeInlineImageText(text))
+                {
+                    e.CancelCommand();          // 阻止默认粘贴
+                    HandleInlineImageTextAsync(text);
+                    return;
+                }
 
                 // 先尝试从文案里**原样抠出 URL**（保留 fid / 查询串等），比按 PwdId 重建更保真。
                 var m = Regex.Match(text, @"https?://[^\s""'<>）】\]]+");
@@ -2056,12 +2585,24 @@ namespace GeZi
             var provider = CurrentProvider;
             if (provider == null)
             {
-                EnsureQuarkProvider();
-                provider = CurrentProvider;
+                // 【2026-11-11 修·真实故障】原来是「EnsureQuarkProvider(); provider = CurrentProvider;」——
+                // 这一步是**空转**：EnsureQuarkProvider 只补夸克的 provider 包装，
+                // 而 CurrentProvider 是按 _loginPlatform 分流的。当前平台是 UC 时，
+                // 它建好了夸克 provider 却仍去取 _ucProvider（null），于是照样 return。
+                //
+                // 现在改走 BuildProviderForAsync：它能用内存 Cookie / 设置里的 Cookie /
+                // 账号档案**现场把客户端建起来**（夸克 UC 都支持），才是真正的兜底。
+                provider = await BuildProviderForAsync(_loginPlatform);
             }
             if (provider == null)
             {
-                Log("当前平台还没有可用的客户端，请先登录。");
+                // 到这一步就是真的没凭据了。必须说清楚"缺哪个平台"，并给可操作的去处 ——
+                // 原来只说一句「请先登录」，用户不知道指的是哪个平台、点了也没反应。
+                string pname = CurrentProviderName();
+                Log("无法解析：" + pname + " 没有可用的登录凭据（缺少 Cookie）。");
+                ShowDownloadHint("解析失败：还没有登录" + pname
+                    + "。请到左侧「登录」页扫码或粘贴 Cookie 后再试。");
+                NotifyIfHidden("无法解析分享链接", "还没有登录" + pname + "，请先在登录页登录。");
                 return;
             }
 
@@ -2076,6 +2617,12 @@ namespace GeZi
                 if (string.IsNullOrEmpty(_stoken))
                 {
                     Log("获取分享凭证失败（可能需登录或提取码错误）");
+                    // 【2026-11-11 修】原来只写日志 + 托盘气泡（窗口可见时气泡不弹），
+                    // 于是用户在主窗口里看到的是「点了解析，什么都没发生」。
+                    // 现在用下载页的提示条把原因直接摊在眼前。
+                    ShowDownloadHint(string.IsNullOrEmpty(passcode)
+                        ? "解析失败：没能拿到分享凭证。这个分享多半需要提取码，请在右边填上再解析。"
+                        : "解析失败：分享凭证获取失败 —— 提取码可能不对，或分享已失效，或需要登录。");
                     NotifyIfHidden("自动解析失败",
                         "获取分享凭证失败，可能需要登录，或分享提取码不正确。");
                     return;
@@ -2125,6 +2672,7 @@ namespace GeZi
             catch (Exception ex)
             {
                 Log("解析失败: " + ex.Message);
+                ShowDownloadHint("解析失败：" + ex.Message);
                 NotifyIfHidden("自动解析失败", ex.Message);
             }
             finally
@@ -2290,6 +2838,33 @@ namespace GeZi
             catch (Exception ex)
             {
                 Log("转存询问设置保存失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 文件列表第二行「显示修改日期」开关（2026-11-15 用户定稿：不替所有人独断，
+        /// 默认开）。切换后：写 Settings 持久化 → 同步 ShareFileItem 的静态开关 →
+        /// 逐行刷新第二行文案（DateLine 是计算属性，开关变化不会自动触发重算）。
+        /// </summary>
+        private void OnShowFileDateChanged(object sender, RoutedEventArgs e)
+        {
+            if (_applyingSettings) return;
+            try
+            {
+                bool on = ShowFileDateCheck.IsChecked == true;
+                _settings.ShowFileDate = on;
+                ShareFileItem.ShowDatesInList = on;
+                SettingsStore.Save(_settings);
+
+                // 已在列表里的行逐项刷新（新加载的行在构建时自然读到最新开关）
+                foreach (var f in _files) f.RefreshDateLine();
+                Log(on
+                    ? "已开启：文件列表第二行显示修改日期"
+                    : "已关闭：文件列表第二行只显示大小");
+            }
+            catch (Exception ex)
+            {
+                Log("日期显示设置保存失败: " + ex.Message);
             }
         }
 
@@ -2501,13 +3076,19 @@ namespace GeZi
                     Log("剪贴板里发现 " + CurrentProviderName() + " 分享链接，已自动切换平台。");
                 }
 
-                if (string.Equals(info.PwdId, _clipboardLastPwdId, StringComparison.Ordinal))
+                // .NET Framework 4.8 没有 Environment.TickCount64（那是 .NET Core 3.0+ 的 API），
+                // 用 UtcNow 换算成毫秒 —— long 且无 int 溢出问题。
+                long nowMs = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
+                if (string.Equals(info.PwdId, _clipboardLastPwdId, StringComparison.Ordinal)
+                    && nowMs - _clipboardLastAtMs < ClipboardDedupWindowMs)
                 {
-                    // 同一条分享的重复通知 → 不再重复发请求。见 _clipboardLastPwdId 的注释。
-                    // （要重新解析，直接点「解析」按钮即可 —— 手动路径不受这个标记影响。）
+                    // 同一条分享的**连发**通知（一次复制可能来好几条）→ 不再重复发请求。
+                    // 超过窗口期则放行，让用户重新复制同一链接时能够重试 —— 见
+                    // ClipboardDedupWindowMs 的注释（旧实现是永久去重，失败后无法重试）。
                     return;
                 }
                 _clipboardLastPwdId = info.PwdId;
+                _clipboardLastAtMs = nowMs;
 
                 // 提取码从**整段文本**里取：链接自带 pwd= 的能认，文案里的
                 // 「提取码：abcd」也能认（ShareUrlParser 两种都支持）。
@@ -2653,11 +3234,12 @@ namespace GeZi
                 if (ShareModeRadio.IsChecked != true)
                     ShareModeRadio.IsChecked = true;
 
-                // ② 结果只出现在「下载」页的分享面板里（NavList 顺序：0=下载 1=任务
-                //    2=设置 3=登录），所以把页面也指过去，否则用户在设置页复制的链接，
+                // ② 结果只出现在「下载」页的分享面板里（侧栏顺序见 Tab* 常量：
+                //    0=下载 1=任务 2=登录 3=资源 4=设置），所以把页面也指过去，
+                //    否则用户在设置页复制的链接，
                 //    程序在背后解析完他什么也看不见。
                 //    ⚠️ 只切页签，不 Show / 不 Activate —— 窗口藏在托盘时静默解析，不抢焦点。
-                Tabs.SelectedIndex = 0;
+                Tabs.SelectedIndex = TabDownload;
             }
             catch { }
 
@@ -3209,6 +3791,21 @@ namespace GeZi
         private bool _fileSelectMode;
 
         /// <summary>
+        /// 区间连选的起点（2026-11-11 新增）。
+        ///
+        /// <para>【用户需求】「在 s 模式下 选择初始位置 再按 Alt+点击文件（终止位置）
+        /// 同时选中区间文件」—— 也就是资源管理器那种"点 A、Alt+点 Z、A~Z 全选"。</para>
+        ///
+        /// <para>【为什么另开锚点而不是用已有选中项】多选模式下点选是"切换"语义，
+        /// 用户可能先随便点了几个、再想连选一段。用"最后选中项"当锚点会让区间起点
+        /// 变成他最后点的那个（往往是误点），而不是他**心里认定的起点**。
+        /// 所以锚点只在"普通点击"时更新，且退出多选/换目录时清空。</para>
+        ///
+        /// <para>存 Fid 而不是索引：筛选/排序变化时索引会失效，Fid 在目录内稳定。</para>
+        /// </summary>
+        private string _fileSelectAnchorFid;
+
+        /// <summary>
         /// 当前文件列表里是否有可选的条目（考虑筛选词）。
         /// <para>用于决定多选模式能否进入 —— 空列表里进多选模式毫无意义，
         /// 只会看到一条提示条挂在那里，用户反馈过"没有文件也会展示多选提示"。</para>
@@ -3241,6 +3838,7 @@ namespace GeZi
             }
 
             _fileSelectMode = true;
+            _fileSelectAnchorFid = null;   // 新进模式：区间起点从零开始
             try
             {
                 if (FileSelectBar != null) FileSelectBar.Visibility = Visibility.Visible;
@@ -3258,6 +3856,8 @@ namespace GeZi
         {
             if (!_fileSelectMode) return;
             _fileSelectMode = false;
+            // 区间起点跟着模式一起失效：下次进来不该还记着上次的位置
+            _fileSelectAnchorFid = null;
             try
             {
                 if (FileSelectBar != null) FileSelectBar.Visibility = Visibility.Collapsed;
@@ -3275,6 +3875,95 @@ namespace GeZi
         /// 只说"选了几项"用户没有体积概念，加了总大小才能判断"这一批大概多大"、
         /// 值不值得开下载。</para>
         /// </summary>
+        /// <summary>
+        /// 把「锚点到目标行」之间的所有条目**加选**（2026-11-11 新增）。
+        ///
+        /// <para>【用户需求】s 多选模式下：先点一个起点，再 Alt+点终点，整段一起选中。</para>
+        ///
+        /// <para>【为什么按"当前显示顺序"取区间】用户看到的就是这个顺序（可能是筛选后、
+        /// 也可能是按名字倒序）。如果按底层 _files 的原始顺序取，选出来的会和眼睛看到的
+        /// 不一致 —— 那比不实现还糟。</para>
+        ///
+        /// <para>【锚点缺失时】没有起点就把当前点击项设为锚点并选中它。
+        /// 这样"直接 Alt+点第一个"也能用，不必先普通点一次。</para>
+        /// </summary>
+        private void SelectFileRangeTo(ListBoxItem targetItem)
+        {
+            try
+            {
+                if (targetItem == null || FileList == null) return;
+                var target = targetItem.DataContext as ShareFileItem;
+                if (target == null) return;
+
+                // 没有锚点（或锚点已不在当前视图里）→ 把它当成新的起点
+                if (string.IsNullOrEmpty(_fileSelectAnchorFid))
+                {
+                    _fileSelectAnchorFid = target.Fid;
+                    targetItem.IsSelected = true;
+                    Log("已设定区间起点：" + target.Name + "（再 Alt+点击终点即可连选）");
+                    return;
+                }
+
+                // 按**当前视图顺序**收集可见条目（含筛选后的结果，与用户所见一致）
+                var visible = new List<ShareFileItem>();
+                foreach (var o in FileList.Items)
+                {
+                    var f = o as ShareFileItem;
+                    if (f != null) visible.Add(f);
+                }
+
+                int a = -1, b = -1;
+                for (int i = 0; i < visible.Count; i++)
+                {
+                    if (a < 0 && string.Equals(visible[i].Fid, _fileSelectAnchorFid, StringComparison.Ordinal))
+                        a = i;
+                    if (b < 0 && ReferenceEquals(visible[i], target))
+                        b = i;
+                }
+
+                if (a < 0)
+                {
+                    // 锚点被筛选掉了 / 换了目录 → 用当前项当新起点
+                    _fileSelectAnchorFid = target.Fid;
+                    targetItem.IsSelected = true;
+                    Log("区间起点已失效（可能被筛选或换了目录），已把「" + target.Name + "」设为新起点。");
+                    return;
+                }
+                if (b < 0) return;
+
+                if (a > b) { int t = a; a = b; b = t; }
+
+                // 先建一个"已选中"的集合：SelectedItems.Contains 是线性查找，
+                // 区间几十项时没事，但用户按住 Alt 跨度很大时会退化成 O(n²)，
+                // 期间界面会明显卡一下。用 HashSet 把它压成 O(1)。
+                var already = new HashSet<ShareFileItem>();
+                foreach (var o in FileList.SelectedItems)
+                {
+                    var f2 = o as ShareFileItem;
+                    if (f2 != null) already.Add(f2);
+                }
+
+                int added = 0;
+                for (int i = a; i <= b; i++)
+                {
+                    var f = visible[i];
+                    if (already.Contains(f)) continue;
+                    FileList.SelectedItems.Add(f);
+                    already.Add(f);
+                    added++;
+                }
+                // 终点也算进已选（含起点与终点本身）
+                if (!targetItem.IsSelected) targetItem.IsSelected = true;
+
+                Log("区间连选：第 " + (a + 1) + " ~ " + (b + 1) + " 项，共 "
+                    + (b - a + 1) + " 项（新加 " + added + " 项）");
+            }
+            catch (Exception ex)
+            {
+                Log("区间连选失败: " + ex.Message);
+            }
+        }
+
         private void UpdateFileSelectCount()
         {
             try
@@ -3370,8 +4059,34 @@ namespace GeZi
             if (_fileSelectMode && ReferenceEquals(sender, FileList))
             {
                 e.Handled = true;
+
+                // ---- Alt+点击 = 区间连选（2026-11-11 新增）----
+                //
+                // 【用户需求】「在 s 模式下 选择初始位置 再按 Alt+点击文件（终止位置）
+                // 同时选中区间文件」。
+                //
+                // 【为什么要 Alt 而不是 Shift】Shift 已经被占用（= 离散切换单项，
+                // 见下面 ① 分支，那是用户 2026-10 明确要求的"不要连选"）。
+                // Alt 在文件列表里没有既有语义，拿来当区间选择器正好。
+                //
+                // 【语义选择】区间选择是**加选**（把区间内全部标为选中），而不是切换。
+                // 理由：用户按 Alt 的意图明确是"我要这一段"，把已选中的再点掉会出乎意料。
+                // 这与资源管理器一致。
+                if ((mods & ModifierKeys.Alt) != 0)
+                {
+                    SelectFileRangeTo(item);
+                    try { item.Focus(); } catch { }
+                    UpdateFileSelectCount();
+                    return;
+                }
+
                 item.IsSelected = !item.IsSelected;
                 try { item.Focus(); } catch { }
+
+                // 普通点击 = 重新指定区间起点（用户心里认定的"初始位置"）
+                var clicked = item.DataContext as ShareFileItem;
+                _fileSelectAnchorFid = clicked != null ? clicked.Fid : null;
+
                 UpdateFileSelectCount();
                 return;
             }
@@ -3408,7 +4123,28 @@ namespace GeZi
                 EnterFolder(dir);
                 return;
             }
-            // ④ 单击文件 / 其它情况：完全走 WPF 默认行为
+            // ④ 单击文件（无修饰键、非 s 多选模式）：
+            //    【2026-11-15 用户定稿】「对于图片和txt 直接点击 就是预览即可，
+            //    只在s多选模式下才是选中」—— s 模式已被 ⓪.5 拦走、修饰键被 ①② 拦走，
+            //    走到这里的一定是"裸点击"。图片/文本类 → 直接开预览窗（不选中）；
+            //    其余类型（docx/zip/pdf/音视频）保持 WPF 默认 = 选中。
+            if (ReferenceEquals(sender, FileList) && mods == ModifierKeys.None)
+            {
+                var pvItem = FileList.ItemContainerGenerator.ItemFromContainer(item) as ShareFileItem;
+                if (pvItem != null && !pvItem.IsDir &&
+                    ShareFileItem.PreviewKindOf(pvItem.Name) != ShareFileItem.PreviewKind.None)
+                {
+                    e.Handled = true;
+                    // 用 BeginInvoke 把模态窗推到输入事件栈之外 —— 在 PreviewMouseLeftButtonDown
+                    // 的调用栈里直接 ShowDialog 会让模态循环嵌进事件处理，风险面大（与
+                    // 切平台自动扫码的 BeginInvoke(Background) 同一套惯例）。
+                    var target = pvItem;
+                    Dispatcher.BeginInvoke(DispatcherPriority.Background,
+                        new Action(() => _ = OpenPreviewAsync(target)));
+                    return;
+                }
+            }
+            // ⑤ 其余情况：完全走 WPF 默认行为（= 选中）
         }
 
         /// <summary>从鼠标命中的可视元素往上找 ListBoxItem。</summary>
@@ -3597,11 +4333,24 @@ namespace GeZi
         private List<ShareFileItem> SortDirEntries(IList<QuarkFileEntry> items)
         {
             // 2026-10-24：改为实例方法并遵循 _fileSortDescending（默认倒序）。
-            return SortFileItems(items.Select(it => new ShareFileItem
+            var list = SortFileItems(items.Select(it => new ShareFileItem
             {
                 Fid = it.Fid, Name = it.Name, Size = it.Size,
                 IsDir = it.IsDir, Token = it.Token,
+                // 【2026-11-15 P0】缩略图 URL（图片/视频行左侧直接渲染网盘小图）+ 修改日期
+                //（第二行「大小 + 日期」）。构建后立刻按扩展名定类型图标并异步拉缩略图。
+                ThumbnailUrl = it.Thumbnail,
+                // ⚠️ 2026-11-15 用户抓出的漏项：这里漏传 UpdatedAt 导致 Core 层解析得
+                // 再好界面也拿不到（首版只传了 ThumbnailUrl 就提交了，日期一直空白）。
+                // 教训记入 lesson：新增字段必须两端贯通（Core 解析端 + UI 构建端）核对。
+                UpdatedAt = it.UpdatedAt,
             }));
+            foreach (var it in list)
+            {
+                ShareFileItem.ApplyIcon(it);
+                if (!it.IsDir) KickThumbnail(it);
+            }
+            return list;
         }
 
         /// <summary>
@@ -3689,6 +4438,9 @@ namespace GeZi
             }
 
             _files.Clear();
+            // 【2026-11-11】换目录 → 区间连选的锚点作废。
+            // 锚点存的是 Fid，而 Fid 只在同一个目录内唯一；跨目录沿用会选到错的条目。
+            _fileSelectAnchorFid = null;
             ResetDirSizeScan();     // 换目录了：上一轮没算完的不再算
 
             if (restore)
@@ -3939,6 +4691,9 @@ namespace GeZi
                 // _files.CollectionChanged 在清空/填充时已经触发过 UpdateEmptyStates，
                 // 但"加载失败且一条都没有"这条路径不会动集合 —— 补一次保证加载态收掉。
                 UpdateEmptyStates();
+                // 【2026-11-10】目录加载完刷一次上传按钮：登录态与网盘能力
+                // 往往要到这一刻才真正就绪（启动恢复浏览位置时尤其如此）。
+                UpdateUploadButtonVisibility();
 
                 // 【2026-10-21】每次目录加载完成（含缓存命中）都记一次浏览位置。
                 // 为什么放 finally 而不是每个导航入口各写一遍：
@@ -4680,7 +5435,7 @@ namespace GeZi
             // KeyUp 可能收不到，状态就更容易错乱。
             // 结论：修饰键不适合当这种"粘滞开关"，换成一个普通字母键最干净。
             // 字母键走的是下面的普通分支（不带修饰键），与所有系统快捷键零冲突。
-            if (e.Key == Key.S && Tabs.SelectedIndex == 0)
+            if (e.Key == Key.S && Tabs.SelectedIndex == TabDownload)
             {
                 e.Handled = true;
                 if (_fileSelectMode) ExitFileSelectMode();
@@ -4703,7 +5458,7 @@ namespace GeZi
             //      只在下载页有意义：刷新的是文件列表。
             //      复用 OnRefresh 意味着同样会**绕过缓存**、走真实请求 ——
             //      这样从本地缓存恢复后，r 就是"去看有没有更新"的快捷方式。
-            if (e.Key == Key.R && Tabs.SelectedIndex == 0)
+            if (e.Key == Key.R && Tabs.SelectedIndex == TabDownload)
             {
                 e.Handled = true;
                 RefreshCurrentDirAsync();
@@ -4766,7 +5521,7 @@ namespace GeZi
                     return;
                 }
             }
-            if (e.Key == Key.Z && Tabs.SelectedIndex == 1)
+            if (e.Key == Key.Z && Tabs.SelectedIndex == TabTasks)
             {
                 e.Handled = true;
                 EnterTaskSelectMode();
@@ -4774,28 +5529,36 @@ namespace GeZi
             }
 
             // ② 切换页面：任何页面都能用。
-            //    1/2/3 = 下载 / 任务 / 登录（设置那页给了 q，不让数字键去占位），
-            //    6 = 关于本程序。小键盘上的同名键（NumPad）一并认，免得用户按了没反应。
+            //    【2026-11-11 用户指定】1=下载 / 2=任务 / 3=登录(账号) / 4=资源，
+            //    设置页用 q（不占数字位），6 = 关于本程序。
+            //    小键盘上的同名键（NumPad）一并认，免得用户按了没反应。
             switch (e.Key)
             {
                 case Key.D1:
                 case Key.NumPad1:
                     e.Handled = true;
-                    Tabs.SelectedIndex = 0;   // 侧栏顺序：0 下载 / 1 任务 / 2 设置 / 3 登录
+                    Tabs.SelectedIndex = TabDownload;   // 侧栏顺序见 Tab* 常量定义
                     return;
                 case Key.D2:
                 case Key.NumPad2:
                     e.Handled = true;
-                    Tabs.SelectedIndex = 1;
+                    Tabs.SelectedIndex = TabTasks;
                     return;
                 case Key.D3:
                 case Key.NumPad3:
                     e.Handled = true;
-                    Tabs.SelectedIndex = 3;
+                    Tabs.SelectedIndex = TabLogin;
                     return;
+                // 4 = 资源（与侧栏第 4 项一致）
+                case Key.D4:
+                case Key.NumPad4:
+                    e.Handled = true;
+                    Tabs.SelectedIndex = TabResources;
+                    return;
+                // 设置页：q（用户指定，给数字键留出 1-4 的连续区间）
                 case Key.Q:
                     e.Handled = true;
-                    Tabs.SelectedIndex = 2;
+                    Tabs.SelectedIndex = TabSettings;
                     return;
                 case Key.D6:
                 case Key.NumPad6:
@@ -4806,7 +5569,7 @@ namespace GeZi
 
             // ② 以下都作用于「下载」页的文件列表。在任务页/设置页按 x 却把文件列表里
             //    的选中项下掉，既看不见也想不到，所以先判页面。
-            if (Tabs.SelectedIndex != 0) return;
+            if (Tabs.SelectedIndex != TabDownload) return;
 
             switch (e.Key)
             {
@@ -4890,7 +5653,7 @@ namespace GeZi
                 // ③ 兜底：把焦点交给窗口本身（Window 是 IInputElement，一定能接住）。
                 bool moved = false;
 
-                if (Tabs.SelectedIndex == 0 && FileList != null)
+                if (Tabs.SelectedIndex == TabDownload && FileList != null)
                 {
                     try
                     {
@@ -5711,6 +6474,37 @@ namespace GeZi
         /// <param name="name">文件名（未清洗）。</param>
         /// <param name="takenInBatch">本批已占用的路径（大小写不敏感），防止同批两个同名文件互撞。</param>
         /// <returns>可用的目标路径；<c>null</c> 表示这个文件已经在下、应当跳过。</returns>
+        /// <summary>
+        /// 清洗一层相对目录路径（2026-11-11 新增）。
+        ///
+        /// <para>【为什么需要】<c>RelDir</c> 可能来自**旧任务快照**或分享方的原始目录名，
+        /// 里面带着首尾空白。而 Windows 落盘时会悄悄吃掉首尾空格，
+        /// 于是"程序算出来的路径"与"磁盘上的真实路径"对不上 ——
+        /// 表现为 <c>Directory.Exists</c> 为 false、建子目录报
+        /// 「未能找到路径的一部分」，下载还没开始就失败（用户实测）。</para>
+        ///
+        /// <para>这里按 / 与 \ 拆段，逐段清洗后再拼回去。逐段而不是整串，
+        /// 是因为空白可能出现在任意一层（分享的子目录名同样可能带空格）。</para>
+        /// </summary>
+        private static string CleanRelDir(string relDir)
+        {
+            if (string.IsNullOrEmpty(relDir)) return "";
+            try
+            {
+                var parts = relDir.Split(new[] { System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 0) return "";
+                var cleaned = new List<string>(parts.Length);
+                foreach (var part in parts)
+                {
+                    string c = PathUtil.SanitizeFileName(part);
+                    if (string.IsNullOrEmpty(c) || c == "quark_file") continue;  // 空段/纯非法段直接跳过
+                    cleaned.Add(c);
+                }
+                return string.Join("\\", cleaned);
+            }
+            catch { return relDir; }
+        }
+
         private string ResolveDestOrSkip(string destDir, string name, HashSet<string> takenInBatch)
         {
             string basePath = Path.Combine(destDir, PathUtil.SanitizeFileName(name));
@@ -5754,7 +6548,7 @@ namespace GeZi
             {
                 var it = items[i];
                 if (string.IsNullOrEmpty(it.Url)) continue;
-                string destDir = Path.Combine(_settings.OutDir, it.RelDir ?? "");
+                string destDir = Path.Combine(_settings.OutDir, CleanRelDir(it.RelDir));
                 try { Directory.CreateDirectory(destDir); }
                 catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
 
@@ -5813,7 +6607,7 @@ namespace GeZi
             ClearFileSelection();   // 同上：入队即撤掉列表里的高亮
             Log("已加入下载队列: " + jobs.Count + " 个文件（复用已取链接）"
                 + (skipped > 0 ? "（另有 " + skipped + " 个已在下载，已跳过）" : ""));
-            Tabs.SelectedIndex = 1;
+            Tabs.SelectedIndex = TabTasks;
             RunJobs(jobs);
         }
 
@@ -6008,7 +6802,7 @@ namespace GeZi
                 for (int i = 0; i < items.Count; i++)
                 {
                     var it = items[i];
-                    string destDir = Path.Combine(_settings.OutDir, it.RelDir ?? "");
+                    string destDir = Path.Combine(_settings.OutDir, CleanRelDir(it.RelDir));
                     try { Directory.CreateDirectory(destDir); }
                     catch (Exception ex) { Log("创建下载目录失败: " + destDir + " — " + ex.Message); continue; }
                     string dest = ResolveDestOrSkip(destDir, it.Name, taken);
@@ -6067,7 +6861,7 @@ namespace GeZi
                 ClearFileSelection();   // 已提交 → 撤掉高亮，避免误触重复入队
                 Log("已加入下载队列: " + jobs.Count + " 个文件"
                     + (skipped > 0 ? "（另有 " + skipped + " 个已在下载，已跳过）" : ""));
-                Tabs.SelectedIndex = 1;
+                Tabs.SelectedIndex = TabTasks;
                 RunJobs(jobs);
             }
             finally
@@ -7049,6 +7843,8 @@ namespace GeZi
             // 口径 = **这一批从推送到全部完成**的用时（用户明确要求，不是累加）。
             // 每推一批重新计时；批次结束停表并把结果留在状态栏上。
             _batchStartTime = DateTime.UtcNow;
+            _batchElapsedBefore = TimeSpan.Zero;   // 新批次：累计清零
+            _batchClockFrozen = false;
             _lastBatchElapsed = null;
 
             // 记下"本批开始时"的累计字节 —— 之后算平均速度时用**增量**，
@@ -7082,8 +7878,11 @@ namespace GeZi
                 // 不再继续累加（下一批推送时会重新计时）。
                 if (_batchStartTime != null)
                 {
-                    _lastBatchElapsed = DateTime.UtcNow - _batchStartTime.Value;
+                    // 两段式：之前累计的 + 最后这一段落
+                    _lastBatchElapsed = _batchElapsedBefore + (DateTime.UtcNow - _batchStartTime.Value);
                     _batchStartTime = null;
+                    _batchElapsedBefore = TimeSpan.Zero;
+                    _batchClockFrozen = false;
                 }
                 RefreshTotalStatusBar();
             }
@@ -7428,6 +8227,36 @@ namespace GeZi
         /// 刷新底部状态栏。可在任意时刻重复调用（内部分支都已判空）。
         /// 由 <see cref="LogAggregateProgress"/> 按 10 秒节拍驱动，任务增删时也会主动调一次。
         /// </summary>
+        // ---- 已下载大小「渐变滚动」（2026-11-13）----
+        // 逐帧推进所有任务的显示平滑值，让「已下 / 总量」数字平滑往上滚。
+
+        private void PumpSmoothProgress()
+        {
+            try
+            {
+                _smoothNeeded = false;
+                // 快照再遍历：AdvanceDisplay 可能触发重排（OnChanged→绑定→列表刷新），
+                // 遍历期间改 _tasks 会抛错，快照最安全。
+                foreach (var t in _tasks.ToList())
+                {
+                    if (t.AdvanceDisplay()) _smoothNeeded = true;
+                }
+                if (!_smoothNeeded) _smoothProgressTimer.Stop();
+            }
+            catch { _smoothProgressTimer.Stop(); }
+        }
+
+        /// <summary>进度上报时提示平滑定时器继续（若已在跑则无操作）。</summary>
+        private void KickSmoothTimer()
+        {
+            try
+            {
+                _smoothNeeded = true;
+                if (!_smoothProgressTimer.IsEnabled) _smoothProgressTimer.Start();
+            }
+            catch { }
+        }
+
         private void RefreshTotalStatusBar()
         {
             try
@@ -7497,7 +8326,7 @@ namespace GeZi
                 {
                     if (speed > 1024)
                     {
-                        TotalSpeedText.Text = Util.FormatSize((long)speed) + "/s";
+                        TotalSpeedText.Text = Util.FormatSpeed(speed);
                     }
                     else if (pending.Count > 0)
                     {
@@ -7902,6 +8731,8 @@ namespace GeZi
                 // 阶段说明（如「正在合并分片」）。非下载态一律清空，
                 // 免得完成/失败后还挂着「正在合并分片」这种残留文案。
                 item.Phase = u.State == JobState.Downloading ? u.Progress.Phase : null;
+                // 新进度到来 → 提示平滑定时器该跑（若已在跑则无操作）
+                KickSmoothTimer();
 
                 // 【2026-10-22 用户要求】「任务页的总进度和总速度更新太慢，
                 // 要确保和任务在下载同步」。
@@ -9847,6 +10678,10 @@ namespace GeZi
                 // 否则在途请求还会让核心上报渐降速度，界面看着像"慢慢停"。
                 t.Speed = 0;
                 Log("已暂停: " + t.Name);
+
+                // 【2026-11-10】这一批已经没有任何在跑的任务 → 停表，
+                // 否则状态栏的「耗时」会在暂停期间继续往上涨（用户实测反馈）。
+                if (BatchHasPausedTask()) FreezeBatchClock(true);
             }
             else
             {
@@ -9955,6 +10790,11 @@ namespace GeZi
                 }
 
                 t.PauseRequested = false;   // 先清标志，否则会继续忽略核心的 Downloading
+
+                // 【2026-11-10】恢复计时：把暂停期间冻结的那段重新接上，
+                // 否则恢复后耗时要么停在旧值、要么一次跳过整段暂停时长。
+                FreezeBatchClock(false);
+
                 t.Job.ResumeJob();
                 // 【2026-10-24 修】原来这里直接写 `t.State = JobState.Downloading`，
                 // 但 ResumeJob() 只是**取消暂停信号**，worker 还要去抢调度器的并发名额
@@ -11189,7 +12029,7 @@ namespace GeZi
             public void Update(DiagnosticsSnapshot s)
             {
                 Name = s.Name ?? "";
-                Speed = Util.FormatSize((long)s.Speed) + "/s";
+                Speed = Util.FormatSpeed(s.Speed);
                 Conns = s.ActiveConnections + "/" + s.WorkerCount;
                 Parts = s.PartsDone + "/" + s.PartsTotal;
                 string pct = s.TotalBytes > 0
@@ -12455,6 +13295,10 @@ namespace GeZi
                 AutoTuneCheck.IsChecked = _settings.AutoTune;
                 // 【2026-10-24】下载前询问是否转存（默认开）
                 AskBeforeSaveCheck.IsChecked = _settings.AskBeforeSave;
+                // 【2026-11-15】文件列表第二行是否显示修改日期（默认开）：
+                // 回填勾选 + 同步 ShareFileItem 的静态开关（列表行 DateLine 读写它）。
+                ShowFileDateCheck.IsChecked = _settings.ShowFileDate;
+                ShareFileItem.ShowDatesInList = _settings.ShowFileDate;
                 // 【2026-10-24】网盘文件列表排序方向（默认倒序）→ 回填到工具栏按钮
                 _fileSortDescending = _settings.FileSortDescending;
                 try
@@ -12920,6 +13764,66 @@ namespace GeZi
         /// </summary>
         private DateTime? _batchStartTime;
 
+        /// <summary>
+        /// 暂停累计时长（2026-11-10 新增）。
+        ///
+        /// <para>【解决什么】用户实测：「为什么暂停了任务，下方的耗时还会继续」。
+        /// 原来耗时 = 现在 - 批次起点，而暂停期间这个差值照样增长 ——
+        /// 时间在走、进度却不动，看着像程序还在干活。</para>
+        ///
+        /// <para>【做法】把「已耗时」拆成两段：<c>_batchElapsedBefore</c>（之前累计的）
+        /// + 当前这一段（现在 - 本段起点）。暂停时把当前这段结账进累计值、
+        /// 并把 <c>_batchStartTime</c> 置空；恢复时重新给一个起点。
+        /// 这样暂停期间耗时就停在那一刻，不会继续涨。</para>
+        /// </summary>
+        private TimeSpan _batchElapsedBefore = TimeSpan.Zero;
+
+        /// <summary>耗时计时当前是否被冻结（暂停中）。见 <see cref="FreezeBatchClock"/>。</summary>
+        private bool _batchClockFrozen;
+
+        /// <summary>本批是否有任务处于暂停（暂停期间耗时不增长）。</summary>
+        private bool BatchHasPausedTask()
+        {
+            try
+            {
+                foreach (var t in _tasks)
+                {
+                    if (t == null) continue;
+                    if (t.State == JobState.Paused) return true;
+                    if (t.State == JobState.Downloading || t.State == JobState.Queued) return false;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 冻结/恢复耗时计时（2026-11-10 新增）。
+        /// <paramref name="freeze"/> 为 true 时把当前这段结账、停表；false 时重新开始计。
+        /// </summary>
+        private void FreezeBatchClock(bool freeze)
+        {
+            try
+            {
+                if (freeze)
+                {
+                    if (_batchStartTime != null)
+                    {
+                        _batchElapsedBefore += DateTime.UtcNow - _batchStartTime.Value;
+                        if (_batchElapsedBefore < TimeSpan.Zero) _batchElapsedBefore = TimeSpan.Zero;
+                        _batchStartTime = null;
+                    }
+                    _batchClockFrozen = true;
+                }
+                else
+                {
+                    if (_batchStartTime == null) _batchStartTime = DateTime.UtcNow;
+                    _batchClockFrozen = false;
+                }
+            }
+            catch { }
+        }
+
         /// <summary>上一批完成时的用时（保留显示，直到下一批开始）。</summary>
         private TimeSpan? _lastBatchElapsed;
 
@@ -12940,8 +13844,17 @@ namespace GeZi
             {
                 if (_batchStartTime != null)
                 {
-                    var span = DateTime.UtcNow - _batchStartTime.Value;
+                    // 两段式：之前累计的 + 当前这一段
+                    var span = _batchElapsedBefore + (DateTime.UtcNow - _batchStartTime.Value);
+                    if (span < TimeSpan.Zero) span = TimeSpan.Zero;
                     return "耗时 " + TaskItem.FormatEta(span.TotalSeconds);
+                }
+                if (_batchClockFrozen && _batchElapsedBefore > TimeSpan.Zero)
+                {
+                    // 明确处于"暂停冻结"状态 → 显示已累计的那部分，停住不动。
+                    // ⚠️ 用显式标志判断，不要用"累计值>0 且 没有上批结果"这种推断 ——
+                    //    批次正常结束时累计值刚被清零，边界上会误标成「（暂停）」。
+                    return "耗时 " + TaskItem.FormatEta(_batchElapsedBefore.TotalSeconds) + "（已暂停）";
                 }
                 if (_lastBatchElapsed != null)
                 {
@@ -12980,7 +13893,7 @@ namespace GeZi
 
                 double avg = (double)bytes / span.Value.TotalSeconds;
                 if (avg < 1) return "—";
-                return Util.FormatSize((long)avg) + "/s";
+                return Util.FormatSpeed(avg);
             }
             catch { return "—"; }
         }
@@ -13030,7 +13943,7 @@ namespace GeZi
 
         // ---------------- 登录 ----------------
 
-        private void OnLoginClick(object sender, RoutedEventArgs e) => Tabs.SelectedIndex = 3;
+        private void OnLoginClick(object sender, RoutedEventArgs e) => Tabs.SelectedIndex = TabLogin;
 
         /// <summary>
         /// 打开账号管理弹窗：列出本机保存的账号，可一键切换 / 删除，或去扫码登录新账号。
@@ -13118,7 +14031,7 @@ namespace GeZi
             {
                 // 扫码新账号：切到登录页并收起本弹窗（保留现有账号档案不动）。
                 win.Close();
-                Tabs.SelectedIndex = 3;
+                Tabs.SelectedIndex = TabLogin;
             };
             closeBtn.Click += (s, ev) => win.Close();
 
@@ -13303,8 +14216,40 @@ namespace GeZi
         private GeZi.Core.Pan.IPanProvider _quarkProvider;
 
         /// <summary>取夸克 provider（有 _client 才建，避免老代码 set _client 后忘记同步）。</summary>
+        /// <remarks>
+        /// 【2026-11-11 修·真实故障】原来只包装**已经存在**的 <c>_client</c>：
+        /// <code>
+        /// if (_quarkProvider == null &amp;&amp; _client != null) …   // _client 为 null 就返回 null
+        /// </code>
+        /// 而 <c>_client</c> 只在"启动时当前平台就是夸克"的情况下才建。于是出现这样一条
+        /// 用户实测的死路：上次用的是 UC（未登录）→ 启动后 _client 始终为 null →
+        /// 用户复制**夸克**分享链接 → 平台已切到夸克、配置里夸克 Cookie 也好好的，
+        /// 但没有一行代码去用它建客户端 → 解析直接 return「当前平台还没有可用的客户端」，
+        /// 而且点多少次都一样（日志里会连续刷这句）。
+        ///
+        /// <para>现在补上"没有 _client 但有 Cookie 就现场建一个"，让所有调用点
+        /// （解析、续传取链、转存…）都能自愈，而不是各自再写一遍。</para>
+        /// </remarks>
         private GeZi.Core.Pan.IPanProvider EnsureQuarkProvider()
         {
+            if (_quarkProvider == null && _client == null)
+            {
+                // 没有客户端但有凭据 → 现场建。凭据为空时保持 null，让调用方如实报"未登录"。
+                try
+                {
+                    string cookie = _settings == null ? null : _settings.Cookie;
+                    if (!string.IsNullOrEmpty(cookie))
+                    {
+                        _client = new QuarkClient(cookie);
+                        Log("[客户端] 按配置里的夸克 Cookie 现场重建客户端（此前未创建）");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogDetail("按配置重建夸克客户端失败：" + ex.Message);
+                }
+            }
+
             if (_quarkProvider == null && _client != null)
                 return _quarkProvider = new GeZi.Core.Pan.QuarkProvider(_client);
             return _quarkProvider;
@@ -13449,6 +14394,119 @@ namespace GeZi
         /// <summary>上次自动尝试登录的 Cookie 签名，避免同一串重复请求。</summary>
         private string _lastAutoLoginSig;
 
+        // ============================================================
+        // Cookie 输入框脱敏显示（2026-11-10 新增）
+        // ============================================================
+
+        /// <summary>
+        /// 输入框里**当前显示的那份脱敏串**对应的**真实 Cookie**。
+        ///
+        /// <para>【为什么必须单独存一份】用户要求「Cookie 只展示前 10 位，后面用 * 展示」——
+        /// 这是**展示层**需求。但输入框同时也是登录的**数据源**
+        /// （「导入并登录」和自动登录都读 <c>CookieImportBox.Text</c>）。
+        /// 如果只把界面改成 <c>ctoken=cYLHyFS3z********</c> 而不留真值，
+        /// 用户一回填就点登录，程序会拿一串星号去请求，必然失败。</para>
+        ///
+        /// <para>所以：控件里放脱敏串给人看，真值放这里给程序用。
+        /// 读取时一律走 <see cref="ReadCookieBoxValue"/>，不要直接读 .Text。</para>
+        /// </summary>
+        private string _cookieShownReal;
+
+        /// <summary>脱敏后的 Cookie 是否正显示在输入框里（用于区分"用户自己敲的"与"我们回填的"）。</summary>
+        private bool _cookieBoxMasked;
+
+        /// <summary>
+        /// 把 Cookie 脱敏成「前 N 位 + 星号」。
+        ///
+        /// <para>保留前 10 个字符：足以让用户认出"是不是这份 Cookie"
+        /// （开头通常是 <c>ctoken=xxx</c> 或 <c>__pus=xxx</c> 这样的键名+值前缀），
+        /// 又不会把整串凭据显示在屏幕上（截图/录屏/旁人一眼都能看见）。</para>
+        ///
+        /// <para>★ 顺带按分号切段，每段各自脱敏 —— 整串只留开头 10 位的话，
+        /// 后面几十个键全变成一片星号，用户完全看不出这份 Cookie 包含哪些字段。
+        /// 逐段脱敏既隐藏了值，又保留了「有哪些键」这个有用信息。</para>
+        /// </summary>
+        private static string MaskCookie(string cookie, int keep = 10)
+        {
+            if (string.IsNullOrEmpty(cookie)) return "";
+            var parts = cookie.Split(';');
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string seg = parts[i].Trim();
+                if (seg.Length == 0) continue;
+                if (sb.Length > 0) sb.Append("; ");
+
+                int eq = seg.IndexOf('=');
+                if (eq <= 0)
+                {
+                    // 没有 = 的段（脏数据）：整段截断
+                    sb.Append(seg.Length <= keep ? seg : seg.Substring(0, keep) + "****");
+                    continue;
+                }
+                string key = seg.Substring(0, eq);
+                string value = seg.Substring(eq + 1);
+                if (value.Length == 0) { sb.Append(key).Append('='); continue; }
+
+                // 值本身太短就别漏光了（<8 位直接全遮）
+                int show = value.Length <= 8 ? 0 : Math.Min(keep, value.Length - 4);
+                sb.Append(key).Append('=')
+                  .Append(show > 0 ? value.Substring(0, show) : "")
+                  .Append("****");
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 把真实 Cookie 写进输入框（脱敏显示），并记下真值。
+        /// 这是**唯一**应该往 <c>CookieImportBox</c> 里回填凭据的入口。
+        /// </summary>
+        private void SetCookieBoxMasked(string real)
+        {
+            try
+            {
+                if (CookieImportBox == null) return;
+                _cookieShownReal = real ?? "";
+                _cookieBoxMasked = !string.IsNullOrEmpty(_cookieShownReal);
+                CookieImportBox.Text = _cookieBoxMasked ? MaskCookie(_cookieShownReal) : "";
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 读输入框里**真正该用的** Cookie 值。
+        ///
+        /// <para>三种情况：① 显示的是我们回填的脱敏串 → 返回真值；
+        /// ② 用户自己改过了（Text 与脱敏串不一致）→ 返回用户敲的内容，并解除脱敏标记；
+        /// ③ 空框 → 空串。</para>
+        ///
+        /// <para>★ 判断"用户改过"用的是与脱敏串逐字比较，而不是"有没有星号" ——
+        /// 用户可能真粘了一串带星号的东西（极少见），用内容比较才不会误判。</para>
+        /// </summary>
+        private string ReadCookieBoxValue()
+        {
+            try
+            {
+                if (CookieImportBox == null) return "";
+                string shown = CookieImportBox.Text ?? "";
+                if (shown.Length == 0) return "";
+
+                if (_cookieBoxMasked)
+                {
+                    string expected = MaskCookie(_cookieShownReal);
+                    if (string.Equals(shown.Trim(), expected.Trim(), StringComparison.Ordinal))
+                        return _cookieShownReal ?? "";   // 没被改过 → 用真值
+
+                    // 用户改过：以他敲的为准，脱敏标记作废
+                    _cookieBoxMasked = false;
+                    _cookieShownReal = null;
+                }
+                return shown.Trim();
+            }
+            catch { return ""; }
+        }
+
+
         /// <summary>
         /// 两个平台各自的 Cookie 输入框草稿（2026-11-02 新增）。
         ///
@@ -13470,7 +14528,7 @@ namespace GeZi
             {
                 if (CookieImportBox == null) return;
                 if (!string.IsNullOrEmpty(fromPlatform))
-                    _cookieDrafts[fromPlatform] = CookieImportBox.Text ?? "";
+                    _cookieDrafts[fromPlatform] = ReadCookieBoxValue();
 
                 string next = "";
                 if (!string.IsNullOrEmpty(toPlatform))
@@ -13486,11 +14544,12 @@ namespace GeZi
                 // 用户实测：「你的两个cookie 都是夸克的，但明明 UC 是粘贴过对应 cookie 的」。
                 if (!string.IsNullOrEmpty(next))
                 {
-                    CookieImportBox.Text = next;
+                    SetCookieBoxMasked(next);
                 }
                 else
                 {
                     // 清空 → 让 RestoreCookieBoxFor 按平台重新从设置里取
+                    SetCookieBoxMasked("");
                     CookieImportBox.Text = "";
                     _cookieDrafts.Remove(toPlatform ?? "");
                     RestoreCookieBoxFor(toPlatform);
@@ -13544,6 +14603,8 @@ namespace GeZi
 
             // 【2026-11-02】切平台后也要重算「清空当前目录」的显隐（UC 没有删除能力）
             UpdateEmptyDirButtonVisibility(ShareMode);
+            // 【2026-11-10】上传按钮同理：按新平台的能力位决定显隐
+            UpdateUploadButtonVisibility();
         }
 
         /// <summary>按 <see cref="_loginPlatform"/> 摆正两个标签的样式与小红点。</summary>
@@ -14303,7 +15364,9 @@ namespace GeZi
             {
                 if (CookieImportBox == null) return;
 
-                string text = CookieImportBox.Text ?? "";
+                // 【2026-11-10】走 ReadCookieBoxValue：框里可能是脱敏串，
+                // 直接读 .Text 会拿一串星号去校验，永远登不上。
+                string text = ReadCookieBoxValue();
                 // 太短的输入（还在敲 key 名）不试，避免每敲一个字就发请求
                 if (text.Length < 80) return;
 
@@ -14338,7 +15401,7 @@ namespace GeZi
 
         private async void OnImportCookie(object sender, RoutedEventArgs e)
         {
-            var cookie = CookieImportBox.Text.Trim();
+            var cookie = ReadCookieBoxValue();
             if (string.IsNullOrEmpty(cookie))
             {
                 Log("请先粘贴 Cookie");
@@ -14400,8 +15463,8 @@ namespace GeZi
                 return;
             }
 
-            // 回填到输入框，让用户看得见到底导入了什么
-            CookieImportBox.Text = cookie;
+            // 回填到输入框（脱敏显示），让用户看得见"导入了哪份"，又不把整串凭据晾在屏幕上
+            SetCookieBoxMasked(cookie);
             int n = cookie.Split(';').Length;
             Log(string.Format("已从文件导入 Cookie（{0}），共 {1} 项。", dlg.FileName, n));
 
@@ -14721,7 +15784,7 @@ namespace GeZi
             if (_client == null)
             {
                 Log("尚未登录，先扫码登录吧");
-                try { Tabs.SelectedIndex = 3; } catch { }
+                try { Tabs.SelectedIndex = TabLogin; } catch { }
                 return;
             }
             long t0 = BusyClock();
@@ -14883,7 +15946,7 @@ namespace GeZi
                 string draft;
                 if (_cookieDrafts.TryGetValue(platformId ?? "", out draft)
                     && !string.IsNullOrEmpty(draft)
-                    && string.Equals(draft, CookieImportBox.Text, StringComparison.Ordinal))
+                    && string.Equals(draft, ReadCookieBoxValue(), StringComparison.Ordinal))
                 {
                     // 框里正是该平台已保存的草稿 → 已经对了，不用动
                     return;
@@ -14904,7 +15967,7 @@ namespace GeZi
                 }
 
                 if (string.IsNullOrEmpty(cookie)) return;
-                CookieImportBox.Text = cookie;
+                SetCookieBoxMasked(cookie);
                 _cookieDrafts[platformId ?? ""] = cookie;
                 // 这是"已经登录过的" Cookie，不该再触发一次自动登录
                 _lastAutoLoginSig = CurrentProviderId() + "|" + cookie;
@@ -15270,19 +16333,23 @@ namespace GeZi
         {
             // 切走「任务」页时顺手退出删除选择模式：否则回来会看到一个还亮着的提示条，
             // 而用户此时并没有在选东西。
-            if (_taskSelectMode && Tabs.SelectedIndex != 1)
+            if (_taskSelectMode && Tabs.SelectedIndex != TabTasks)
                 ExitTaskSelectMode();
 
             // 【2026-10-21】同理：离开下载页就退出多选模式。
             // 否则切到别的页面时提示条不见了、模式却还开着，回来点文件会对不上预期。
-            if (_fileSelectMode && Tabs.SelectedIndex != 0)
+            if (_fileSelectMode && Tabs.SelectedIndex != TabDownload)
                 ExitFileSelectMode(clearSelection: false);
 
             // 【2026-10-21】进入设置页时刷一次「关于与更新」卡片：
             // 启动检查是异步的，可能在用户切过来之后才拿到结果。
-            // Tab 顺序：0 下载 / 1 任务 / 2 设置 / 3 登录
-            if (Tabs.SelectedIndex == 2)
+            // Tab 顺序见文件顶部的 Tab* 常量（2026-11-11 插入「资源」页后不再写死数字）
+            if (Tabs.SelectedIndex == TabSettings)
                 RefreshSettingsUpdateUi();
+
+            // 首次进入「资源」页时初始化（绑定数据源 + 铺演示结果）
+            if (Tabs.SelectedIndex == TabResources)
+                EnsureResourcesPageReady();
 
             if (_syncingNav)
                 return;
@@ -15323,7 +16390,7 @@ namespace GeZi
                 if (d is Button) return;
                 d = System.Windows.Media.VisualTreeHelper.GetParent(d);
             }
-            try { Tabs.SelectedIndex = 3; } catch { }
+            try { Tabs.SelectedIndex = TabLogin; } catch { }
         }
 
         // ============================================================

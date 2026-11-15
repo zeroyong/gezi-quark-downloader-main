@@ -1082,6 +1082,29 @@ namespace GeZi.Core.Api
             return result;
         }
 
+        // ---------------- 上传（2026-11-10 新增）----------------
+
+        /// <summary>
+        /// 上传通道的通用投递口（供 <see cref="Upload.QuarkUploader"/> 回调使用）。
+        ///
+        /// <para>【为什么不让 Uploader 自己 new HttpClient】
+        /// 走这里才能复用本类已经调好的会话：Cookie 域、浏览器头指纹、
+        /// 5xx/408/429 退避重试、以及**服务端 Set-Cookie 的滚动合并**
+        /// （<c>__puus</c> 会随请求更新，自己发请求拿不到这份更新，
+        /// 上传几个文件后就可能变成"未登录"）。</para>
+        ///
+        /// <para>返回已反序列化的响应对象；HTTP 非 2xx 或响应不是 JSON 一律抛
+        /// <see cref="QuarkApiException"/>，与其它接口保持一致。</para>
+        /// </summary>
+        /// <param name="url">完整接口地址。</param>
+        /// <param name="body">请求体（会被序列化成 JSON）。</param>
+        public async Task<Dictionary<string, object>> PostJsonForUploadAsync(string url, object body)
+        {
+            var res = await RequestAsync(HttpMethod.Post, url, null, body)
+                .ConfigureAwait(false);
+            return AsDict(res) ?? new Dictionary<string, object>();
+        }
+
         // ---------------- 删除 / 回收站 / 分享 ----------------
 
         public async Task DeleteAsync(IList<string> fids)
@@ -1142,10 +1165,17 @@ namespace GeZi.Core.Api
             return new QuarkFileEntry
             {
                 Fid = AsString(Get(it, "fid")) ?? "",
-                Name = AsString(Get(it, "file_name")) ?? "",
+                // 网盘返回的 file_name 可能是 HTML 实体（实测 &amp;#39; 这种），
+                // 不解码会让非法字符进入磁盘路径 → 建目录直接失败。见 FileNameSanitizer。
+                Name = FileNameSanitizer.CleanFileName(AsString(Get(it, "file_name")) ?? ""),
                 Size = AsLong(Get(it, "size")),
                 IsDir = AsBool(Get(it, "dir")),
                 Token = share ? (AsString(Get(it, "share_fid_token")) ?? "") : "",
+                // 【2026-11-15】缩略图（图片/视频类文件才有）+ 修改时间（Unix 秒）。
+                // 两个字段都是展示用：缩略图给文件列表左侧，日期给大小旁边那行。
+                // 缺了不影响任何下载逻辑，所以用 Try 取、拿不到就是 null/0。
+                Thumbnail = AsString(Get(it, "thumbnail")),
+                UpdatedAt = GeZi.Core.Models.QuarkFileEntry.ParseUpdatedAt(it),
             };
         }
 
@@ -1158,7 +1188,9 @@ namespace GeZi.Core.Api
             {
                 Fid = AsString(Get(it, "fid")) ?? "",
                 DownloadUrl = AsString(Get(it, "download_url")) ?? "",
-                Name = AsString(Get(it, "file_name")) ?? "",
+                // 网盘返回的 file_name 可能是 HTML 实体（实测 &amp;#39; 这种），
+                // 不解码会让非法字符进入磁盘路径 → 建目录直接失败。见 FileNameSanitizer。
+                Name = FileNameSanitizer.CleanFileName(AsString(Get(it, "file_name")) ?? ""),
                 Size = AsLong(Get(it, "size")),
             };
         }

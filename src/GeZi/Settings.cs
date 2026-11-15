@@ -59,6 +59,12 @@ namespace GeZi
         /// </summary>
         public bool FileSortDescending { get; set; } = true;
 
+        /// <summary>
+        /// 文件列表第二行是否显示修改日期（2026-11-15，用户定稿「有些用户可能不喜欢」
+        /// → 不替所有人独断，默认开）。设置页「个性化」卡片可切，即时刷新当前列表。
+        /// </summary>
+        public bool ShowFileDate { get; set; } = true;
+
         public string OutDir { get; set; } = "";
         public bool AutoClean { get; set; } = true;
 

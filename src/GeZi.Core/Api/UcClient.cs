@@ -140,6 +140,23 @@ namespace GeZi.Core.Api
             return s.Length <= 300 ? s : s.Substring(0, 300) + "…";
         }
 
+        // ==================== 上传（2026-11-10 新增）====================
+
+        /// <summary>
+        /// 上传通道的通用投递口（供 <see cref="Upload.QuarkUploader"/> 回调使用）。
+        ///
+        /// <para>UC 与夸克共用同一套上传协议，只有 apiBase / product / origin 不同。
+        /// 走这里能复用本类的会话（Cookie 域、UC 专属请求头、Set-Cookie 滚动合并）——
+        /// 自己 new HttpClient 会丢掉 <c>__puus</c> 的滚动更新，传几个文件后就可能变成未登录。</para>
+        /// </summary>
+        public async Task<Dictionary<string, object>> PostJsonForUploadAsync(string url, object body)
+        {
+            var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            var json = ser.Serialize(body);
+            var res = await SendAsync(HttpMethod.Post, url, json).ConfigureAwait(false);
+            return res ?? new Dictionary<string, object>();
+        }
+
         private static Dictionary<string, object> AsDict(object o) => o as Dictionary<string, object>;
 
         private static object Get(Dictionary<string, object> d, string key)
@@ -457,10 +474,16 @@ namespace GeZi.Core.Api
                 list.Add(new QuarkFileEntry
                 {
                     Fid = AsString(Get(item, "fid")) ?? "",
-                    Name = AsString(Get(item, "file_name")) ?? "",
+                    // 同上：UC 与夸克同源，file_name 也可能带 HTML 实体
+                    Name = FileNameSanitizer.CleanFileName(AsString(Get(item, "file_name")) ?? ""),
                     Size = AsLong(Get(item, "size")),
                     IsDir = isDir,
                     Token = AsString(Get(item, "share_fid_token")) ?? "",
+                    // 【2026-11-15】与夸克 Normalize 对齐：缩略图 + 修改时间。
+                    // UC 的分享列表字段名与夸克一致；老接口缺字段时拿不到就是 null/0，
+                    // 展示层自然回落（图标 / 不显示日期），不会崩。
+                    Thumbnail = AsString(Get(item, "thumbnail")),
+                    UpdatedAt = GeZi.Core.Models.QuarkFileEntry.ParseUpdatedAt(item),
                 });
             }
             return list;

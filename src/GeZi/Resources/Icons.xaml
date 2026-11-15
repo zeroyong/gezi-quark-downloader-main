@@ -34,10 +34,37 @@
     <!-- 文件 -->
     <Geometry x:Key="IconFile">M6,3.5 H14 L18.5,8 V20.5 H6 Z M14,3.5 V8 H18.5</Geometry>
 
+    <!-- ============================================================
+         文件类型图标 · 符号层（2026-11-15 P0，配合 IconFile 底板使用）
+         来源：「文件预览与图标方案.html」三套风格中的 A 套（描边徽标），
+         颜色由 ShareFileItem.IconBrush 下发，XAML 不写死色值。
+         坐标系 24×24，符号画在中央（8~16.5 一带），行模板里用
+         RenderTransform（scale 0.66 + 平移）落到文档底板的下半区。
+         圆一律用两段 A 弧拼整圆（WPF 没有 SVG 的 ".02 半径闭合"技巧）。
+         ============================================================ -->
+    <Geometry x:Key="FTS_Image">M9,15.5 L11.5,12.5 L13.5,14.9 L14.8,13.3 L16.8,15.5 M15.6,9.7 A0.9,0.9 0 1 0 13.8,9.7 A0.9,0.9 0 1 0 15.6,9.7</Geometry>
+    <Geometry x:Key="FTS_Video">M10.6,9.4 L15.4,12 L10.6,14.6 Z</Geometry>
+    <Geometry x:Key="FTS_Audio">M10.5,15.2 V10.3 L14.5,9.1 V14 M10.5,15.2 A1.1,1.1 0 1 0 8.3,15.2 A1.1,1.1 0 1 0 10.5,15.2 M14.5,14 A1.1,1.1 0 1 0 12.3,14 A1.1,1.1 0 1 0 14.5,14</Geometry>
+    <Geometry x:Key="FTS_Docx">M9,9.5 L10.2,13.7 L12,10.3 L13.8,13.7 L15,9.5</Geometry>
+    <Geometry x:Key="FTS_Xlsx">M9.5,9.5 H14.5 V14.5 H9.5 Z M9.5,12 H14.5 M12,9.5 V14.5</Geometry>
+    <Geometry x:Key="FTS_Pptx">M9.5,14.8 V12.2 M12,14.8 V10.4 M14.5,14.8 V13.2 M8.8,16.4 H15.2</Geometry>
+    <Geometry x:Key="FTS_Pdf">M9,12 Q10.5,10 12,12 Q13.5,14 15,12 M9.5,14.6 H14.5</Geometry>
+    <Geometry x:Key="FTS_Txt">M9,9.8 H15 M9,12.2 H15 M9,14.6 H12.6</Geometry>
+    <Geometry x:Key="FTS_Zip">M12,8.6 V15.2 M10.7,10.4 H13.3 M10.7,12.4 H13.3 M10.7,14.4 H13.3 M11.2,16.4 H12.8 V17.8 H11.2 Z</Geometry>
+    <Geometry x:Key="FTS_Code">M10.6,9.2 L8,12 L10.6,14.8 M13.4,9.2 L16,12 L13.4,14.8</Geometry>
+    <Geometry x:Key="FTS_Exe">M12,8.6 V13.6 M9.8,11.4 L12,13.6 L14.2,11.4 M9.2,16.6 H14.8</Geometry>
+    <Geometry x:Key="FTS_Subtitle">M9,9.6 H15 M9,12 H13.4 M8.6,14.6 H15.4 V16.6 H8.6 Z</Geometry>
+    <Geometry x:Key="FTS_Torrent">M8.6,12 H10.4 M13.6,12 H15.4 M12.2,12 A0.9,0.9 0 1 0 10.4,12 A0.9,0.9 0 1 0 12.2,12 M13.6,12 A0.9,0.9 0 1 0 11.8,12 A0.9,0.9 0 1 0 13.6,12</Geometry>
+    <Geometry x:Key="FTS_Other">M9.5,12 H14.5</Geometry>
+
     <!-- 收藏星标（2026-11-10，解析历史行内「收藏」按钮用）
          五角星：从正上方顶点开始，按 72° 交替取外/内顶点。
          空心描边 = 未收藏；填充 = 已收藏（填充与否由代码控制 Fill/Stroke）。 -->
     <Geometry x:Key="IconStar">M12,3 L14.7,8.6 L20.9,9.5 L16.4,13.8 L17.5,19.9 L12,16.9 L6.5,19.9 L7.6,13.8 L3.1,9.5 L9.3,8.6 Z</Geometry>
+
+    <!-- 上传（2026-11-10，网盘页工具栏「上传」按钮用）
+         箭头朝上 + 底部托盘：与「下载」的箭头朝下形成明确对照。 -->
+    <Geometry x:Key="IconUpload">M12,16 V4 M6,10 L12,4 L18,10 M4,17 V19.5 A1,1 0 0 0 5,20.5 H19 A1,1 0 0 0 20,19.5 V17</Geometry>
 
     <!-- 进度 / 活动 -->
     <Geometry x:Key="IconActivity">M3,12 H7 L9.5,6 L14.5,18 L17,12 H21</Geometry>

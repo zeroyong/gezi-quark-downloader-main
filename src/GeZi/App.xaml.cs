@@ -34,9 +34,14 @@ namespace GeZi
         /// <summary>
         /// 跨进程「请把主窗拉起来」消息号。用 RegisterWindowMessage 注册，
         /// 保证同一台机器上所有 GeZi 实例拿到同一个值（≥0xC000 的区间，不会与系统消息冲突）。
+        ///
+        /// 【2026-11-13】v1 → v2：与 huaotem-bot/GeZi-downloader(v2.4.0) 撞锁。
+        /// 两个项目的互斥名/消息号完全同名（都叫 GeZi_SingleInstance_Mutex_v1 /
+        /// GeZi_Activate_MainWindow_v1），导致对方在运行时我们点开被顶掉、或反之。
+        /// 升到 v2 与对方错开，两程序即可各自独立运行、互不干扰。
         /// </summary>
         internal static readonly int WmActivateMain =
-            NativeMethods.RegisterWindowMessageW("GeZi_Activate_MainWindow_v1");
+            NativeMethods.RegisterWindowMessageW("GeZi_Activate_MainWindow_v2");
 
         /// <summary>主窗口是否已显示过（供第二实例激活逻辑判断）。</summary>
         internal static bool MainShown;
@@ -111,7 +116,7 @@ namespace GeZi
             bool createdNew;
             try
             {
-                _instanceMutex = new Mutex(true, "GeZi_SingleInstance_Mutex_v1", out createdNew);
+                _instanceMutex = new Mutex(true, "GeZi_SingleInstance_Mutex_v2", out createdNew);
             }
             catch
             {

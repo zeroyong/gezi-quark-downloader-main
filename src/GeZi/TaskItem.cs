@@ -291,6 +291,40 @@ namespace GeZi
             }
         }
 
+        // ---- 「已下载大小」显示平滑（2026-11-13，学习 huaotem GeZi-downloader v2.4.0）----
+        // 用户反馈：「主要是下载多少的 大小进度 它是渐变往上加的 我们的比较突兀」。
+        // 真实 Done 是 500ms 一跳（高速时一次跳几 MB），直接显示=数字跳变。
+        // 这里加一层**显示侧缓动**：DisplayDone 每帧向真实 _done 指数收敛，
+        // DoneText 改读它 → 「已下载大小」顺畅往上滚，不动核心逻辑与真实数据。
+        // 由 MainWindow 的光滑定时器(SmoothProgressTimer)逐帧调用 AdvanceDisplay()。
+        public double DisplayDone { get; internal set; } = -1;
+
+        /// <summary>推进显示平滑值向真实值收敛。返回是否还有差距（用于定时器是否继续）。</summary>
+        public bool AdvanceDisplay()
+        {
+            // 首次调用用真实值兜底（防止列表刚出现时从 0 慢慢滚）
+            if (DisplayDone < 0) DisplayDone = _done;
+            double cur = DisplayDone;
+            double target = _done;
+            if (target > cur)
+            {
+                // 指数趋近：一次补上差距的约 55%，帧率越高越贴近。
+                // 帧率约 20Hz（50ms），单次 55% ⇒ 从"落后一截"到基本追上约 100~150ms，
+                // 数字平滑滚动且不觉得滞后。
+                double next = cur + (target - cur) * 0.55;
+                if (next + 1.0 >= target) next = target;   // 差不到 1 字节直接到位
+                DisplayDone = next;
+                OnChanged(nameof(DoneText));
+                return true;
+            }
+            if (Math.Abs(target - cur) > 1.0)
+            {
+                DisplayDone = target;   // 减少（很少发生）：直接落到真实值，不反向滚
+                OnChanged(nameof(DoneText));
+            }
+            return false;
+        }
+
         /// <summary>
         /// 最近一次**进度真的前进**的时刻（UTC）。
         ///
@@ -386,13 +420,21 @@ namespace GeZi
                     return "";
                 if (_speed <= 0)
                     return "…";      // 刚开始还没测出速度
-                return Util.FormatSize((long)_speed) + "/s";
+                return Util.FormatSpeed(_speed);
             }
         }
 
-        public string DoneText => _total > 0
-            ? Util.FormatSize(_done) + " / " + Util.FormatSize(_total)
-            : Util.FormatSize(_done);
+        public string DoneText
+        {
+            get
+            {
+                // 显示读平滑值 DisplayDone（渐变滚动）；未初始化(首次)回落真实 _done，保证老行为等价
+                double shown = DisplayDone >= 0 ? DisplayDone : _done;
+                return _total > 0
+                    ? Util.FormatSize((long)shown) + " / " + Util.FormatSize(_total)
+                    : Util.FormatSize((long)shown);
+            }
+        }
 
         /// <summary>
         /// 预计剩余时间文本（2026-10-20 新增，方案 A 行内内联）。

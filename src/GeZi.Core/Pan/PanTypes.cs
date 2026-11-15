@@ -58,6 +58,15 @@ namespace GeZi.Core.Pan
 
         /// <summary>能把直链导出给外部下载器（aria2 / curl / Motrix）。</summary>
         Export = 1 << 8,
+
+        /// <summary>
+        /// 能把本地文件上传到「我的网盘」（2026-11-10 新增）。
+        ///
+        /// <para>夸克 / UC 支持（两家是同一套 OSS 协议，只有域名与 pr 不同）。
+        /// 上传只在个人盘模式可用，分享浏览页不挂入口 —— 上传必须落在自己的
+        /// 网盘里，不能直接往别人的分享里写。</para>
+        /// </summary>
+        Upload = 1 << 9,
     }
 
     /// <summary>

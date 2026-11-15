@@ -11,7 +11,10 @@
         TextOptions.TextFormattingMode="Display"
         UseLayoutRounding="True"
         PreviewKeyDown="OnShortcutKeyDown"
-        Closing="OnWindowClosing">
+        Closing="OnWindowClosing"
+        AllowDrop="True"
+        DragOver="OnWindowDragOver"
+        Drop="OnWindowDrop">
 
     <!-- 自绘标题栏：去掉系统边框，改用 WindowChrome 保留拖拽/贴边/双击最大化/系统菜单 -->
     <shell:WindowChrome.WindowChrome>
@@ -184,16 +187,23 @@
                             </ListBoxItem>
                             <ListBoxItem>
                                 <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconSettings}"
+                                    <Path Data="{StaticResource IconUser}"
                                           Style="{StaticResource NavItemIcon}"/>
-                                    <TextBlock Text="设置" Style="{StaticResource NavItemText}"/>
+                                    <TextBlock Text="登录" Style="{StaticResource NavItemText}"/>
                                 </StackPanel>
                             </ListBoxItem>
                             <ListBoxItem>
                                 <StackPanel Orientation="Horizontal">
-                                    <Path Data="{StaticResource IconUser}"
+                                    <Path Data="{StaticResource IconSearch}"
                                           Style="{StaticResource NavItemIcon}"/>
-                                    <TextBlock Text="登录" Style="{StaticResource NavItemText}"/>
+                                    <TextBlock Text="资源" Style="{StaticResource NavItemText}"/>
+                                </StackPanel>
+                            </ListBoxItem>
+                            <ListBoxItem>
+                                <StackPanel Orientation="Horizontal">
+                                    <Path Data="{StaticResource IconSettings}"
+                                          Style="{StaticResource NavItemIcon}"/>
+                                    <TextBlock Text="设置" Style="{StaticResource NavItemText}"/>
                                 </StackPanel>
                             </ListBoxItem>
                         </ListBox>
@@ -669,6 +679,24 @@
                                                        Margin="6,0,0,0" VerticalAlignment="Center"/>
                                         </StackPanel>
                                     </Button>
+                                    <!-- 【2026-11-10 新增】上传文件到我自己的网盘。
+                                         只在「我的网盘」模式下可见（分享模式不能写别人的目录），
+                                         由 UpdateUploadButtonVisibility 按 ShareMode 与能力位控制。
+                                         放在「刷新」左边：读文件 → 传文件 → 看结果，顺序自然。 -->
+                                    <Button x:Name="DriveUploadBtn" Click="OnUploadClick"
+                                            Style="{StaticResource ToolButton}"
+                                            Visibility="Collapsed"
+                                            ToolTip="上传本地文件到当前目录（可多选；网盘已有相同内容时自动秒传）">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Path Data="{StaticResource IconUpload}" Stretch="Uniform"
+                                                  Width="13" Height="13" VerticalAlignment="Center"
+                                                  Stroke="{DynamicResource TextSecondaryBrush}"
+                                                  StrokeThickness="2"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                  StrokeLineJoin="Round"/>
+                                            <TextBlock Text="上传" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
                                     <Button x:Name="DriveRefreshBtn" Click="OnRefresh"
                                             Style="{StaticResource ToolButton}">
                                         <StackPanel Orientation="Horizontal">
@@ -734,7 +762,7 @@
                                             <TextBlock Text="多选模式" Margin="8,0,0,0" FontWeight="SemiBold"
                                                        Foreground="{DynamicResource PrimaryBrush}"
                                                        VerticalAlignment="Center"/>
-                                            <TextBlock Text="点文件 = 加选 / 取消 · 文件夹不再进入目录"
+                                            <TextBlock Text="点文件 = 加选 / 取消 · Alt+点击 = 连选一段 · 文件夹不再进入目录"
                                                        Margin="10,0,0,0" FontSize="11.5"
                                                        Foreground="{DynamicResource TextSecondaryBrush}"
                                                        VerticalAlignment="Center"/>
@@ -785,40 +813,165 @@
                                             </ContextMenu>
                                         </ListBox.ContextMenu>
                                         <ListBox.ItemTemplate>
+                                            <!-- 【2026-11-15 P0 重排】行内布局改成两行式（用户定稿）：
+                                                 ① 左侧：图片/视频文件直接渲染网盘缩略图（ShareFileItem.Thumbnail，
+                                                    拉到前 / 拉失败显示类型图标）；非图片按扩展名显示类型图标
+                                                    （IconFile 底板 + FTS_* 符号，颜色走 IconBrush）；
+                                                    文件夹沿用黄色 IconFolder。
+                                                 ② 中间：第一行文件名，第二行「大小 + 修改日期」
+                                                    （用户原话「下方可以展示对于大小和 日期」）。
+                                                 ③ 右侧：大小列（2026-11-15 晚间定稿：P0 首版的「···」按钮
+                                                    经用户实测「眼睛好累」已整体下线，操作走右键菜单）。 -->
                                             <DataTemplate>
-                                                <Grid>
+                                                <Grid Height="44">
                                                     <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="Auto"/>
+                                                        <!-- 固定 44 = 缩略图 34 + 边距 10；图标分支 26+18 也落在这格内，
+                                                             保证有/无缩略图的行名称起点对齐 -->
+                                                        <ColumnDefinition Width="44"/>
                                                         <ColumnDefinition Width="*"/>
                                                         <ColumnDefinition Width="Auto"/>
                                                     </Grid.ColumnDefinitions>
-                                                    <!-- 目录/文件图标 -->
-                                                    <Path Grid.Column="0" Stretch="Uniform" Width="16" Height="16"
-                                                          VerticalAlignment="Center" Margin="0,0,10,0"
-                                                          StrokeThickness="1.8"
-                                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
-                                                          StrokeLineJoin="Round">
-                                                        <Path.Style>
-                                                            <Style TargetType="Path">
-                                                                <Setter Property="Data"
-                                                                        Value="{StaticResource IconFile}"/>
-                                                                <Setter Property="Stroke"
-                                                                        Value="{DynamicResource TextTertiaryBrush}"/>
+
+                                                    <!-- 缩略图（拉到后顶掉类型图标）：
+                                                         默认可见，HasThumbnail=false（还没拉到/拉失败）时隐藏。
+                                                         【2026-11-15 用户反馈】列表缩略图也要圆角美化 ——
+                                                         固定 34×34，Clip 直接写死 8px 圆角矩形。 -->
+                                                    <Image Grid.Column="0" Source="{Binding Thumbnail}"
+                                                           Width="34" Height="34" VerticalAlignment="Center"
+                                                           HorizontalAlignment="Left" Margin="0,0,10,0" Stretch="UniformToFill">
+                                                        <Image.Clip>
+                                                            <RectangleGeometry Rect="0,0,34,34" RadiusX="8" RadiusY="8"/>
+                                                        </Image.Clip>
+                                                        <Image.Style>
+                                                            <Style TargetType="Image">
+                                                                <Setter Property="Visibility" Value="Visible"/>
                                                                 <Style.Triggers>
-                                                                    <DataTrigger Binding="{Binding IsDir}" Value="True">
-                                                                        <Setter Property="Data"
-                                                                                Value="{StaticResource IconFolder}"/>
-                                                                        <Setter Property="Stroke"
-                                                                                Value="{DynamicResource WarningBrush}"/>
+                                                                    <DataTrigger Binding="{Binding HasThumbnail}" Value="False">
+                                                                        <Setter Property="Visibility" Value="Collapsed"/>
                                                                     </DataTrigger>
                                                                 </Style.Triggers>
                                                             </Style>
-                                                        </Path.Style>
-                                                    </Path>
-                                                    <TextBlock Grid.Column="1" Text="{Binding Name}"
-                                                               TextTrimming="CharacterEllipsis"
-                                                               VerticalAlignment="Center" Margin="0,0,16,0"
-                                                               Style="{StaticResource BodyText}"/>
+                                                        </Image.Style>
+                                                    </Image>
+
+                                                    <!-- 类型图标 / 文件夹图标（缩略图就位后整组让位） -->
+                                                    <Grid Grid.Column="0" Width="26" Height="26"
+                                                          VerticalAlignment="Center" HorizontalAlignment="Left"
+                                                          Margin="4,0,14,0">
+                                                        <Grid.Style>
+                                                            <Style TargetType="Grid">
+                                                                <Setter Property="Visibility" Value="Visible"/>
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding HasThumbnail}" Value="True">
+                                                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </Grid.Style>
+                                                        <Path Stretch="Uniform" Width="24" Height="24"
+                                                              StrokeThickness="1.8"
+                                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round">
+                                                            <Path.Style>
+                                                                <Style TargetType="Path">
+                                                                    <Setter Property="Data" Value="{StaticResource IconFile}"/>
+                                                                    <Setter Property="Stroke" Value="{Binding IconBrush}"/>
+                                                                    <Style.Triggers>
+                                                                        <DataTrigger Binding="{Binding IsDir}" Value="True">
+                                                                            <Setter Property="Data" Value="{StaticResource IconFolder}"/>
+                                                                            <Setter Property="Stroke" Value="{DynamicResource WarningBrush}"/>
+                                                                        </DataTrigger>
+                                                                    </Style.Triggers>
+                                                                </Style>
+                                                            </Path.Style>
+                                                        </Path>
+                                                        <!-- 符号层：按 IconKey 切形状；文件夹不画符号。
+                                                             RenderTransform 把中央符号压到底板下半区（scale .66）。 -->
+                                                        <Path Stretch="Uniform" Width="24" Height="24"
+                                                              StrokeThickness="2.4"
+                                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"
+                                                              Stroke="{Binding IconBrush}">
+                                                            <Path.RenderTransform>
+                                                                <MatrixTransform Matrix="0.66,0,0,0.66,4.08,7.18"/>
+                                                            </Path.RenderTransform>
+                                                            <Path.Style>
+                                                                <Style TargetType="Path">
+                                                                    <Setter Property="Data" Value="{StaticResource FTS_Other}"/>
+                                                                    <Style.Triggers>
+                                                                        <DataTrigger Binding="{Binding IsDir}" Value="True">
+                                                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="image">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Image}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="video">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Video}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="audio">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Audio}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="docx">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Docx}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="xlsx">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Xlsx}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="pptx">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Pptx}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="pdf">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Pdf}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="txt">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Txt}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="zip">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Zip}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="code">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Code}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="exe">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Exe}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="subtitle">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Subtitle}"/>
+                                                                        </DataTrigger>
+                                                                        <DataTrigger Binding="{Binding IconKey}" Value="torrent">
+                                                                            <Setter Property="Data" Value="{StaticResource FTS_Torrent}"/>
+                                                                        </DataTrigger>
+                                                                    </Style.Triggers>
+                                                                </Style>
+                                                            </Path.Style>
+                                                        </Path>
+                                                    </Grid>
+
+                                                    <!-- 名称 + 第二行（日期，2026-11-15 晚间定稿：
+                                                         「大小 还是移到右侧吧 去掉三个点 不然看起来眼睛好累」——
+                                                         第二行只留淡色日期，HasDate=false（开关关/接口没给）整行藏起） -->
+                                                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,12,0">
+                                                        <TextBlock Text="{Binding Name}"
+                                                                   TextTrimming="CharacterEllipsis"
+                                                                   Style="{StaticResource BodyText}"/>
+                                                        <TextBlock Text="{Binding DateLine}"
+                                                                   Margin="0,1,0,0"
+                                                                   FontSize="11.5">
+                                                            <TextBlock.Style>
+                                                                <Style TargetType="TextBlock" BasedOn="{StaticResource TertiaryText}">
+                                                                    <Setter Property="Visibility" Value="Visible"/>
+                                                                    <Style.Triggers>
+                                                                        <DataTrigger Binding="{Binding HasDate}" Value="False">
+                                                                            <Setter Property="Visibility" Value="Collapsed"/>
+                                                                        </DataTrigger>
+                                                                    </Style.Triggers>
+                                                                </Style>
+                                                            </TextBlock.Style>
+                                                        </TextBlock>
+                                                    </StackPanel>
+
+                                                    <!-- 大小列：回到右侧（文件夹显示后台递归大小），
+                                                         原「···」按钮按用户反馈删除（操作走右键菜单） -->
                                                     <TextBlock Grid.Column="2" Text="{Binding SizeText}"
                                                                VerticalAlignment="Center"
                                                                Style="{StaticResource TertiaryText}"/>
@@ -1927,6 +2080,731 @@
                     </Grid>
                 </TabItem>
 
+                <!-- ============ 登录 ============ -->
+                <TabItem Style="{StaticResource HeadlessTabItem}">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0">
+                        <!-- 【2026-11-02 UC 全宽】这里必须是 StackPanel（垂直堆叠语义），
+                             不能换成 Grid —— Grid 不加 RowDefinitions 时所有子元素
+                             默认挤在 Row0/Column0 **全部重叠**，布局会彻底错乱。
+                             （我改过一次 Grid 忘了加 Row，实测就是这个后果。）
+                             原来限制宽度的是 MaxWidth="960" + HorizontalAlignment="Left"，
+                             现在把这两个挪到 code-behind 的 ApplyLoginLayout 里动态控制：
+                             · 夸克模式：MaxWidth=960 + Left（保持原样）
+                             · UC 全宽：MaxWidth=∞ + Stretch（撑满） -->
+                        <StackPanel x:Name="LoginPageRoot" Margin="20,18,20,24"
+                                    MaxWidth="960" HorizontalAlignment="Left">
+
+                            <TextBlock Text="登录" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
+                            <TextBlock Text="登录后可浏览「我的网盘」、转存分享文件；不登录也能用直链下载"
+                                       Style="{StaticResource TertiaryText}" Margin="0,0,0,18"/>
+
+                            <!-- ============ 【2026-11-02 新增】平台切换（方案 C）============
+                                 2.9.0 加入 UC 网盘后，登录页要能区分"现在登录的是哪个平台"。
+                                 做成两段式切换而不是并排双卡：
+                                   · 两个平台的操作完全一样（都是扫码/WebView 取 Cookie），
+                                     并排会重复一整套界面；
+                                   · 切换后下方的扫码卡与账号列表整体替换，语义更清晰。
+                                 选中态用 PrimaryLight 底 + Primary 描边，与全局强调色一致。 -->
+                            <Border Style="{StaticResource Card}" Padding="6" Margin="0,0,0,14"
+                                    HorizontalAlignment="Left">
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="PlatformQuarkBtn" Click="OnPlatformSwitch"
+                                            Tag="quark" Style="{StaticResource PlatformTabOn}">
+                                        <TextBlock Text="夸克网盘" FontSize="13" FontWeight="SemiBold"/>
+                                    </Button>
+                                    <Button x:Name="PlatformUcBtn" Click="OnPlatformSwitch"
+                                            Tag="uc" Style="{StaticResource PlatformTabOff}" Margin="4,0,0,0">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="UC 网盘" FontSize="13" FontWeight="SemiBold"/>
+                                            <!-- 未登录时的小红点：让用户一眼看到"还有个平台没登录" -->
+                                            <Border x:Name="UcUnreadDot" Width="6" Height="6"
+                                                    CornerRadius="3" Margin="6,0,0,0"
+                                                    VerticalAlignment="Center"
+                                                    Background="{DynamicResource DangerBrush}"/>
+                                        </StackPanel>
+                                    </Button>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- 左右分栏：左=扫码（主操作，视觉最重），右=状态/导入导出/账号管理
+                                 之前是单列 640 宽，屏幕大时右侧大片空白，内容全挤在左边。
+
+                                 【2026-11-02 定稿】UC 与夸克同构，都是扫码 + Cookie 导入，
+                                 不再有内嵌浏览器，两栏布局对两个平台都适用。 -->
+                            <Grid x:Name="LoginColumns">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+
+                                <!-- ============ 左列：扫码登录 ============
+                                     用 Grid 三行（标题 Auto / 二维码 * / 按钮+状态 Auto），
+                                     整卡 VerticalAlignment=Stretch 与右列等高；
+                                     二维码行用 * 吸收多余高度并垂直居中 —— 这样无论
+                                     登录前后、窗口多大，左右两列外轮廓都是同一个矩形。 -->
+                                <Border x:Name="LoginLeftCard" Grid.Column="0" Style="{StaticResource PrimaryCard}"
+                                        Width="304" VerticalAlignment="Stretch">
+                                    <Grid>
+                                        <!-- 【2026-11-02】两套互斥内容：
+                                             UcQrArea        = 扫码/登录区（未登录，或平台是夸克）
+                                             UcLoggedInPanel = 已登录的账号信息（仅 UC 登录后显示）
+                                             code-behind 的 ShowUcLoggedInPanel() 负责切换。 -->
+                                        <Grid x:Name="UcQrArea">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="*"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+
+                                        <StackPanel Grid.Row="0">
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                                <Path x:Name="LoginCardIcon" Data="{StaticResource IconQr}" Stretch="Uniform"
+                                                      Width="16" Height="16" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource PrimaryBrush}"
+                                                      StrokeThickness="1.8"
+                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                                <TextBlock x:Name="LoginCardTitle" Text="扫码登录"
+                                                           Style="{StaticResource CardTitleText}"
+                                                           Margin="7,0,0,0" FontSize="15"/>
+                                            </StackPanel>
+                                            <TextBlock x:Name="QrHintText"
+                                                       Text="用手机「夸克 App」扫描二维码并在手机上确认"
+                                                       Style="{StaticResource TertiaryText}"
+                                                       TextWrapping="Wrap" Margin="0,0,0,14"/>
+                                        </StackPanel>
+
+                                        <!-- 二维码 / UC 登录页区
+                                             【2026-11-02】UC 模式下这块要撑满卡片剩余高度，
+                                             不再固定 264px（用户反馈"那么小个窗口看起来很难受"）。
+                                             夸克模式仍按 264 高度居中显示二维码，由 code-behind 切高度。 -->
+                                        <Grid x:Name="QrOrWebArea" Grid.Row="1" Height="264" Margin="0,0,0,14"
+                                              VerticalAlignment="Center">
+                                            <!-- ⚠️ Background="White" 是**故意硬编码**的，不要改成 DynamicResource：
+                                                 二维码必须是"深色模块 + 白色静默区"才能被手机扫出来。
+                                                 深色主题下若跟着变深，扫码会直接失败（不是审美问题）。
+                                                 容器保持纯白 + 一圈描边，在深色界面上反而更醒目、
+                                                 等于给二维码加了个"白卡底座"。 -->
+                                            <Border x:Name="QrImageBox" Width="264" Height="264"
+                                                    Background="White"
+                                                    BorderBrush="{DynamicResource BorderBrushStrong}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="10" Padding="8"
+                                                    Visibility="Collapsed">
+                                                <Image x:Name="QrImage" Stretch="Uniform"
+                                                       RenderOptions.BitmapScalingMode="NearestNeighbor"/>
+                                            </Border>
+                                            <Border x:Name="QrPlaceholderBox"
+                                                    Background="{DynamicResource SurfaceSunkenBrush}"
+                                                    BorderBrush="{DynamicResource BorderBrushSoft}"
+                                                    BorderThickness="1" CornerRadius="10">
+                                                <StackPanel HorizontalAlignment="Center"
+                                                            VerticalAlignment="Center">
+                                                    <Path Data="{StaticResource IconQr}" Stretch="Uniform"
+                                                          Width="42" Height="42"
+                                                          HorizontalAlignment="Center"
+                                                          Stroke="{DynamicResource BorderBrushStrong}"
+                                                          StrokeThickness="1.4"
+                                                          StrokeStartLineCap="Round"
+                                                          StrokeEndLineCap="Round"/>
+                                                    <TextBlock Text="点下方按钮获取二维码"
+                                                               Margin="0,10,0,0"
+                                                               HorizontalAlignment="Center"
+                                                               Foreground="{DynamicResource TextTertiaryBrush}"
+                                                               FontSize="11.5"/>
+                                                </StackPanel>
+                                            </Border>
+
+                                        </Grid>
+
+                                        <!-- 按钮 + 状态：
+                                             ⚠️ 这里必须是**两行 Grid**，不能把按钮与状态框
+                                             直接叠在同一个 Grid 里 —— 叠放时 QrStatusBox 会
+                                             压在按钮上（用户反馈「提示遮住了按钮，上方明明有空位」）。
+                                             Row0=按钮（Auto）、Row1=状态框（Auto），
+                                             状态框自然落在按钮下方，上方二维码区的空位也吃得到。 -->
+                                        <Grid Grid.Row="2">
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto"/>
+                                                <RowDefinition Height="Auto"/>
+                                            </Grid.RowDefinitions>
+
+                                            <StackPanel Grid.Row="0" Orientation="Horizontal">
+                                                <Button x:Name="QrLoginBtn" Click="OnQrLogin"
+                                                        Style="{StaticResource PrimaryButton}">
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <Path Data="{StaticResource IconQr}"
+                                                              Stretch="Uniform"
+                                                              Width="14" Height="14"
+                                                              VerticalAlignment="Center"
+                                                              Stroke="{DynamicResource TextOnPrimaryBrush}"
+                                                              StrokeThickness="1.8"
+                                                              StrokeStartLineCap="Round"
+                                                              StrokeEndLineCap="Round"/>
+                                                        <TextBlock x:Name="QrLoginBtnText" Text="获取二维码" Margin="7,0,0,0"
+                                                                   VerticalAlignment="Center"/>
+                                                    </StackPanel>
+                                                </Button>
+                                                <!-- 【2026-10-03】原来这里还有一个「刷新二维码」按钮，
+                                                     用户反馈「这里刷新二维码的按键多余了」——
+                                                     确实多余：它和「获取二维码」绑的是**同一个处理函数**
+                                                     （都是 OnQrLogin），点哪个都是重新取一张。
+                                                     现在只留一个按钮，二维码过期时提示用户再点一次即可。 -->
+                                            </StackPanel>
+
+                                            <!-- 状态提示：随扫码进度实时变化（等待扫码 → 已扫码待确认 → 成功/过期）
+                                                 ⚠️ 图标/颜色都由 code-behind 的 SetQrStatus() 按语义给：
+                                                 「等待扫码」是正常流程，配黄三角会让用户以为坏了。
+                                                 进行中=中性信息图标，成功=绿对勾，失败/过期=红叉。 -->
+                                            <Border x:Name="QrStatusBox" Grid.Row="1"
+                                                    Margin="0,12,0,0"
+                                                    Padding="12,10"
+                                                    CornerRadius="10" Visibility="Collapsed"
+                                                    Background="{DynamicResource SurfaceSunkenBrush}">
+                                                <StackPanel Orientation="Horizontal">
+                                                    <Path x:Name="QrStatusIcon"
+                                                          Data="{StaticResource IconClock}"
+                                                          Stretch="Uniform" Width="15" Height="15"
+                                                          VerticalAlignment="Center" Margin="0,0,8,0"
+                                                          Stroke="{DynamicResource TextSecondaryBrush}"
+                                                          StrokeThickness="1.8"
+                                                          StrokeStartLineCap="Round"
+                                                          StrokeEndLineCap="Round"
+                                                          StrokeLineJoin="Round"/>
+                                                    <TextBlock x:Name="QrStatusText" Text=""
+                                                               TextWrapping="Wrap"
+                                                               Style="{StaticResource SecondaryText}"
+                                                               VerticalAlignment="Center"/>
+                                                </StackPanel>
+                                            </Border>
+                                        </Grid>
+                                        </Grid>
+                                        <!-- /UcQrArea -->
+
+                                        <!-- ============ 【2026-11-02】UC 已登录：账号信息 ============
+                                             用户要求：「登录成功后 再切换成现在布局 并且展示用户的信息」。
+                                             登录后二维码已无用，这块替换掉整个扫码区（默认折叠，
+                                             由 code-behind 的 ShowUcLoggedInPanel 切换显示）。 -->
+                                        <StackPanel x:Name="UcLoggedInPanel" Visibility="Collapsed">
+                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                                                <Path Data="{StaticResource IconUser}" Stretch="Uniform"
+                                                      Width="16" Height="16" VerticalAlignment="Center"
+                                                      Stroke="{DynamicResource SuccessBrush}"
+                                                      StrokeThickness="1.8"
+                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                                <TextBlock Text="已登录"
+                                                           Style="{StaticResource CardTitleText}"
+                                                           Margin="7,0,0,0" FontSize="15"
+                                                           Foreground="{DynamicResource SuccessBrush}"/>
+                                            </StackPanel>
+
+                                            <!-- 头像 + 昵称 -->
+                                            <Grid Margin="0,0,0,18">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Border x:Name="UcAvatarBox" Grid.Column="0"
+                                                        Width="52" Height="52" CornerRadius="26"
+                                                        Background="{DynamicResource PrimaryBrush}"
+                                                        VerticalAlignment="Center">
+                                                    <Grid>
+                                                        <TextBlock x:Name="UcAvatarText" Text="U"
+                                                                   FontSize="20" FontWeight="SemiBold"
+                                                                   Foreground="{DynamicResource TextOnPrimaryBrush}"
+                                                                   HorizontalAlignment="Center"
+                                                                   VerticalAlignment="Center"/>
+                                                        <Image x:Name="UcAvatarImage" Stretch="UniformToFill"
+                                                               Visibility="Collapsed">
+                                                            <Image.Clip>
+                                                                <EllipseGeometry Center="26,26" RadiusX="26" RadiusY="26"/>
+                                                            </Image.Clip>
+                                                        </Image>
+                                                    </Grid>
+                                                </Border>
+                                                <StackPanel Grid.Column="1" Margin="12,0,0,0"
+                                                            VerticalAlignment="Center">
+                                                    <TextBlock x:Name="UcNickText" Text="UC 用户"
+                                                               FontSize="15" FontWeight="SemiBold"
+                                                               TextTrimming="CharacterEllipsis"
+                                                               Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                                    <TextBlock Text="UC 网盘"
+                                                               FontSize="11.5" Margin="0,3,0,0"
+                                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                                </StackPanel>
+                                            </Grid>
+
+                                            <!-- 容量 -->
+                                            <TextBlock Text="存储空间" FontSize="11.5"
+                                                       Margin="0,0,0,7"
+                                                       Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                            <ProgressBar x:Name="UcCapacityBar" Height="6"
+                                                         Minimum="0" Maximum="100" Value="0"
+                                                         BorderThickness="0"
+                                                         Background="{DynamicResource SurfaceSunkenBrush}"
+                                                         Foreground="{DynamicResource SuccessBrush}"/>
+                                            <TextBlock x:Name="UcCapacityText" Text="容量未知"
+                                                       FontSize="12" Margin="0,7,0,0"
+                                                       Foreground="{DynamicResource TextSecondaryBrush}"/>
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+
+                                <!-- ============ 右列：状态 / 导入导出 / 账号管理 / 提示 ============
+                                     三行：状态 Auto / 导入 Cookie Auto / 小贴士 *。
+                                     最后一行用 * 吸收剩余高度，右列上下沿与左列严格对齐。 -->
+                                <Grid x:Name="LoginRightColumn" Grid.Column="1" Margin="16,0,0,0">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="*"/>
+                                    </Grid.RowDefinitions>
+
+                                    <!-- 当前登录状态 -->
+                                    <Border Grid.Row="0" Style="{StaticResource Card}"
+                                            Margin="0,0,0,14">
+                                        <StackPanel>
+                                            <TextBlock Text="当前状态" Style="{StaticResource CardTitleText}"
+                                                       Margin="0,0,0,10"/>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                </Grid.ColumnDefinitions>
+                                                <Border x:Name="LoginAvatarBox" Grid.Column="0"
+                                                        Style="{StaticResource AvatarBorder}"
+                                                        VerticalAlignment="Center">
+                                                    <Grid>
+                                                        <TextBlock x:Name="LoginAvatarText" Text="?"
+                                                                   FontSize="14" FontWeight="SemiBold"
+                                                                   Foreground="{DynamicResource TextOnPrimaryBrush}"
+                                                                   HorizontalAlignment="Center"
+                                                                   VerticalAlignment="Center"/>
+                                                        <Image x:Name="LoginAvatarImage" Stretch="UniformToFill"
+                                                               Visibility="Collapsed">
+                                                            <Image.Clip>
+                                                                <EllipseGeometry Center="17,17" RadiusX="17" RadiusY="17"/>
+                                                            </Image.Clip>
+                                                        </Image>
+                                                    </Grid>
+                                                </Border>
+                                                <StackPanel Grid.Column="1" Margin="10,0,0,0"
+                                                            VerticalAlignment="Center">
+                                                    <TextBlock x:Name="LoginWhoText" Text="未登录"
+                                                               FontSize="13.5" FontWeight="SemiBold"
+                                                               Foreground="{DynamicResource TextPrimaryBrush}"
+                                                               TextTrimming="CharacterEllipsis"/>
+                                                    <TextBlock x:Name="LoginSubText"
+                                                               Text="扫码或导入 Cookie 即可登录"
+                                                               FontSize="11" Margin="0,2,0,0"
+                                                               Foreground="{DynamicResource TextTertiaryBrush}"
+                                                               TextWrapping="Wrap"/>
+                                                </StackPanel>
+                                            </Grid>
+
+                                            <StackPanel x:Name="LoginActionRow" Orientation="Horizontal"
+                                                        Margin="0,14,0,0">
+                                                <Button x:Name="LoginBtn" Content="登录" Click="OnLoginClick"
+                                                        Style="{StaticResource SecondaryButton}"
+                                                        Margin="0,0,8,0"/>
+                                                <Button x:Name="AccountsBtn" Content="切换账号"
+                                                        Click="OnOpenAccounts"
+                                                        Style="{StaticResource SecondaryButton}"
+                                                        Visibility="Collapsed"/>
+                                                <!-- 【2026-10-03】「登出」按钮按用户要求删除（觉得多余）。
+                                                     退出登录的能力没丢：挪进了「切换账号」窗口里，
+                                                     那里才是账号管理的地方。 -->
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- 导入 Cookie -->
+                                    <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,0,0,14">
+                                        <StackPanel>
+                                            <TextBlock Text="导入 Cookie" Style="{StaticResource CardTitleText}"
+                                                       Margin="0,0,0,6"/>
+                                            <TextBlock Text="扫码不方便时，可从浏览器复制网盘 Cookie 直接粘贴，粘贴后会自动登录；也可以从 Cookie 文件导入。"
+                                                       Style="{StaticResource TertiaryText}"
+                                                       TextWrapping="Wrap" Margin="0,0,0,10"/>
+                                            <!-- 【2026-11-02 用户要求】「我是粘贴在输入框里的 应该检测到内容 就自动获取」。
+                                                 TextChanged 里做防抖检测：识别到完整 Cookie（含 __pus 与 __puus）就自动校验登录，
+                                                 不必再手点「导入并登录」。按钮保留作手动兜底与重试入口。 -->
+                                            <TextBox x:Name="CookieImportBox" Height="72"
+                                                     TextChanged="OnCookieImportTextChanged"
+                                                     Style="{StaticResource AppTextBoxMultiline}"/>
+                                            <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                                                <Button x:Name="ImportCookieBtn" Content="导入并登录"
+                                                        Click="OnImportCookie"
+                                                        Style="{StaticResource PrimaryButton}"
+                                                        Margin="0,0,8,0"/>
+                                                <!-- 【2026-10-03 新增】从文件导入 Cookie（用户反馈缺这个入口）。
+                                                     支持 .txt（原始 Cookie 串）与 .json（浏览器扩展导出的格式）。 -->
+                                                <Button x:Name="ImportCookieFileBtn" Click="OnImportCookieFile"
+                                                        Style="{StaticResource SecondaryButton}"
+                                                        Margin="0,0,8,0"
+                                                        ToolTip="从文件读取 Cookie 并直接登录。&#10;支持 .txt（原始 Cookie 串）和 .json（浏览器扩展导出）。">
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <Path Data="{StaticResource IconFolder}"
+                                                              Stretch="Uniform" Width="14" Height="14"
+                                                              VerticalAlignment="Center"
+                                                              Stroke="{DynamicResource TextSecondaryBrush}"
+                                                              StrokeThickness="1.8"
+                                                              StrokeStartLineCap="Round"
+                                                              StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"/>
+                                                        <TextBlock Text="从文件导入"
+                                                                   Margin="7,0,0,0"
+                                                                   VerticalAlignment="Center"/>
+                                                    </StackPanel>
+                                                </Button>
+                                                <!-- 【2026-10-03 改】原来是「复制当前 Cookie」→ 只往剪贴板塞。
+                                                     用户要求「无论是导出直链还是导出 cookie 都不要复制到
+                                                     粘贴板上」，所以改成**写文件**，按钮文案与图标同步改。 -->
+                                                <Button x:Name="ExportCookieBtn" Click="OnExportCookie"
+                                                        Style="{StaticResource SecondaryButton}"
+                                                        ToolTip="把当前登录 Cookie 导出成桌面上的 txt 文件（不占用剪贴板）。">
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <Path Data="{StaticResource IconFile}"
+                                                              Stretch="Uniform" Width="14" Height="14"
+                                                              VerticalAlignment="Center"
+                                                              Stroke="{DynamicResource TextSecondaryBrush}"
+                                                              StrokeThickness="1.8"
+                                                              StrokeStartLineCap="Round"
+                                                              StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"/>
+                                                        <TextBlock Text="导出 Cookie 文件"
+                                                                   Margin="7,0,0,0"
+                                                                   VerticalAlignment="Center"/>
+                                                    </StackPanel>
+                                                </Button>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- 小贴士：填满右列剩余高度（Grid.Row=2 是 * 行），
+                                         让右列底沿与左列严格平齐，也让新用户少踩坑 -->
+                                    <Border Grid.Row="2" Style="{StaticResource InfoBanner}"
+                                            VerticalAlignment="Stretch">
+                                      <Grid>
+                                        <!-- 装饰层：小贴士的文字只占左边一小块，右侧一大片空着
+                                             （用户反馈「这个地方感觉右边也有点太空了」）。
+                                             点缀几颗星星填充右侧，画在文字**之前**（在下层），
+                                             不吃点击、透明度压低，不与正文抢注意力。 -->
+                                        <Grid IsHitTestVisible="False">
+                                            <Path Data="{StaticResource IconSparkle}"
+                                                  Fill="{DynamicResource PrimaryBrush}"
+                                                  Opacity="0.62"
+                                                  Width="30" Height="30" Stretch="Uniform"
+                                                  HorizontalAlignment="Right" VerticalAlignment="Center"
+                                                  Margin="0,0,18,0"/>
+                                            <Path Data="{StaticResource IconSparkle}"
+                                                  Fill="{DynamicResource PrimaryBrush}"
+                                                  Opacity="0.46"
+                                                  Width="16" Height="16" Stretch="Uniform"
+                                                  HorizontalAlignment="Right" VerticalAlignment="Top"
+                                                  Margin="0,14,60,0"/>
+                                            <Path Data="{StaticResource IconSparkle}"
+                                                  Fill="{DynamicResource PrimaryBrush}"
+                                                  Opacity="0.36"
+                                                  Width="11" Height="11" Stretch="Uniform"
+                                                  HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                                                  Margin="0,0,16,18"/>
+                                        </Grid>
+                                        <StackPanel>
+                                            <TextBlock Text="小贴士" FontSize="12" FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource PrimaryBrush}"
+                                                       Margin="0,0,0,6"/>
+                                            <TextBlock Style="{StaticResource ProseText}"
+                                                       Text="· 登录信息经系统加密后存在本地配置里，不会上传到任何服务器。"/>
+                                            <!-- 【2026-10-03 再改】上一版写的是
+                                                 「登录状态过期时不用重新扫码，再点一次「获取二维码」即可」——
+                                                 这句是**错的**：它把「二维码本身过期」和「登录态过期」
+                                                 混为一谈了。
+                                                 · 二维码过期（还没扫就超时）→ 确实只要再点一次「获取二维码」
+                                                   换一张新的（这是原作者想说的）；
+                                                 · 登录态过期（Cookie 失效）→ **必须重新扫码**，
+                                                   只点「获取二维码」只会得到一张新码，不扫不登录。
+                                                 按用户给的措辞改掉，避免误导。 -->
+                                            <TextBlock Style="{StaticResource ProseText}" Margin="0,4,0,0"
+                                                       Text="· 登录状态过期时可以重新扫码，点击「获取二维码」即可。"/>
+                                            <TextBlock Style="{StaticResource ProseText}" Margin="0,4,0,0"
+                                                       Text="· 扫码得到的是网页版登录态，和手机 App 端互不影响、可同时使用。"/>
+                                        </StackPanel>
+                                      </Grid>
+                                    </Border>
+                                </Grid>
+                            </Grid>
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabItem>
+
+                <!-- ============ 资源搜索（2026-11-11 新增）============
+                     风格：A · 紧凑列表（用户从三套原型里选定）。
+                     视觉完全复用现有资源：Card / ToolButton / PrimaryButton /
+                     TextPrimaryBrush 等，所以与其它页面天然一致，不引入新配色。
+
+                     ⚠️ 数据来源：目前是**本地 mock**（ResourcesMock 里的样例）。
+                     真实搜源需要后端或公开源，属于独立议题 —— 这一版只把
+                     「界面 + 交互 + 与下载流程的衔接」做通，见 ResourcesPage 的注释。 -->
+                <TabItem Style="{StaticResource HeadlessTabItem}">
+                    <Grid Margin="20,18,20,18">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <!-- ① 标题 + 搜索框 -->
+                        <Grid Grid.Row="0" Margin="0,0,0,14">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+
+                            <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,24,0">
+                                <TextBlock Text="资源搜索"
+                                           FontSize="22" FontWeight="SemiBold"
+                                           Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                <TextBlock Text="课程 · 电子书 · 软件 · 更多分享"
+                                           FontSize="11.5" Margin="0,3,0,0"
+                                           Foreground="{DynamicResource TextTertiaryBrush}"/>
+                            </StackPanel>
+
+                            <!-- 搜索框：圆角输入 + 右侧按钮，与整站输入框同一套描边 -->
+                            <Border Grid.Column="1" CornerRadius="22" Height="44"
+                                    Background="{DynamicResource SurfaceBrush}"
+                                    BorderBrush="{DynamicResource BorderBrushStrong}"
+                                    BorderThickness="1"
+                                    VerticalAlignment="Center">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+
+                                    <Path Grid.Column="0" Data="{StaticResource IconSearch}"
+                                          Stretch="Uniform" Width="16" Height="16"
+                                          Margin="16,0,0,0" VerticalAlignment="Center"
+                                          Stroke="{DynamicResource TextTertiaryBrush}"
+                                          StrokeThickness="2"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+
+                                    <TextBox x:Name="ResSearchBox" Grid.Column="1"
+                                             TextChanged="OnResSearchTextChanged"
+                                             KeyDown="OnResSearchKeyDown"
+                                             BorderThickness="0" Background="Transparent"
+                                             Padding="10,0,6,0"
+                                             VerticalContentAlignment="Center"
+                                             FontSize="13.5"
+                                             AutomationProperties.Name="资源搜索框"
+                                             CaretBrush="{DynamicResource PrimaryBrush}"
+                                             ToolTip="输入关键词后回车搜索（当前为演示数据）"/>
+
+                                    <!-- 清空按钮：有内容才显示，由 OnResSearchTextChanged 控制 -->
+                                    <Button x:Name="ResSearchClearBtn" Grid.Column="2"
+                                            Click="OnResSearchClear"
+                                            Visibility="Collapsed"
+                                            Style="{StaticResource IconGhostButton}"
+                                            Width="26" Height="26" Margin="0,0,4,0"
+                                            AutomationProperties.Name="清空搜索"
+                                            ToolTip="清空">
+                                        <Path Data="{StaticResource IconClose}" Stretch="Uniform"
+                                              Width="10" Height="10"
+                                              Stroke="{DynamicResource TextTertiaryBrush}"
+                                              StrokeThickness="2"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                    </Button>
+
+                                    <Button x:Name="ResSearchBtn" Grid.Column="3"
+                                            Click="OnResSearchClick"
+                                            Content="搜索"
+                                            Margin="4,4,4,4" Padding="22,0"
+                                            Style="{StaticResource PrimaryButton}"
+                                            AutomationProperties.Name="开始搜索"/>
+                                </Grid>
+                            </Border>
+                        </Grid>
+
+                        <!-- ② 平台页签（只有夸克与 UC —— 本项目只接这两家） -->
+                        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,10">
+                            <RadioButton x:Name="ResPlatAll" Content="全部"
+                                         GroupName="ResPlat"
+                                         Style="{StaticResource SegmentedRadio}"
+                                         IsChecked="True"
+                                         Click="OnResPlatformChanged"
+                                         Tag="all"
+                                         Margin="0,0,6,0"/>
+                            <RadioButton x:Name="ResPlatQuark" Content="夸克"
+                                         GroupName="ResPlat"
+                                         Style="{StaticResource SegmentedRadio}"
+                                         Click="OnResPlatformChanged"
+                                         Tag="quark"
+                                         Margin="0,0,6,0"/>
+                            <RadioButton x:Name="ResPlatUc" Content="UC"
+                                         GroupName="ResPlat"
+                                         Style="{StaticResource SegmentedRadio}"
+                                         Click="OnResPlatformChanged"
+                                         Tag="uc"/>
+                        </StackPanel>
+
+                        <!-- ③ 结果工具条 -->
+                        <Grid Grid.Row="2" Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+
+                            <TextBlock x:Name="ResResultInfo" Grid.Column="0"
+                                       Text="输入关键词开始搜索"
+                                       VerticalAlignment="Center"
+                                       FontSize="12"
+                                       Foreground="{DynamicResource TextTertiaryBrush}"/>
+
+                            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                <Button x:Name="ResDetectBtn" Click="OnResDetectLinks"
+                                        Style="{StaticResource ToolButton}"
+                                        ToolTip="重新检测结果里的分享链接是否仍然有效"
+                                        Visibility="Collapsed">
+                                    <StackPanel Orientation="Horizontal">
+                                        <Path Data="{StaticResource IconRefresh}" Stretch="Uniform"
+                                              Width="12" Height="12" VerticalAlignment="Center"
+                                              Stroke="{DynamicResource TextSecondaryBrush}"
+                                              StrokeThickness="2"
+                                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                        <TextBlock Text="重新检测" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                                    </StackPanel>
+                                </Button>
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- ④ 结果列表（A 风格：紧凑单列，靠分隔线切分） -->
+                        <Border Grid.Row="3" Style="{StaticResource Card}" Padding="0">
+                            <Grid>
+                                <ScrollViewer x:Name="ResScroll" VerticalScrollBarVisibility="Auto"
+                                              Padding="0">
+                                    <ItemsControl x:Name="ResList" Margin="0">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid x:Name="ResRow" Background="Transparent"
+                                                      MouseLeftButtonUp="OnResRowClick"
+                                                      MouseEnter="OnResRowEnter"
+                                                      MouseLeave="OnResRowLeave">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+
+                                                    <!-- 左侧图标块 -->
+                                                    <Border Grid.Column="0" Width="40" Height="40"
+                                                            CornerRadius="9" Margin="16,13,0,13"
+                                                            VerticalAlignment="Center"
+                                                            Background="{DynamicResource SurfaceSunkenBrush}">
+                                                        <Path Data="{StaticResource IconFile}"
+                                                              Stretch="Uniform" Width="18" Height="18"
+                                                              HorizontalAlignment="Center"
+                                                              VerticalAlignment="Center"
+                                                              Stroke="{DynamicResource PrimaryBrush}"
+                                                              StrokeThickness="1.8"
+                                                              StrokeStartLineCap="Round"
+                                                              StrokeEndLineCap="Round"
+                                                              StrokeLineJoin="Round"/>
+                                                    </Border>
+
+                                                    <!-- 中间：标题 / 描述 / 元信息 -->
+                                                    <StackPanel Grid.Column="1" Margin="13,13,10,13"
+                                                                VerticalAlignment="Center">
+                                                        <TextBlock Text="{Binding Title}"
+                                                                   FontSize="14" FontWeight="SemiBold"
+                                                                   TextTrimming="CharacterEllipsis"
+                                                                   Foreground="{DynamicResource TextPrimaryBrush}"/>
+                                                        <TextBlock Text="{Binding Desc}"
+                                                                   FontSize="12" Margin="0,3,0,6"
+                                                                   MaxHeight="34"
+                                                                   TextWrapping="Wrap"
+                                                                   TextTrimming="CharacterEllipsis"
+                                                                   Foreground="{DynamicResource TextSecondaryBrush}"/>
+
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <!-- 平台标签 -->
+                                                            <Border CornerRadius="5" Padding="7,1"
+                                                                    Background="{DynamicResource PrimaryLightBrush}"
+                                                                    VerticalAlignment="Center">
+                                                                <TextBlock Text="{Binding PlatformName}"
+                                                                           FontSize="11" FontWeight="SemiBold"
+                                                                           Foreground="{DynamicResource PrimaryBrush}"/>
+                                                            </Border>
+
+                                                            <!-- 链接状态：文字+色点，颜色由 HealthBrush 提供 -->
+                                                            <Ellipse Width="6" Height="6" Margin="11,0,5,0"
+                                                                     VerticalAlignment="Center"
+                                                                     Fill="{Binding HealthBrush}"/>
+                                                            <TextBlock Text="{Binding HealthText}"
+                                                                       FontSize="11.5"
+                                                                       VerticalAlignment="Center"
+                                                                       Foreground="{Binding HealthBrush}"/>
+
+                                                            <TextBlock Text="{Binding SizeText}"
+                                                                       FontSize="11.5" Margin="13,0,0,0"
+                                                                       VerticalAlignment="Center"
+                                                                       Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                                            <TextBlock Text="{Binding DateText}"
+                                                                       FontSize="11.5" Margin="13,0,0,0"
+                                                                       VerticalAlignment="Center"
+                                                                       Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                                        </StackPanel>
+                                                    </StackPanel>
+
+                                                    <!-- 右侧：操作（悬停才出现，与解析历史星标同一做法） -->
+                                                    <StackPanel x:Name="ResRowActions" Grid.Column="2"
+                                                                Orientation="Horizontal"
+                                                                VerticalAlignment="Center"
+                                                                Margin="0,0,16,0"
+                                                                Opacity="0">
+                                                        <Button Content="解析"
+                                                                Click="OnResOpenShare"
+                                                                Margin="0,0,7,0"
+                                                                Padding="13,5" FontSize="12"
+                                                                Style="{StaticResource SecondaryButton}"
+                                                                AutomationProperties.Name="解析该资源"
+                                                                ToolTip="把这个分享链接送到「下载」页解析"/>
+                                                        <Button Content="复制链接"
+                                                                Click="OnResCopyLink"
+                                                                Padding="13,5" FontSize="12"
+                                                                Style="{StaticResource SecondaryButton}"
+                                                                AutomationProperties.Name="复制分享链接"/>
+                                                    </StackPanel>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </ScrollViewer>
+
+                                <!-- 空态 -->
+                                <StackPanel x:Name="ResEmpty" VerticalAlignment="Center"
+                                            HorizontalAlignment="Center" IsHitTestVisible="False">
+                                    <Path Data="{StaticResource IconSearch}" Stretch="Uniform"
+                                          Width="40" Height="40" HorizontalAlignment="Center"
+                                          Stroke="{DynamicResource TextTertiaryBrush}"
+                                          StrokeThickness="1.5" Opacity="0.35"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                                    <TextBlock Text="输入关键词开始搜索"
+                                               Margin="0,14,0,0" HorizontalAlignment="Center"
+                                               FontSize="13"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                    <TextBlock x:Name="ResEmptyHint"
+                                               Text="当前为演示数据，仅展示界面效果"
+                                               Margin="0,5,0,0" HorizontalAlignment="Center"
+                                               FontSize="11.5"
+                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                    </Grid>
+                </TabItem>
+
                 <!-- ============ 设置 ============ -->
                 <TabItem Style="{StaticResource HeadlessTabItem}">
                     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0">
@@ -1997,6 +2875,17 @@
                                                    Style="{StaticResource TertiaryText}"
                                                    VerticalAlignment="Center" Margin="10,0,0,0"/>
                                     </StackPanel>
+
+                                    <!-- 【2026-11-15】文件列表第二行的修改日期可开关 ——
+                                         用户定稿：日期是 P0 的一部分，但"有些用户可能不喜欢"，
+                                         不替所有人独断，默认开（与本机使用习惯一致）。
+                                         切换即时刷新当前列表（DateLine 逐项 Raise），持久化走 Settings。 -->
+                                    <CheckBox x:Name="ShowFileDateCheck"
+                                              Content="文件列表第二行显示修改日期"
+                                              Style="{StaticResource AppCheckBox}"
+                                              Margin="0,14,0,0"
+                                              Click="OnShowFileDateChanged"
+                                              AutomationProperties.Name="文件列表显示修改日期"/>
                                 </StackPanel>
                             </Border>
 
@@ -2633,463 +3522,6 @@
                                                Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史、全屏在任何页面都可用；a / d / s / r / x / g / i 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件有两种方式：按 s 进入粘滞多选（再按 s 或 Esc 退出，全程不用按键）、r 刷新当前目录，或按住 Shift 临时多选（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
                                 </StackPanel>
                             </Border>
-                        </StackPanel>
-                    </ScrollViewer>
-                </TabItem>
-
-                <!-- ============ 登录 ============ -->
-                <TabItem Style="{StaticResource HeadlessTabItem}">
-                    <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,10,0">
-                        <!-- 【2026-11-02 UC 全宽】这里必须是 StackPanel（垂直堆叠语义），
-                             不能换成 Grid —— Grid 不加 RowDefinitions 时所有子元素
-                             默认挤在 Row0/Column0 **全部重叠**，布局会彻底错乱。
-                             （我改过一次 Grid 忘了加 Row，实测就是这个后果。）
-                             原来限制宽度的是 MaxWidth="960" + HorizontalAlignment="Left"，
-                             现在把这两个挪到 code-behind 的 ApplyLoginLayout 里动态控制：
-                             · 夸克模式：MaxWidth=960 + Left（保持原样）
-                             · UC 全宽：MaxWidth=∞ + Stretch（撑满） -->
-                        <StackPanel x:Name="LoginPageRoot" Margin="20,18,20,24"
-                                    MaxWidth="960" HorizontalAlignment="Left">
-
-                            <TextBlock Text="登录" Style="{StaticResource PageTitleText}" Margin="0,0,0,4"/>
-                            <TextBlock Text="登录后可浏览「我的网盘」、转存分享文件；不登录也能用直链下载"
-                                       Style="{StaticResource TertiaryText}" Margin="0,0,0,18"/>
-
-                            <!-- ============ 【2026-11-02 新增】平台切换（方案 C）============
-                                 2.9.0 加入 UC 网盘后，登录页要能区分"现在登录的是哪个平台"。
-                                 做成两段式切换而不是并排双卡：
-                                   · 两个平台的操作完全一样（都是扫码/WebView 取 Cookie），
-                                     并排会重复一整套界面；
-                                   · 切换后下方的扫码卡与账号列表整体替换，语义更清晰。
-                                 选中态用 PrimaryLight 底 + Primary 描边，与全局强调色一致。 -->
-                            <Border Style="{StaticResource Card}" Padding="6" Margin="0,0,0,14"
-                                    HorizontalAlignment="Left">
-                                <StackPanel Orientation="Horizontal">
-                                    <Button x:Name="PlatformQuarkBtn" Click="OnPlatformSwitch"
-                                            Tag="quark" Style="{StaticResource PlatformTabOn}">
-                                        <TextBlock Text="夸克网盘" FontSize="13" FontWeight="SemiBold"/>
-                                    </Button>
-                                    <Button x:Name="PlatformUcBtn" Click="OnPlatformSwitch"
-                                            Tag="uc" Style="{StaticResource PlatformTabOff}" Margin="4,0,0,0">
-                                        <StackPanel Orientation="Horizontal">
-                                            <TextBlock Text="UC 网盘" FontSize="13" FontWeight="SemiBold"/>
-                                            <!-- 未登录时的小红点：让用户一眼看到"还有个平台没登录" -->
-                                            <Border x:Name="UcUnreadDot" Width="6" Height="6"
-                                                    CornerRadius="3" Margin="6,0,0,0"
-                                                    VerticalAlignment="Center"
-                                                    Background="{DynamicResource DangerBrush}"/>
-                                        </StackPanel>
-                                    </Button>
-                                </StackPanel>
-                            </Border>
-
-                            <!-- 左右分栏：左=扫码（主操作，视觉最重），右=状态/导入导出/账号管理
-                                 之前是单列 640 宽，屏幕大时右侧大片空白，内容全挤在左边。
-
-                                 【2026-11-02 定稿】UC 与夸克同构，都是扫码 + Cookie 导入，
-                                 不再有内嵌浏览器，两栏布局对两个平台都适用。 -->
-                            <Grid x:Name="LoginColumns">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto"/>
-                                    <ColumnDefinition Width="*"/>
-                                </Grid.ColumnDefinitions>
-
-                                <!-- ============ 左列：扫码登录 ============
-                                     用 Grid 三行（标题 Auto / 二维码 * / 按钮+状态 Auto），
-                                     整卡 VerticalAlignment=Stretch 与右列等高；
-                                     二维码行用 * 吸收多余高度并垂直居中 —— 这样无论
-                                     登录前后、窗口多大，左右两列外轮廓都是同一个矩形。 -->
-                                <Border x:Name="LoginLeftCard" Grid.Column="0" Style="{StaticResource PrimaryCard}"
-                                        Width="304" VerticalAlignment="Stretch">
-                                    <Grid>
-                                        <!-- 【2026-11-02】两套互斥内容：
-                                             UcQrArea        = 扫码/登录区（未登录，或平台是夸克）
-                                             UcLoggedInPanel = 已登录的账号信息（仅 UC 登录后显示）
-                                             code-behind 的 ShowUcLoggedInPanel() 负责切换。 -->
-                                        <Grid x:Name="UcQrArea">
-                                        <Grid.RowDefinitions>
-                                            <RowDefinition Height="Auto"/>
-                                            <RowDefinition Height="*"/>
-                                            <RowDefinition Height="Auto"/>
-                                        </Grid.RowDefinitions>
-
-                                        <StackPanel Grid.Row="0">
-                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
-                                                <Path x:Name="LoginCardIcon" Data="{StaticResource IconQr}" Stretch="Uniform"
-                                                      Width="16" Height="16" VerticalAlignment="Center"
-                                                      Stroke="{DynamicResource PrimaryBrush}"
-                                                      StrokeThickness="1.8"
-                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                                                <TextBlock x:Name="LoginCardTitle" Text="扫码登录"
-                                                           Style="{StaticResource CardTitleText}"
-                                                           Margin="7,0,0,0" FontSize="15"/>
-                                            </StackPanel>
-                                            <TextBlock x:Name="QrHintText"
-                                                       Text="用手机「夸克 App」扫描二维码并在手机上确认"
-                                                       Style="{StaticResource TertiaryText}"
-                                                       TextWrapping="Wrap" Margin="0,0,0,14"/>
-                                        </StackPanel>
-
-                                        <!-- 二维码 / UC 登录页区
-                                             【2026-11-02】UC 模式下这块要撑满卡片剩余高度，
-                                             不再固定 264px（用户反馈"那么小个窗口看起来很难受"）。
-                                             夸克模式仍按 264 高度居中显示二维码，由 code-behind 切高度。 -->
-                                        <Grid x:Name="QrOrWebArea" Grid.Row="1" Height="264" Margin="0,0,0,14"
-                                              VerticalAlignment="Center">
-                                            <!-- ⚠️ Background="White" 是**故意硬编码**的，不要改成 DynamicResource：
-                                                 二维码必须是"深色模块 + 白色静默区"才能被手机扫出来。
-                                                 深色主题下若跟着变深，扫码会直接失败（不是审美问题）。
-                                                 容器保持纯白 + 一圈描边，在深色界面上反而更醒目、
-                                                 等于给二维码加了个"白卡底座"。 -->
-                                            <Border x:Name="QrImageBox" Width="264" Height="264"
-                                                    Background="White"
-                                                    BorderBrush="{DynamicResource BorderBrushStrong}"
-                                                    BorderThickness="1"
-                                                    CornerRadius="10" Padding="8"
-                                                    Visibility="Collapsed">
-                                                <Image x:Name="QrImage" Stretch="Uniform"
-                                                       RenderOptions.BitmapScalingMode="NearestNeighbor"/>
-                                            </Border>
-                                            <Border x:Name="QrPlaceholderBox"
-                                                    Background="{DynamicResource SurfaceSunkenBrush}"
-                                                    BorderBrush="{DynamicResource BorderBrushSoft}"
-                                                    BorderThickness="1" CornerRadius="10">
-                                                <StackPanel HorizontalAlignment="Center"
-                                                            VerticalAlignment="Center">
-                                                    <Path Data="{StaticResource IconQr}" Stretch="Uniform"
-                                                          Width="42" Height="42"
-                                                          HorizontalAlignment="Center"
-                                                          Stroke="{DynamicResource BorderBrushStrong}"
-                                                          StrokeThickness="1.4"
-                                                          StrokeStartLineCap="Round"
-                                                          StrokeEndLineCap="Round"/>
-                                                    <TextBlock Text="点下方按钮获取二维码"
-                                                               Margin="0,10,0,0"
-                                                               HorizontalAlignment="Center"
-                                                               Foreground="{DynamicResource TextTertiaryBrush}"
-                                                               FontSize="11.5"/>
-                                                </StackPanel>
-                                            </Border>
-
-                                        </Grid>
-
-                                        <!-- 按钮 + 状态：
-                                             ⚠️ 这里必须是**两行 Grid**，不能把按钮与状态框
-                                             直接叠在同一个 Grid 里 —— 叠放时 QrStatusBox 会
-                                             压在按钮上（用户反馈「提示遮住了按钮，上方明明有空位」）。
-                                             Row0=按钮（Auto）、Row1=状态框（Auto），
-                                             状态框自然落在按钮下方，上方二维码区的空位也吃得到。 -->
-                                        <Grid Grid.Row="2">
-                                            <Grid.RowDefinitions>
-                                                <RowDefinition Height="Auto"/>
-                                                <RowDefinition Height="Auto"/>
-                                            </Grid.RowDefinitions>
-
-                                            <StackPanel Grid.Row="0" Orientation="Horizontal">
-                                                <Button x:Name="QrLoginBtn" Click="OnQrLogin"
-                                                        Style="{StaticResource PrimaryButton}">
-                                                    <StackPanel Orientation="Horizontal">
-                                                        <Path Data="{StaticResource IconQr}"
-                                                              Stretch="Uniform"
-                                                              Width="14" Height="14"
-                                                              VerticalAlignment="Center"
-                                                              Stroke="{DynamicResource TextOnPrimaryBrush}"
-                                                              StrokeThickness="1.8"
-                                                              StrokeStartLineCap="Round"
-                                                              StrokeEndLineCap="Round"/>
-                                                        <TextBlock x:Name="QrLoginBtnText" Text="获取二维码" Margin="7,0,0,0"
-                                                                   VerticalAlignment="Center"/>
-                                                    </StackPanel>
-                                                </Button>
-                                                <!-- 【2026-10-03】原来这里还有一个「刷新二维码」按钮，
-                                                     用户反馈「这里刷新二维码的按键多余了」——
-                                                     确实多余：它和「获取二维码」绑的是**同一个处理函数**
-                                                     （都是 OnQrLogin），点哪个都是重新取一张。
-                                                     现在只留一个按钮，二维码过期时提示用户再点一次即可。 -->
-                                            </StackPanel>
-
-                                            <!-- 状态提示：随扫码进度实时变化（等待扫码 → 已扫码待确认 → 成功/过期）
-                                                 ⚠️ 图标/颜色都由 code-behind 的 SetQrStatus() 按语义给：
-                                                 「等待扫码」是正常流程，配黄三角会让用户以为坏了。
-                                                 进行中=中性信息图标，成功=绿对勾，失败/过期=红叉。 -->
-                                            <Border x:Name="QrStatusBox" Grid.Row="1"
-                                                    Margin="0,12,0,0"
-                                                    Padding="12,10"
-                                                    CornerRadius="10" Visibility="Collapsed"
-                                                    Background="{DynamicResource SurfaceSunkenBrush}">
-                                                <StackPanel Orientation="Horizontal">
-                                                    <Path x:Name="QrStatusIcon"
-                                                          Data="{StaticResource IconClock}"
-                                                          Stretch="Uniform" Width="15" Height="15"
-                                                          VerticalAlignment="Center" Margin="0,0,8,0"
-                                                          Stroke="{DynamicResource TextSecondaryBrush}"
-                                                          StrokeThickness="1.8"
-                                                          StrokeStartLineCap="Round"
-                                                          StrokeEndLineCap="Round"
-                                                          StrokeLineJoin="Round"/>
-                                                    <TextBlock x:Name="QrStatusText" Text=""
-                                                               TextWrapping="Wrap"
-                                                               Style="{StaticResource SecondaryText}"
-                                                               VerticalAlignment="Center"/>
-                                                </StackPanel>
-                                            </Border>
-                                        </Grid>
-                                        </Grid>
-                                        <!-- /UcQrArea -->
-
-                                        <!-- ============ 【2026-11-02】UC 已登录：账号信息 ============
-                                             用户要求：「登录成功后 再切换成现在布局 并且展示用户的信息」。
-                                             登录后二维码已无用，这块替换掉整个扫码区（默认折叠，
-                                             由 code-behind 的 ShowUcLoggedInPanel 切换显示）。 -->
-                                        <StackPanel x:Name="UcLoggedInPanel" Visibility="Collapsed">
-                                            <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
-                                                <Path Data="{StaticResource IconUser}" Stretch="Uniform"
-                                                      Width="16" Height="16" VerticalAlignment="Center"
-                                                      Stroke="{DynamicResource SuccessBrush}"
-                                                      StrokeThickness="1.8"
-                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
-                                                <TextBlock Text="已登录"
-                                                           Style="{StaticResource CardTitleText}"
-                                                           Margin="7,0,0,0" FontSize="15"
-                                                           Foreground="{DynamicResource SuccessBrush}"/>
-                                            </StackPanel>
-
-                                            <!-- 头像 + 昵称 -->
-                                            <Grid Margin="0,0,0,18">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="Auto"/>
-                                                    <ColumnDefinition Width="*"/>
-                                                </Grid.ColumnDefinitions>
-                                                <Border x:Name="UcAvatarBox" Grid.Column="0"
-                                                        Width="52" Height="52" CornerRadius="26"
-                                                        Background="{DynamicResource PrimaryBrush}"
-                                                        VerticalAlignment="Center">
-                                                    <Grid>
-                                                        <TextBlock x:Name="UcAvatarText" Text="U"
-                                                                   FontSize="20" FontWeight="SemiBold"
-                                                                   Foreground="{DynamicResource TextOnPrimaryBrush}"
-                                                                   HorizontalAlignment="Center"
-                                                                   VerticalAlignment="Center"/>
-                                                        <Image x:Name="UcAvatarImage" Stretch="UniformToFill"
-                                                               Visibility="Collapsed">
-                                                            <Image.Clip>
-                                                                <EllipseGeometry Center="26,26" RadiusX="26" RadiusY="26"/>
-                                                            </Image.Clip>
-                                                        </Image>
-                                                    </Grid>
-                                                </Border>
-                                                <StackPanel Grid.Column="1" Margin="12,0,0,0"
-                                                            VerticalAlignment="Center">
-                                                    <TextBlock x:Name="UcNickText" Text="UC 用户"
-                                                               FontSize="15" FontWeight="SemiBold"
-                                                               TextTrimming="CharacterEllipsis"
-                                                               Foreground="{DynamicResource TextPrimaryBrush}"/>
-                                                    <TextBlock Text="UC 网盘"
-                                                               FontSize="11.5" Margin="0,3,0,0"
-                                                               Foreground="{DynamicResource TextTertiaryBrush}"/>
-                                                </StackPanel>
-                                            </Grid>
-
-                                            <!-- 容量 -->
-                                            <TextBlock Text="存储空间" FontSize="11.5"
-                                                       Margin="0,0,0,7"
-                                                       Foreground="{DynamicResource TextTertiaryBrush}"/>
-                                            <ProgressBar x:Name="UcCapacityBar" Height="6"
-                                                         Minimum="0" Maximum="100" Value="0"
-                                                         BorderThickness="0"
-                                                         Background="{DynamicResource SurfaceSunkenBrush}"
-                                                         Foreground="{DynamicResource SuccessBrush}"/>
-                                            <TextBlock x:Name="UcCapacityText" Text="容量未知"
-                                                       FontSize="12" Margin="0,7,0,0"
-                                                       Foreground="{DynamicResource TextSecondaryBrush}"/>
-                                        </StackPanel>
-                                    </Grid>
-                                </Border>
-
-                                <!-- ============ 右列：状态 / 导入导出 / 账号管理 / 提示 ============
-                                     三行：状态 Auto / 导入 Cookie Auto / 小贴士 *。
-                                     最后一行用 * 吸收剩余高度，右列上下沿与左列严格对齐。 -->
-                                <Grid x:Name="LoginRightColumn" Grid.Column="1" Margin="16,0,0,0">
-                                    <Grid.RowDefinitions>
-                                        <RowDefinition Height="Auto"/>
-                                        <RowDefinition Height="Auto"/>
-                                        <RowDefinition Height="*"/>
-                                    </Grid.RowDefinitions>
-
-                                    <!-- 当前登录状态 -->
-                                    <Border Grid.Row="0" Style="{StaticResource Card}"
-                                            Margin="0,0,0,14">
-                                        <StackPanel>
-                                            <TextBlock Text="当前状态" Style="{StaticResource CardTitleText}"
-                                                       Margin="0,0,0,10"/>
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="Auto"/>
-                                                    <ColumnDefinition Width="*"/>
-                                                </Grid.ColumnDefinitions>
-                                                <Border x:Name="LoginAvatarBox" Grid.Column="0"
-                                                        Style="{StaticResource AvatarBorder}"
-                                                        VerticalAlignment="Center">
-                                                    <Grid>
-                                                        <TextBlock x:Name="LoginAvatarText" Text="?"
-                                                                   FontSize="14" FontWeight="SemiBold"
-                                                                   Foreground="{DynamicResource TextOnPrimaryBrush}"
-                                                                   HorizontalAlignment="Center"
-                                                                   VerticalAlignment="Center"/>
-                                                        <Image x:Name="LoginAvatarImage" Stretch="UniformToFill"
-                                                               Visibility="Collapsed">
-                                                            <Image.Clip>
-                                                                <EllipseGeometry Center="17,17" RadiusX="17" RadiusY="17"/>
-                                                            </Image.Clip>
-                                                        </Image>
-                                                    </Grid>
-                                                </Border>
-                                                <StackPanel Grid.Column="1" Margin="10,0,0,0"
-                                                            VerticalAlignment="Center">
-                                                    <TextBlock x:Name="LoginWhoText" Text="未登录"
-                                                               FontSize="13.5" FontWeight="SemiBold"
-                                                               Foreground="{DynamicResource TextPrimaryBrush}"
-                                                               TextTrimming="CharacterEllipsis"/>
-                                                    <TextBlock x:Name="LoginSubText"
-                                                               Text="扫码或导入 Cookie 即可登录"
-                                                               FontSize="11" Margin="0,2,0,0"
-                                                               Foreground="{DynamicResource TextTertiaryBrush}"
-                                                               TextWrapping="Wrap"/>
-                                                </StackPanel>
-                                            </Grid>
-
-                                            <StackPanel x:Name="LoginActionRow" Orientation="Horizontal"
-                                                        Margin="0,14,0,0">
-                                                <Button x:Name="LoginBtn" Content="登录" Click="OnLoginClick"
-                                                        Style="{StaticResource SecondaryButton}"
-                                                        Margin="0,0,8,0"/>
-                                                <Button x:Name="AccountsBtn" Content="切换账号"
-                                                        Click="OnOpenAccounts"
-                                                        Style="{StaticResource SecondaryButton}"
-                                                        Visibility="Collapsed"/>
-                                                <!-- 【2026-10-03】「登出」按钮按用户要求删除（觉得多余）。
-                                                     退出登录的能力没丢：挪进了「切换账号」窗口里，
-                                                     那里才是账号管理的地方。 -->
-                                            </StackPanel>
-                                        </StackPanel>
-                                    </Border>
-
-                                    <!-- 导入 Cookie -->
-                                    <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,0,0,14">
-                                        <StackPanel>
-                                            <TextBlock Text="导入 Cookie" Style="{StaticResource CardTitleText}"
-                                                       Margin="0,0,0,6"/>
-                                            <TextBlock Text="扫码不方便时，可从浏览器复制网盘 Cookie 直接粘贴，粘贴后会自动登录；也可以从 Cookie 文件导入。"
-                                                       Style="{StaticResource TertiaryText}"
-                                                       TextWrapping="Wrap" Margin="0,0,0,10"/>
-                                            <!-- 【2026-11-02 用户要求】「我是粘贴在输入框里的 应该检测到内容 就自动获取」。
-                                                 TextChanged 里做防抖检测：识别到完整 Cookie（含 __pus 与 __puus）就自动校验登录，
-                                                 不必再手点「导入并登录」。按钮保留作手动兜底与重试入口。 -->
-                                            <TextBox x:Name="CookieImportBox" Height="72"
-                                                     TextChanged="OnCookieImportTextChanged"
-                                                     Style="{StaticResource AppTextBoxMultiline}"/>
-                                            <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
-                                                <Button x:Name="ImportCookieBtn" Content="导入并登录"
-                                                        Click="OnImportCookie"
-                                                        Style="{StaticResource PrimaryButton}"
-                                                        Margin="0,0,8,0"/>
-                                                <!-- 【2026-10-03 新增】从文件导入 Cookie（用户反馈缺这个入口）。
-                                                     支持 .txt（原始 Cookie 串）与 .json（浏览器扩展导出的格式）。 -->
-                                                <Button x:Name="ImportCookieFileBtn" Click="OnImportCookieFile"
-                                                        Style="{StaticResource SecondaryButton}"
-                                                        Margin="0,0,8,0"
-                                                        ToolTip="从文件读取 Cookie 并直接登录。&#10;支持 .txt（原始 Cookie 串）和 .json（浏览器扩展导出）。">
-                                                    <StackPanel Orientation="Horizontal">
-                                                        <Path Data="{StaticResource IconFolder}"
-                                                              Stretch="Uniform" Width="14" Height="14"
-                                                              VerticalAlignment="Center"
-                                                              Stroke="{DynamicResource TextSecondaryBrush}"
-                                                              StrokeThickness="1.8"
-                                                              StrokeStartLineCap="Round"
-                                                              StrokeEndLineCap="Round"
-                                                              StrokeLineJoin="Round"/>
-                                                        <TextBlock Text="从文件导入"
-                                                                   Margin="7,0,0,0"
-                                                                   VerticalAlignment="Center"/>
-                                                    </StackPanel>
-                                                </Button>
-                                                <!-- 【2026-10-03 改】原来是「复制当前 Cookie」→ 只往剪贴板塞。
-                                                     用户要求「无论是导出直链还是导出 cookie 都不要复制到
-                                                     粘贴板上」，所以改成**写文件**，按钮文案与图标同步改。 -->
-                                                <Button x:Name="ExportCookieBtn" Click="OnExportCookie"
-                                                        Style="{StaticResource SecondaryButton}"
-                                                        ToolTip="把当前登录 Cookie 导出成桌面上的 txt 文件（不占用剪贴板）。">
-                                                    <StackPanel Orientation="Horizontal">
-                                                        <Path Data="{StaticResource IconFile}"
-                                                              Stretch="Uniform" Width="14" Height="14"
-                                                              VerticalAlignment="Center"
-                                                              Stroke="{DynamicResource TextSecondaryBrush}"
-                                                              StrokeThickness="1.8"
-                                                              StrokeStartLineCap="Round"
-                                                              StrokeEndLineCap="Round"
-                                                              StrokeLineJoin="Round"/>
-                                                        <TextBlock Text="导出 Cookie 文件"
-                                                                   Margin="7,0,0,0"
-                                                                   VerticalAlignment="Center"/>
-                                                    </StackPanel>
-                                                </Button>
-                                            </StackPanel>
-                                        </StackPanel>
-                                    </Border>
-
-                                    <!-- 小贴士：填满右列剩余高度（Grid.Row=2 是 * 行），
-                                         让右列底沿与左列严格平齐，也让新用户少踩坑 -->
-                                    <Border Grid.Row="2" Style="{StaticResource InfoBanner}"
-                                            VerticalAlignment="Stretch">
-                                      <Grid>
-                                        <!-- 装饰层：小贴士的文字只占左边一小块，右侧一大片空着
-                                             （用户反馈「这个地方感觉右边也有点太空了」）。
-                                             点缀几颗星星填充右侧，画在文字**之前**（在下层），
-                                             不吃点击、透明度压低，不与正文抢注意力。 -->
-                                        <Grid IsHitTestVisible="False">
-                                            <Path Data="{StaticResource IconSparkle}"
-                                                  Fill="{DynamicResource PrimaryBrush}"
-                                                  Opacity="0.62"
-                                                  Width="30" Height="30" Stretch="Uniform"
-                                                  HorizontalAlignment="Right" VerticalAlignment="Center"
-                                                  Margin="0,0,18,0"/>
-                                            <Path Data="{StaticResource IconSparkle}"
-                                                  Fill="{DynamicResource PrimaryBrush}"
-                                                  Opacity="0.46"
-                                                  Width="16" Height="16" Stretch="Uniform"
-                                                  HorizontalAlignment="Right" VerticalAlignment="Top"
-                                                  Margin="0,14,60,0"/>
-                                            <Path Data="{StaticResource IconSparkle}"
-                                                  Fill="{DynamicResource PrimaryBrush}"
-                                                  Opacity="0.36"
-                                                  Width="11" Height="11" Stretch="Uniform"
-                                                  HorizontalAlignment="Right" VerticalAlignment="Bottom"
-                                                  Margin="0,0,16,18"/>
-                                        </Grid>
-                                        <StackPanel>
-                                            <TextBlock Text="小贴士" FontSize="12" FontWeight="SemiBold"
-                                                       Foreground="{DynamicResource PrimaryBrush}"
-                                                       Margin="0,0,0,6"/>
-                                            <TextBlock Style="{StaticResource ProseText}"
-                                                       Text="· 登录信息经系统加密后存在本地配置里，不会上传到任何服务器。"/>
-                                            <!-- 【2026-10-03 再改】上一版写的是
-                                                 「登录状态过期时不用重新扫码，再点一次「获取二维码」即可」——
-                                                 这句是**错的**：它把「二维码本身过期」和「登录态过期」
-                                                 混为一谈了。
-                                                 · 二维码过期（还没扫就超时）→ 确实只要再点一次「获取二维码」
-                                                   换一张新的（这是原作者想说的）；
-                                                 · 登录态过期（Cookie 失效）→ **必须重新扫码**，
-                                                   只点「获取二维码」只会得到一张新码，不扫不登录。
-                                                 按用户给的措辞改掉，避免误导。 -->
-                                            <TextBlock Style="{StaticResource ProseText}" Margin="0,4,0,0"
-                                                       Text="· 登录状态过期时可以重新扫码，点击「获取二维码」即可。"/>
-                                            <TextBlock Style="{StaticResource ProseText}" Margin="0,4,0,0"
-                                                       Text="· 扫码得到的是网页版登录态，和手机 App 端互不影响、可同时使用。"/>
-                                        </StackPanel>
-                                      </Grid>
-                                    </Border>
-                                </Grid>
-                            </Grid>
                         </StackPanel>
                     </ScrollViewer>
                 </TabItem>

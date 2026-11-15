@@ -22,6 +22,7 @@ using GeZi.Core.Api;
 using GeZi.Core.Download;
 using GeZi.Core.Models;
 using GeZi.Core.Support;
+using GeZi.Core.Upload;
 
 namespace GeZi.Core.Pan
 {
@@ -68,7 +69,8 @@ namespace GeZi.Core.Pan
             ScanAppHint = "夸克 App",
             Caps = PanCapabilities.Share | PanCapabilities.Mine | PanCapabilities.Save
                  | PanCapabilities.Delete | PanCapabilities.QrLogin | PanCapabilities.CookieLogin
-                 | PanCapabilities.MineDownload | PanCapabilities.Capacity | PanCapabilities.Export,
+                 | PanCapabilities.MineDownload | PanCapabilities.Capacity | PanCapabilities.Export
+                 | PanCapabilities.Upload,
         };
 
         public string Cookie => _client.CookieStr;
@@ -167,6 +169,31 @@ namespace GeZi.Core.Pan
         {
             // QuarkClient.PathFidAsync 内部已经"找不到就建"，与这里语义一致
             return await _client.PathFidAsync(path).ConfigureAwait(false);
+        }
+
+        // ==================== 上传（2026-11-10 新增）====================
+
+        /// <summary>
+        /// 上传本地文件到指定目录。
+        ///
+        /// <para>协议实现在 <see cref="QuarkUploader"/>，这里只负责把
+        /// 「网盘 JSON 接口怎么发」这件事接到本类已有的会话上 ——
+        /// 这样 Cookie 域、请求头指纹、Set-Cookie 滚动更新全都不用重做。</para>
+        /// </summary>
+        public async Task<bool> UploadAsync(string localPath, string parentFid,
+            Action<UploadPhase, long, long> progress = null, CancellationToken ct = default)
+        {
+            using (var uploader = new QuarkUploader(
+                apiBase: QuarkConstants.ApiBase,
+                product: "ucpro",
+                origin: QuarkConstants.Origin,
+                userAgent: QuarkConstants.ApiUa,
+                cookie: _client.CookieStr,
+                postJson: (url, body) => _client.PostJsonForUploadAsync(url, body)))
+            {
+                return await uploader.UploadAsync(localPath, parentFid, null, progress, ct)
+                    .ConfigureAwait(false);
+            }
         }
 
         public void Dispose()

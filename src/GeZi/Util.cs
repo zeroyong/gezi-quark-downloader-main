@@ -22,20 +22,60 @@ namespace GeZi
 {
     public static class Util
     {
+        /// <summary>
+        /// 文件大小格式化（**1024 进制**，与 Windows 资源管理器一致）。
+        ///
+        /// <para>【为什么最终选了 1024】2026-10-06 曾为了跟「夸克分享页」对齐改成 1000 进制，
+        /// 但 2026-11-10 用户拿资源管理器核对同一个文件时发现对不上：
+        /// 本程序写 6.15 MB、资源管理器写 5.9M —— 不是文件错，是两把尺子不同
+        /// （1000 进制 vs 1024 进制，单个文件就差 4~5%）。
+        /// </para>
+        ///
+        /// <para>【裁决依据】用户日常**核对文件大小用的都是资源管理器**，
+        /// 分享页只是偶尔路过。所以大小跟资源管理器走 1024 进制；
+        /// 而速度（<see cref="FormatSpeed"/>）保持 1000 进制，因为网络速率
+        /// 业界一贯按 10^6 = 1 MB/s 计。这也是 Windows 与多数文件管理器的通行分工。</para>
+        ///
+        /// <para>⚠️ 后缀仍写 KB/MB/GB（不写 KiB/MiB），这是资源管理器的显示习惯，
+        /// 与它对比时不会产生歧义。</para>
+        /// </summary>
         public static string FormatSize(long n)
         {
-            // 🚨 【2026-10-06 修】原来除以 1024 却标 "KB/MB/GB"（那是 KiB/MiB/GiB）。
-            // 后果：同一个文件「夸克分享页写 9.54 GB、本程序写 8.89 GB」，用户以为少下了。
-            // 改成 **1000 进制** —— 单位名副其实，也顺带让速度显示符合网络速率的惯例（1 MB/s = 10^6 B/s）。
+            if (n < 0) n = 0;
             double v = n;
             string[] units = { "B", "KB", "MB", "GB", "TB" };
+            int i = 0;
+            while (v >= 1024 && i < units.Length - 1)
+            {
+                v /= 1024.0;
+                i++;
+            }
+            return i == 0 ? n + " B" : v.ToString("F2") + " " + units[i];
+        }
+
+        /// <summary>
+        /// 传输速率格式化（**1000 进制**，网络的通行口径：1 MB/s = 10^6 B/s）。
+        ///
+        /// <para>单独一个方法是为了跟 <see cref="FormatSize"/> 分开：
+        /// 文件大小让用户拿资源管理器核对得上，速率则符合各家测速软件/运营商的习惯。</para>
+        ///
+        /// <para>★ 返回值**自带 `/s` 后缀**（如 <c>1.22 MB/s</c>）。
+        /// 【2026-11-10 修】最初这个方法只返回 <c>1.22 MB</c>、由调用方自行拼 `/s`，
+        /// 结果我替换调用点时把后缀丢了 —— 界面上速度显示成「1.22 MB」，
+        /// 看着像文件大小而不是速度。后缀放进方法内部，调用方就不可能再漏。</para>
+        /// </summary>
+        public static string FormatSpeed(double bytesPerSec)
+        {
+            if (bytesPerSec < 0) bytesPerSec = 0;
+            double v = bytesPerSec;
+            string[] units = { "B", "KB", "MB", "GB" };
             int i = 0;
             while (v >= 1000 && i < units.Length - 1)
             {
                 v /= 1000.0;
                 i++;
             }
-            return i == 0 ? n + " B" : v.ToString("F2") + " " + units[i];
+            return i == 0 ? ((long)v) + " B/s" : v.ToString("F2") + " " + units[i] + "/s";
         }
 
         /// <summary>

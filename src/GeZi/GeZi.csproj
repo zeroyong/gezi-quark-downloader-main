@@ -147,8 +147,17 @@
                  ⑨ 解析历史新增「收藏」按钮（与「置顶」是两个独立动作），
                     悬浮行时才显示，已收藏的常驻显示实心星。
                  ⑩ 自动调度语义修正：「同时下载任务数」由用户决定，
-                    「单文件并发」按它自动反算（预算 ÷ 任务数）。 -->
-    <Version>2.9.0</Version>
+                    「单文件并发」按它自动反算（预算 ÷ 任务数）。
+           2.9.1：① 新增「二维码图片文本」识别 —— 用户原话：「就是类似 这种
+                  data:image/png;base64,iVBORw0KGg 只是图片链接 需要转成网址」。
+                    · 链接框粘贴 data:image/...;base64,… 或纯 base64 图片文本时先拦下
+                      （绝不把几十 KB 塞进单行框），后台解出二维码内容再填链接并解析；
+                    · 「识别二维码」窗口读入图片即自动识别，不再需要手动点「识别」；
+                    · 容忍折行/空白、省略 padding、URL-safe 字母表、末尾带说明文字，
+                      也认"装着 base64 的 .txt 文件拖进识别窗口"；
+                    · 不是图片数据时说明真实原因（"这不是图片"而不是"图片解析失败"）；
+                    · 纯 base64 用图片魔数（iVBORw0KGgo 等）判定，普通长文本不会误判。 -->
+    <Version>2.9.1</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <StartupObject>GeZi.App</StartupObject>
     <!-- 【2026-10-03】应用图标：exe 文件图标 + 任务栏/Alt-Tab 图标。
@@ -189,6 +198,9 @@
     <!-- 零 NuGet：JSON 用框架自带的 DataContractJsonSerializer（历史记录/未完成任务持久化）。
          不要引 System.Web.Extensions —— 它依赖 System.Web，会让 WPF 的 XAML 编译器报 MC1000。 -->
     <Reference Include="System.Runtime.Serialization" />
+    <!-- 【2026-11-15】预览/缩略图需要 HttpClient（net48 要显式引用程序集）。
+         与 GeZi.Core 同款零 NuGet 做法，见 GeZi.Core.csproj 的注释。 -->
+    <Reference Include="System.Net.Http" />
   </ItemGroup>
 
 </Project>

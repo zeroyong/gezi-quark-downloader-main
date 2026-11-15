@@ -481,6 +481,30 @@ namespace GeZi.Core.Download
         /// </summary>
         private const int ReadTimeoutSec = 20;
 
+        // ==================== 慢连接重连（2026-11-10 晚新增）====================
+
+        /// <summary>
+        /// 单次读取慢于这个速率（字节/秒）就记一次"慢读"。
+        ///
+        /// <para>【为什么门槛压到 2KB/s 这么低】这不是"正常速度"的分界线，而是
+        /// **"这条连接已经没救了"** 的分界线。实测被限速的连接是 216~319 B/s
+        /// （一次读 12~19 秒才回 4KB）；正常连接最差也有几十 KB/s。
+        /// 压低是为了**绝不误伤正常慢速下载** —— 错杀会让好连接被反复重连，反而更慢。</para>
+        /// </summary>
+        private const long SlowReadBytesPerSec = 2 * 1024;
+
+        /// <summary>
+        /// 连续多少次"慢读"就掐断这条连接、重新建连。
+        ///
+        /// <para>【为什么用"连续 N 次"而不是"单次超时"】用户实测的限速特征很刁钻：
+        /// 每次都在超时之前给一点数据（12.8 秒、18.9 秒，都差一点没到 20 秒看门狗），
+        /// 所以单次超时**永远抓不到**这种连接。而连续多次都慢是确定性信号：
+        /// 这条连接分到的节点就是慢的，只有换连接才有救。</para>
+        ///
+        /// <para>取 3 次：偶发抖动不会误触发；真被限速时约 40~60 秒内会重连。</para>
+        /// </summary>
+        private const int SlowReadStrikes = 3;
+
         /// <summary>收尾阶段的最低年龄门槛。</summary>
         private const long PreemptEndgameMinAgeMs = 3_000;
 
@@ -1000,16 +1024,20 @@ namespace GeZi.Core.Download
         private static string Fmt(long bytes)
         {
             var ci = CultureInfo.InvariantCulture;
-            // 🚨 【2026-10-06 修】原来除以 1024³ 却标成 "GB" —— 那是 **GiB**，
-            // 于是同一个文件「夸克分享页写 9.54 GB、本程序写 8.89 GB」，
-            // 用户以为少下了（实测反馈：「明明9gb只下了8.99gb」）。
-            // 改成 **1000 进制**：单位名副其实，且与夸克分享页/资源管理器之外的多数场景一致。
-            // ⚠️ Windows 资源管理器用的是 1024 进制却同样标 GB，所以两者仍会有差异 ——
-            //    但那属于 Windows 自己的历史包袱，我们不做错误标注。
-            if (bytes < 1000) return bytes.ToString(ci) + " B";
-            if (bytes < 1000L * 1000) return (bytes / 1000.0).ToString("F1", ci) + " KB";
-            if (bytes < 1000L * 1000 * 1000) return (bytes / 1000.0 / 1000.0).ToString("F2", ci) + " MB";
-            return (bytes / 1000.0 / 1000.0 / 1000.0).ToString("F2", ci) + " GB";
+            // 【2026-11-10 改回 1024】与 UI 的 Util.FormatSize 统一口径。
+            //
+            // 历史：2026-10-06 曾改成 1000 进制，理由是「与夸克分享页对齐」
+            // （当时反馈「明明9gb只下了8.99gb」）。
+            // 但 2026-11-10 用户拿 **Windows 资源管理器** 核对时，本程序写 6.15 MB、
+            // 资源管理器写 5.9M —— 用户第一反应是"文件大小不对/传错了"。
+            //
+            // 裁决：用户日常核对的参照物是资源管理器，不是分享页。
+            // 大小统一 1024 进制；速率另走 1000 进制（Util.FormatSpeed）。
+            // 这里是下载日志文本，跟界面同一口径，避免两处数字对不上。
+            if (bytes < 1024) return bytes.ToString(ci) + " B";
+            if (bytes < 1024L * 1024) return (bytes / 1024.0).ToString("F1", ci) + " KB";
+            if (bytes < 1024L * 1024 * 1024) return (bytes / 1024.0 / 1024.0).ToString("F2", ci) + " MB";
+            return (bytes / 1024.0 / 1024.0 / 1024.0).ToString("F2", ci) + " GB";
         }
 
         /// <summary>
@@ -2189,8 +2217,20 @@ namespace GeZi.Core.Download
         {
             if (string.IsNullOrEmpty(name))
                 return "file";
-            var sb = new StringBuilder(name.Length);
-            foreach (char c in name)
+
+            // 【2026-11-10 修】先解 HTML 实体，再处理非法字符。
+            //
+            // 【为什么必须在这里也做一次】API 解析层（QuarkClient/UcClient）已经清洗过新任务，
+            // 但**已经存在的任务快照**（state.json 里那些 Name）存的是脏名字 ——
+            // 用户实测失败的正是这种：`I&#39;m in the &#39;Stranger Things&#39; world...`。
+            // 实体里的 & # ; 全都是 Windows 合法字符，所以下面这层过滤拦不住它们，
+            // 于是完整实体原样进入磁盘路径 → 名字凭空长出十几个字符 →
+            // 在中文 Windows 的 MAX_PATH 预算里，Directory.CreateDirectory 直接抛异常。
+            // 解析层管"新数据"，这里管"老数据 + 任何漏网的路径"，两道都要有。
+            string decoded = FileNameSanitizer.DecodeEntities(name);
+
+            var sb = new StringBuilder(decoded.Length);
+            foreach (char c in decoded)
                 sb.Append(Array.IndexOf(Path.GetInvalidFileNameChars(), c) >= 0 ? '_' : c);
             string s = sb.ToString();
             // 目录名过长会占满 MAX_PATH 预算，截断到 40 字符足够区分。
@@ -4130,6 +4170,11 @@ namespace GeZi.Core.Download
                                     if (pause != null)
                                         await pause.WaitIfPausedAsync(cancelToken).ConfigureAwait(false);
 
+                                    // 【2026-11-10 晚】每次 attempt（= 每次新建连接）都重置慢读计数。
+                                    // 重试的意义就是"换一条连接"，新连接有自己的表现，
+                                    // 不能把上一条的烂账记在它头上。
+                                    int slowReadStrikes = 0;
+
                                     if (attempt > 0)
                                     {
                                         double delayMs = 500.0 * Math.Pow(2.0, attempt - 1);
@@ -4461,6 +4506,51 @@ namespace GeZi.Core.Download
                                                     + "抢占掐不断这种阻塞。",
                                                     idx, readCostMs / 1000.0, n,
                                                     Fmt(part.W), Fmt(part.E - part.S + 1)));
+                                            }
+
+                                            // ==================== 慢连接重连（2026-11-10 晚）====================
+                                            //
+                                            // 【它解决什么】CDN 对个别连接的限速很刁钻：每次都卡在超时**之前**
+                                            // 给一点数据（实测 12.8s 回 4KB、18.9s 回 4KB ≈ 216~319 B/s），
+                                            // 于是 20 秒看门狗永远抓不到，连接就那么一直"慢而不死"地磨。
+                                            // 用户实测日志：35 条这种连接叠起来，总速度只有几 KB/s，
+                                            // 收尾阶段甚至出现「活跃=0/33、速度=0 B/s」。
+                                            //
+                                            // 【为什么不能只靠让片】让片是把活交给**别的连接**，
+                                            // 但如果所有连接都被限速（同一批 CDN 节点），转手也没用。
+                                            // 真正的解法是**换一条新连接**——新连接会拿到不同的节点。
+                                            //
+                                            // 【判据】连续 SlowReadStrikes 次读都慢于 SlowReadBytesPerSec
+                                            // → 这条连接判定为"坏"，抛异常走重试路径（下次是全新连接）。
+                                            // 用"连续 N 次"而不是单次：偶发抖动不该被误杀。
+                                            if (readCostMs >= 500 && n > 0)
+                                            {
+                                                long instBps = n * 1000L / Math.Max(1, readCostMs);
+                                                if (instBps < SlowReadBytesPerSec)
+                                                {
+                                                    slowReadStrikes++;
+                                                    if (slowReadStrikes >= SlowReadStrikes)
+                                                    {
+                                                        Log?.Invoke(string.Format(
+                                                            "[慢连接重连] 片{0} 连续 {1} 次慢读"
+                                                            + "（本次 {2} B/s，{3}s 才回 {4} 字节）→ 掐断重连换节点",
+                                                            idx, slowReadStrikes, instBps,
+                                                            readCostMs / 1000.0, n));
+                                                        // 抛 IOException 而非 OperationCanceledException：
+                                                        // 前者会走"失败重试"路径（重试 = 新建连接 = 换节点），
+                                                        // 后者会被上层当成"被抢占"处理、原样退回队列，
+                                                        // 那样就变成"同一条烂连接反复领同一片"的死循环。
+                                                        // ⚠️ 已写入的字节都在 part.W 里，重连后从这里续传，不丢数据。
+                                                        throw new IOException(string.Format(
+                                                            "连接持续过慢（{0} 次慢读，最后一次 {1} B/s），主动重连换节点",
+                                                            slowReadStrikes, instBps));
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    // 恢复正常 → 把连续计数清零，避免"间隔性慢"被累积成故障
+                                                    slowReadStrikes = 0;
+                                                }
                                             }
 
                                             // 🚨🚨【2026-11-09 修·数据正确性】按**实时**右边界截断。

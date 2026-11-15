@@ -22,6 +22,7 @@ using GeZi.Core.Api;
 using GeZi.Core.Download;
 using GeZi.Core.Models;
 using GeZi.Core.Support;
+using GeZi.Core.Upload;
 
 namespace GeZi.Core.Pan
 {
@@ -214,6 +215,33 @@ namespace GeZi.Core.Pan
 
         public Task<string> EnsureFolderAsync(string path, CancellationToken ct = default)
             => throw new NotSupportedException("UC 网盘暂不支持按路径建目录。");
+
+        /// <summary>
+        /// 上传本地文件到 UC 网盘（2026-11-10 新增）。
+        ///
+        /// <para>【实现已就绪，但**故意不声明** <see cref="PanCapabilities.Upload"/>】
+        /// UC 与夸克共用同一套上传协议，这段代码实测可用（parentFid="0" 即根目录）。
+        /// 但 GeZi 里 UC **还没有「我的网盘」浏览**（<see cref="PanCapabilities.Mine"/>
+        /// 未声明），用户根本没有选目标目录的界面 —— 这时声明上传能力，
+        /// 等于给一个只能传进根目录、无法选位置的入口。
+        /// 所以能力位暂时不声明，等 UC 的我的网盘做好了再打开，
+        /// 那时 UI 一行都不用改（按能力位自动出现）。</para>
+        /// </summary>
+        public async Task<bool> UploadAsync(string localPath, string parentFid,
+            Action<UploadPhase, long, long> progress = null, CancellationToken ct = default)
+        {
+            using (var uploader = new QuarkUploader(
+                apiBase: UcConstants.ApiBase,
+                product: "UCBrowser",
+                origin: UcConstants.WebOrigin,
+                userAgent: UcConstants.UserAgent,
+                cookie: _client.Cookie,
+                postJson: (url, body) => _client.PostJsonForUploadAsync(url, body)))
+            {
+                return await uploader.UploadAsync(localPath, parentFid, null, progress, ct)
+                    .ConfigureAwait(false);
+            }
+        }
 
         public void Dispose()
         {

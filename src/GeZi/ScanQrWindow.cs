@@ -30,17 +30,24 @@ using WpfImage = System.Windows.Controls.Image;   // 避免与 System.Drawing.Im
 namespace GeZi
 {
     /// <summary>
-    /// 「识别二维码」对话框（2026-10-04 新增）。
+    /// 「识别二维码」对话框（2026-10-04 新增，2026-11-13 改为自动识别）。
     ///
     /// 【为什么需要】夸克分享有时只给一张二维码图片、不给文本链接（用户原话：
     /// 「有些时候夸克的分享链接不是一点点形式而是二维码」）。原来只能手动
     /// 把图存下来、再找第三方工具扫，很断。这里做进软件里。
     ///
-    /// 【三种取图方式】按"顺手程度"排：
+    /// 【四种取图方式】按"顺手程度"排：
     ///   1. Ctrl+V 直接粘贴剪贴板里的截图 ← 默认，最快（截图后不用存盘）
-    ///   2. 「选择图片…」从磁盘挑
-    ///   3. 直接把图片文件拖到窗口上
-    /// 三条路统一走 <see cref="QrDecoder"/> 解码，成功后把文本回传给主窗。
+    ///   2. Ctrl+V 粘贴 <c>data:image/png;base64,…</c> 这类**文本形式的图片**
+    ///      （2026-11-13 新增；用户原话：「就是类似 这种 data:image/png;base64,iVBORw0KGg
+    ///      只是图片链接 需要转成网址」）
+    ///   3. 「选择图片…」从磁盘挑
+    ///   4. 直接把图片文件（或装着 base64 的 txt）拖到窗口上
+    /// 四条路统一走 <see cref="QrDecoder"/> 解码，成功后把文本回传给主窗。
+    ///
+    /// 【★ 读入即识别】2026-11-13 用户要求「添加二维码 自动识别功能」：
+    /// 图一进来（粘贴/选文件/拖入）就立刻在后台解码，不再需要点「识别」按钮；
+    /// 按钮保留为"自动识别失败后手动重试"的兜底。
     /// </summary>
     internal sealed class ScanQrWindow : Window
     {
@@ -49,6 +56,7 @@ namespace GeZi
 
         private byte[] _pendingBytes;                  // 待解码的原始字节
         private string _pendingPath;                   // 或文件路径
+        private bool _decoding;                        // 正在解码（防重复触发）
 
         // ⚠️ 这里的 Image 是 WPF 的 System.Windows.Controls.Image（下方 using 了别名 WpfImage），
         //    不能直接写 Image —— 会跟 System.Drawing.Image 撞名（CS0104）。
@@ -105,10 +113,10 @@ namespace GeZi
             root.Children.Add(title);
 
             var hint = DialogChrome.Hint(
-                "把夸克分享二维码图片识别成链接。支持三种方式：\n"
+                "把夸克分享二维码识别成链接。图一进来就自动识别，不用再点按钮：\n"
                 + "· 截图后按 Ctrl+V 直接粘贴（最快）\n"
-                + "· 点「选择图片…」从电脑里挑一张\n"
-                + "· 把图片文件拖到本窗口",
+                + "· 粘贴 data:image/png;base64,… 这类图片文本（也能解）\n"
+                + "· 点「选择图片…」从电脑里挑一张，或把图片文件拖到本窗口",
                 0, 12);
             Grid.SetRow(hint, 1);
             root.Children.Add(hint);
@@ -222,43 +230,118 @@ namespace GeZi
             {
                 if (LoadFromFile(f)) return;
             }
-            SetStatus("拖进来的文件读不出图片（支持的格式：PNG / JPG / BMP / GIF / WebP）", error: true);
+
+            // 【2026-11-13】不是图片 → 再试一次"装着 data:image/...;base64 的文本文件"。
+            // 用户拿到的内联图片常常是被存成 .txt / .html 的一段文本。
+            foreach (var f in files)
+            {
+                string txt;
+                if (TryReadInlineTextFile(f, out txt))
+                {
+                    LoadInlineImageText(txt, f);
+                    return;
+                }
+            }
+
+            SetStatus("拖进来的文件读不出图片（支持 PNG / JPG / BMP / GIF，"
+                      + "或内含 data:image/...;base64 的文本文件）", error: true);
+        }
+
+        /// <summary>把文件当文本读，看里面是不是内联图片数据（.txt / .html 都能蒙对）。</summary>
+        private static bool TryReadInlineTextFile(string path, out string text)
+        {
+            text = null;
+            try
+            {
+                if (!File.Exists(path)) return false;
+                var fi = new FileInfo(path);
+                if (fi.Length <= 0 || fi.Length > 8L * 1024 * 1024) return false;   // 8MB 上限
+                string t = File.ReadAllText(path);
+                if (!QrDecoder.LooksLikeInlineImageText(t)) return false;
+                text = t;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private void TryPasteFromClipboard(bool silentIfEmpty)
         {
             try
             {
-                if (!Clipboard.ContainsImage())
+                if (Clipboard.ContainsImage())
                 {
-                    if (!silentIfEmpty) SetStatus("剪贴板里没有图片。请先截图或复制一张二维码图片。", error: true);
+                    var src = Clipboard.GetImage();
+                    if (src == null)
+                    {
+                        if (!silentIfEmpty) SetStatus("剪贴板里的图片读不出来。", error: true);
+                        return;
+                    }
+
+                    // 转成 PNG 字节交给解码器（走 DecodeBytes 这条统一入口）
+                    byte[] png;
+                    using (var ms = new MemoryStream())
+                    {
+                        var enc = new PngBitmapEncoder();
+                        enc.Frames.Add(BitmapFrame.Create(src));
+                        enc.Save(ms);
+                        png = ms.ToArray();
+                    }
+
+                    SetPending(png, null);
+                    SetStatus("已读取剪贴板图片（" + src.PixelWidth + "×" + src.PixelHeight + "），正在自动识别…", error: false);
+                    AutoDecode();
                     return;
                 }
 
-                var src = Clipboard.GetImage();
-                if (src == null)
+                // 【2026-11-13】剪贴板里没有图片 —— 看文本是不是「图片数据本身」：
+                // data:image/png;base64,… 或纯 base64 图片。这是用户明确要补的路径。
+                string txt = null;
+                try
                 {
-                    if (!silentIfEmpty) SetStatus("剪贴板里的图片读不出来。", error: true);
+                    if (Clipboard.ContainsText()) txt = Clipboard.GetText();
+                }
+                catch { /* 剪贴板被别的进程占着，按"没有文本"处理 */ }
+
+                if (!string.IsNullOrEmpty(txt) && QrDecoder.LooksLikeInlineImageText(txt))
+                {
+                    LoadInlineImageText(txt, null);
                     return;
                 }
 
-                // 转成 PNG 字节交给解码器（走 DecodeBytes 这条统一入口）
-                byte[] png;
-                using (var ms = new MemoryStream())
+                if (!silentIfEmpty)
                 {
-                    var enc = new PngBitmapEncoder();
-                    enc.Frames.Add(BitmapFrame.Create(src));
-                    enc.Save(ms);
-                    png = ms.ToArray();
+                    SetStatus("剪贴板里没有图片，也不是 data:image/...;base64 图片数据。"
+                              + "请先截图/复制二维码图片，或复制那段 base64 文本。", error: true);
                 }
-
-                SetPending(png, null);
-                SetStatus("已读取剪贴板图片（" + src.PixelWidth + "×" + src.PixelHeight + "），点「识别」或按回车。", error: false);
             }
             catch (Exception ex)
             {
                 if (!silentIfEmpty) SetStatus("读剪贴板失败：" + ex.Message, error: true);
             }
+        }
+
+        /// <summary>
+        /// 把文本形式的内联图片（data URI / 纯 base64）变成待识别图片。
+        /// <paramref name="sourceHint"/> 只用于状态文案（来自哪个文件）。
+        /// </summary>
+        private void LoadInlineImageText(string text, string sourceHint)
+        {
+            byte[] bytes;
+            if (!QrDecoder.TryGetInlineImageBytes(text, out bytes))
+            {
+                SetStatus("这段文本看着像图片 base64，但解不出图片 —— 可能复制时被截断了，"
+                          + "或不是 PNG / JPG / BMP / GIF。", error: true);
+                return;
+            }
+
+            SetPending(bytes, null);
+            SetStatus("已读取内联图片数据"
+                      + (string.IsNullOrEmpty(sourceHint) ? "" : "（" + System.IO.Path.GetFileName(sourceHint) + "）")
+                      + "（" + bytes.Length + " 字节），正在自动识别…", error: false);
+            AutoDecode();
         }
 
         private bool LoadFromFile(string path)
@@ -275,7 +358,8 @@ namespace GeZi
                     int w = bmp.Width, h = bmp.Height;
                     bmp.Dispose();
                     SetPending(bytes, path);
-                    SetStatus("已选择：" + Path.GetFileName(path) + "（" + w + "×" + h + "），点「识别」或按回车。", error: false);
+                    SetStatus("已选择：" + Path.GetFileName(path) + "（" + w + "×" + h + "），正在自动识别…", error: false);
+                    AutoDecode();
                     return true;
                 }
             }
@@ -289,8 +373,18 @@ namespace GeZi
         {
             _pendingBytes = bytes;
             _pendingPath = path;
-            _decodeBtn.IsEnabled = true;
+            _decodeBtn.IsEnabled = !_decoding;
             ShowPreview(bytes, path);
+        }
+
+        /// <summary>
+        /// 【★ 2026-11-13 用户要求「添加二维码 自动识别功能」】读入图片后立刻在后台识别，
+        /// 不再需要手动点「识别」/按回车。按钮退化成"自动识别失败后手动重试"的兜底。
+        /// </summary>
+        private void AutoDecode()
+        {
+            if (_decoding || _pendingBytes == null) return;
+            DecodeNow();
         }
 
         private void ShowPreview(byte[] bytes, string path)
@@ -334,6 +428,9 @@ namespace GeZi
                 return;
             }
 
+            if (_decoding) return;   // 自动识别与手动点击可能同时发生，只跑一份
+            _decoding = true;
+
             _decodeBtn.IsEnabled = false;
             SetStatus("正在识别…", error: false);
 
@@ -349,9 +446,12 @@ namespace GeZi
                 return r;
             }).ContinueWith(t =>
             {
+                _decoding = false;
+
                 if (t.IsFaulted)
                 {
                     SetStatus("识别出错：" + (t.Exception?.GetBaseException().Message ?? "未知错误"), error: true);
+                    _decodeBtn.Content = "重新识别";
                     _decodeBtn.IsEnabled = true;
                     return;
                 }
@@ -360,6 +460,7 @@ namespace GeZi
                 if (r == null)
                 {
                     SetStatus("识别失败。", error: true);
+                    _decodeBtn.Content = "重新识别";
                     _decodeBtn.IsEnabled = true;
                     return;
                 }
@@ -367,6 +468,7 @@ namespace GeZi
                 if (!r.Ok)
                 {
                     SetStatus(r.Error ?? "没识别到二维码。", error: true);
+                    _decodeBtn.Content = "重新识别";
                     _decodeBtn.IsEnabled = true;
                     return;
                 }

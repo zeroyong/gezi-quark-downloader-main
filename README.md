@@ -4,7 +4,7 @@
 > 多线程分片下载、边下边播、多账号管理、深色模式。
 > 基于 **.NET Framework 4.8 + WPF** 开发，**零 NuGet 依赖、可完全离线构建**。
 >
-> **当前版本：v2.9.0** · [更新日志](#-更新日志) · [下载](https://github.com/zeroyong/gezi-quark-downloader-main/releases)
+> **当前版本：v2.9.1** · [更新日志](#-更新日志) · [下载](https://github.com/zeroyong/gezi-quark-downloader-main/releases)
 
 <p align="center">
   <img src="src/GeZi/Resources/app-logo.png" width="120" alt="鸽子下载">
@@ -81,7 +81,7 @@
 
 ### 方式一：下载发行版（推荐）
 
-1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.9.0-win64.zip` 并解压到任意目录
+1. 从 [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases) 下载 `GeZi-v2.9.1-win64.zip` 并解压到任意目录
 2. 双击 `GeZi.exe` 即可运行
 3. 若系统缺少 .NET Framework 4.8，Windows 会弹窗提示，按引导安装即可
 
@@ -206,7 +206,25 @@ GeZi/
 > 每条都写清楚「**原来怎样 → 现在怎样**」，方便对比。完整改动见
 > [Releases](https://github.com/zeroyong/gezi-quark-downloader-main/releases)。
 
-### v2.9.0（当前）
+### v2.9.1（当前）
+
+**新增：识别「二维码图片文本」**
+
+网页、聊天工具里拿到的二维码，经常不是图片文件、也不是图片 URL，而是**整张图编成 base64 的文本**（`data:image/png;base64,…`）。以前这串东西粘进链接框只会变成一坨乱码，没法解。
+
+用户原话：「就是类似 这种 data:image/png;base64,iVBORw0KGg 只是图片链接 需要转成网址」。
+
+| 原来怎样 | 现在怎样 |
+|---|---|
+| 粘贴/拖入 base64 图片文本 → 一坨乱码塞进链接框 | 后台解出二维码里的内容，填进链接框并自动解析 |
+| 识别窗口选好图后还要手动点「识别」 | 图一进来就自动识别，按钮退化成手动重试兜底 |
+| 纯 base64 分不清是不是图片 | 用图片魔数（`iVBORw0KGgo`/`/9j/` 等）判定，普通长文本不会误判 |
+| 折行/缺 `=`/URL-safe 全解不开 | 统一容忍（去空白、补 padding、`-`/`_` 转回标准字母表） |
+| 识别失败只报「图片解析失败」 | 明确是"这不是图片数据"还是"没扫到二维码" |
+
+识别窗口顺带支持把**装着 base64 的 .txt 文件**拖进去。
+
+### v2.9.0
 
 **新增：UC 网盘**
 

@@ -20,6 +20,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using GeZi.Core.Download;
 using GeZi.Core.Models;
+using GeZi.Core.Upload;
 
 namespace GeZi.Core.Pan
 {
@@ -116,5 +117,21 @@ namespace GeZi.Core.Pan
 
         /// <summary>按路径找 fid（不存在就建）。需 <see cref="PanCapabilities.Mine"/>。</summary>
         Task<string> EnsureFolderAsync(string path, CancellationToken ct = default);
+
+        /// <summary>
+        /// 上传一个本地文件到指定目录（2026-11-10 新增）。需 <see cref="PanCapabilities.Upload"/>。
+        ///
+        /// <para>返回 true 表示命中**秒传** —— 服务端已有同内容文件，
+        /// 一个字节都没传（不消耗上行流量）。UI 用这个值给用户更准确的提示。</para>
+        ///
+        /// <para>⚠️ 不支持上传的网盘必须抛 <see cref="NotSupportedException"/>，
+        /// 不能静默返回 false —— 否则用户会看到"上传完成"但网盘里什么都没有。</para>
+        /// </summary>
+        /// <param name="localPath">本地文件绝对路径。</param>
+        /// <param name="parentFid">目标目录 fid（根目录为 <c>"0"</c>）。</param>
+        /// <param name="progress">阶段 + 字节进度回调（可为 null）。</param>
+        /// <param name="ct">取消令牌。</param>
+        Task<bool> UploadAsync(string localPath, string parentFid,
+            Action<UploadPhase, long, long> progress = null, CancellationToken ct = default);
     }
 }

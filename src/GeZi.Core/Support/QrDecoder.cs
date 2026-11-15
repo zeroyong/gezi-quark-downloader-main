@@ -20,6 +20,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Text;
 using ZXing;
 using ZXing.Common;
 
@@ -130,6 +131,230 @@ namespace GeZi.Core.Support
             {
                 return Fail("图片解析失败：" + ex.Message);
             }
+        }
+
+        // ============================================================
+        // 文本形式的图片（2026-11-13 新增）
+        // ============================================================
+
+        /// <summary>
+        /// 【用户需求 2026-11-13】原话：「就是类似 这种 data:image/png;base64,iVBORw0KGg
+        /// 只是图片链接 需要转成网址」。
+        ///
+        /// <para>【为什么要它】网页、聊天工具、剪贴板里拿到的二维码，经常不是图片文件、
+        /// 也不是图片 URL，而是**整张图编成 base64 的文本**（<c>data:image/png;base64,…</c>）。
+        /// 原来的三条取图路径（剪贴板图片 / 选文件 / 拖文件）全都进不来 ——
+        /// 用户粘贴这串东西只会看到一坨乱码塞进输入框。这里补上"文本 → 图片字节"这一环，
+        /// 之后照旧走 <see cref="DecodeBytes"/> 识别，拿到里面的网址。</para>
+        /// </summary>
+        public static Result DecodeInlineImage(string text)
+        {
+            byte[] bytes;
+            if (!TryGetInlineImageBytes(text, out bytes))
+            {
+                return Fail("这段内容不是图片数据（既不是 data:image/...;base64，"
+                            + "也不是 base64 编码的图片）。如果它是普通网页链接，直接粘贴链接即可。");
+            }
+
+            Result r = DecodeBytes(bytes);
+            if (r != null && r.Ok && string.IsNullOrEmpty(r.Attempt))
+                r.Attempt = "内联图片";
+            return r;
+        }
+
+        /// <summary>
+        /// 廉价判断「这段文本是否长得像内联图片」——**不做** base64/图像解码，UI 线程可直接调。
+        ///
+        /// <para>只用来决定"要不要把这次粘贴/拖入拦下来交给后台处理"。
+        /// 真正能不能解出图片以 <see cref="TryGetInlineImageBytes"/> 为准。</para>
+        ///
+        /// <para>【为什么纯 base64 要认魔数】不带 <c>data:</c> 前缀时，一长串普通英文/代码
+        /// 也可能全落在 base64 字符集里。所以这里要求它**以图片的 base64 魔数开头**
+        /// （PNG 的 iVBORw0KGgo、JPEG 的 /9j/ 等），误判率几乎为零。</para>
+        /// </summary>
+        public static bool LooksLikeInlineImageText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+
+            string s = StripWhitespace(text);
+
+            if (s.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                // data:image/png;base64,xxxx —— 声明里必须写明 base64
+                if (s.IndexOf("base64", StringComparison.OrdinalIgnoreCase) < 0) return false;
+                int comma = s.IndexOf(',');
+                return comma > 0 && s.Length - comma - 1 >= MinInlinePayloadChars;
+            }
+
+            string run = LongestBase64Run(s);
+            if (run == null) return false;
+            return StartsWithImageMagic(run);
+        }
+
+        /// <summary>
+        /// 从一段文本里抠出图片字节（data URI 或纯 base64 都支持）。
+        /// 失败返回 false，不抛异常 —— 调用方（粘贴/拖拽入口）绝不能因此崩。
+        /// </summary>
+        public static bool TryGetInlineImageBytes(string text, out byte[] bytes)
+        {
+            bytes = null;
+            string payload = ExtractBase64Payload(text);
+            if (payload == null) return false;
+
+            try
+            {
+                bytes = Convert.FromBase64String(payload);
+            }
+            catch (System.FormatException)   // ⚠️ 必须写全名：ZXing 也有一个 FormatException
+            {
+                bytes = null;
+                return false;
+            }
+
+            if (bytes.Length < 64)
+            {
+                bytes = null;
+                return false;
+            }
+
+            // 最后一道确认：GDI+ 真能把它读成图才算数。
+            // 不做这一步的话，一坨"恰好是合法 base64"的乱码会被当成图片，
+            // 后面 DecodeBytes 报的错就叫"图片解析失败"，用户会一头雾水。
+            try
+            {
+                using (var ms = new MemoryStream(bytes, writable: false))
+                using (var probe = new Bitmap(ms))
+                {
+                    if (probe.Width <= 0 || probe.Height <= 0)
+                    {
+                        bytes = null;
+                        return false;
+                    }
+                }
+            }
+            catch
+            {
+                bytes = null;
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>内联图片至少要这么长的 base64 段 —— 再短不可能是一张能扫出来的二维码。</summary>
+        private const int MinInlinePayloadChars = 200;
+
+        /// <summary>
+        /// 图片 base64 的开头特征（用来确认"这是图不是按钮一长串文本"）：
+        /// PNG = iVBORw0KGgo，JPEG = /9j/，GIF = R0lGOD，WebP = UklGR，ICO = AAABAA。
+        /// </summary>
+        private static readonly string[] ImageBase64Heads =
+        {
+            "iVBORw0KGgo",
+            "/9j/",
+            "R0lGOD",
+            "UklGR",
+            "AAABAA",
+        };
+
+        private static bool StartsWithImageMagic(string run)
+        {
+            foreach (var head in ImageBase64Heads)
+            {
+                if (run.StartsWith(head, StringComparison.Ordinal)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>去掉所有空白字符（base64 常被折行，复制时也常带空格/换行）。</summary>
+        private static string StripWhitespace(string text)
+        {
+            var sb = new StringBuilder(text.Length);
+            foreach (char c in text)
+            {
+                if (char.IsWhiteSpace(c)) continue;
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        private static bool IsBase64Char(char c)
+        {
+            return (c >= 'A' && c <= 'Z')
+                || (c >= 'a' && c <= 'z')
+                || (c >= '0' && c <= '9')
+                || c == '+' || c == '/' || c == '=' || c == '-' || c == '_';
+        }
+
+        /// <summary>
+        /// 取文本中最长的 base64 连续段。
+        /// 【为什么不直接整段当 base64】粘贴内容常带前后缀（引号、"data:image/png;base64,"、
+        /// 末尾的说明文字/"提取码:abcd"），整段解必然失败；按段取才稳。
+        /// </summary>
+        private static string LongestBase64Run(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return null;
+
+            string best = null;
+            int start = -1;
+            for (int i = 0; i <= s.Length; i++)
+            {
+                bool ok = i < s.Length && IsBase64Char(s[i]);
+                if (ok)
+                {
+                    if (start < 0) start = i;
+                }
+                else if (start >= 0)
+                {
+                    int len = i - start;
+                    if (len >= MinInlinePayloadChars && (best == null || len > best.Length))
+                        best = s.Substring(start, len);
+                    start = -1;
+                }
+            }
+            return best;
+        }
+
+        /// <summary>
+        /// 从文本里抽出可用的 base64 载荷（已去空白、归一化 URL-safe 字符、补齐 padding）。
+        /// 返回 null 表示"这段文本里没有像图片 base64 的东西"。
+        /// </summary>
+        private static string ExtractBase64Payload(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+
+            string s = StripWhitespace(text);
+
+            if (s.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                int comma = s.IndexOf(',');
+                if (comma <= 0) return null;
+
+                string meta = s.Substring(0, comma);
+                // 只支持 base64 形态的 data URI；URL 编码形态（data:image/svg+xml,<svg…>）
+                // 不是位图，也没有二维码可解，直接不认。
+                if (meta.IndexOf("base64", StringComparison.OrdinalIgnoreCase) < 0) return null;
+
+                s = s.Substring(comma + 1);
+
+                // 网页里拷出来时可能带 URL 编码（%2B、%2F、%3D）
+                if (s.IndexOf('%') >= 0)
+                {
+                    try { s = Uri.UnescapeDataString(s); } catch { /* 还原失败就按原样试 */ }
+                }
+            }
+
+            string run = LongestBase64Run(s);
+            if (run == null) return null;
+
+            // base64url（- 和 _）统一回标准字母表，否则 Convert.FromBase64String 会拒收
+            run = run.Replace('-', '+').Replace('_', '/');
+
+            int pad = run.Length % 4;
+            if (pad == 1) return null;                       // 长度 4n+1 不可能是合法 base64
+            if (pad > 0) run += new string('=', 4 - pad);    // 补齐 padding（很多来源会省掉'='）
+
+            return run;
         }
 
         /// <summary>从已加载的 Bitmap 解码。</summary>
