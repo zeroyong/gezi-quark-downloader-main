@@ -172,6 +172,14 @@ namespace GeZi.Core.Download
         private int _lastRemainParts;
 
         /// <summary>
+        /// 停滞中止时记录的**剩余字节量**（2026-11-15 新增）。
+        /// <para>【为什么光数片不够】tailLimit 上限是 32 片，而用户实测收尾时
+        /// 剩 57 片（每片只剩几十 KB）—— 按片数判「不是收尾」→ 停滞中止后
+        /// **不换链**直接失败。改成片数与字节量双判据：剩余 ≤16MB 也算收尾。</para>
+        /// </summary>
+        private long _lastRemainBytes;
+
+        /// <summary>
         /// 上一次运行时的实际并发路数（0 = 未知）。
         ///
         /// <para>【2026-10-24 新增】主循环判断"收尾阶段"要用它算收尾上限
@@ -491,7 +499,14 @@ namespace GeZi.Core.Download
         /// （一次读 12~19 秒才回 4KB）；正常连接最差也有几十 KB/s。
         /// 压低是为了**绝不误伤正常慢速下载** —— 错杀会让好连接被反复重连，反而更慢。</para>
         /// </summary>
-        private const long SlowReadBytesPerSec = 2 * 1024;
+        /// <summary>
+        /// 慢读重连的绝对下限。【2026-11-15 修】2KB/s → **12KB/s**，对齐 YunX 的
+        /// PREEMPT_MIN_BPS。依据（YunX DownloadManager.kt 实测注释）：网盘 CDN
+        /// **按连接限速**，多数连接 40~80KB/s、慢节点只有 3~7KB/s —— 低于 12KB/s
+        /// 的连接必然是慢节点，重连换节点稳赚；原值 2KB/s 会让 3~11KB/s 的慢节点
+        /// 长期占着片不撒手，收尾阶段正是它们拖死总速度。
+        /// </summary>
+        private const long SlowReadBytesPerSec = 12 * 1024;
 
         /// <summary>
         /// 连续多少次"慢读"就掐断这条连接、重新建连。
@@ -1360,7 +1375,12 @@ namespace GeZi.Core.Download
                 // 判据必须与抢占/爬行统一，否则三处各说各话。
                 int tailLimit = Math.Min(PreemptEndgameInflightMax,
                     Math.Max(PreemptEndgameInflight, _lastWorkerCount / PreemptEndgameDivisor));
-                bool tailStall = _lastRemainParts > 0 && _lastRemainParts <= tailLimit;
+                // 【2026-11-15】收尾判定加**字节维度**：片数判据有盲区（用户实测剩 57 片
+                // 每片只剩几十 KB —— 57 > 32 被判"不是收尾"，停滞中止后不换链直接失败）。
+                // 剩余 ≤16MB 时无论多少片都按收尾处理 —— 换链成本（一次取链请求）
+                // 远低于"换到新节点"的收益，磨几分钟不如立刻换。
+                bool tailStall = (_lastRemainParts > 0 && _lastRemainParts <= tailLimit)
+                    || (_lastRemainBytes > 0 && _lastRemainBytes <= 16L * 1024 * 1024);
 
                 if (LinkRefresher == null || refreshed >= maxRefreshes)
                     break;
@@ -3012,6 +3032,23 @@ namespace GeZi.Core.Download
                 // 没有这个数字就只能猜，所以必须能观测。
                 int activeConns = 0;
 
+                // ==================== 【2026-11-15 尾部掉速第二轮修复】====================
+                // 用户实测：收尾阶段「活跃=0/256、剩57片、速度 95B/s」，
+                // 换链后速度有提升但连接数只有 1~2 个（开的是 256 线程）。
+                // 修复组合：① 剩余 ≤16MB 视为「收尾」，限流不再收窄、软闸门直接放行
+                // （收尾的请求风暴无害，收并发只有害处）；② 停滞换链判据加字节维度
+                // （57 片 > 32 片上限的盲区）；③ 慢读重连门槛 2→12KB/s 对齐 YunX。
+                // 16MB 的依据：收尾阶段剩余几 MB 时，即使单连接 40KB/s，
+                // 全并发几秒也能冲完 —— 此时任何"省请求"的保护都是负收益。
+                const long TailEndgameBytes = 16 * 1024 * 1024;
+
+                /// <summary>当前未完成字节总量（reporter 每秒刷新，供 OnThrottled/软闸门读）。</summary>
+                long remainBytesNow = 0;
+                /// <summary>当前挂在分片上、还没退出的 worker 数（诊断：并发塌缩定位）。</summary>
+                int claimedWorkers = 0;
+                /// <summary>当前在「队列空等待循环」里轮询的空闲 worker 数（诊断用）。</summary>
+                int idleWorkers = 0;
+
                 // workerCount 要等分片规划完成后才知道，但诊断日志在 reporter 里就要用，
                 // 所以用一个可写盒把它桥接过去。
                 int workerCountBox = 0;
@@ -3346,10 +3383,15 @@ namespace GeZi.Core.Download
                             try
                             {
                                 int remainNow = 0;
+                                long remainBytes = 0;
                                 for (int pi = 0; pi < plan.Parts.Count; pi++)
                                     if (plan.Parts[pi].W < plan.Parts[pi].E - plan.Parts[pi].S + 1)
+                                    {
                                         remainNow++;
+                                        remainBytes += plan.Parts[pi].E - plan.Parts[pi].S + 1 - plan.Parts[pi].W;
+                                    }
                                 _lastRemainParts = remainNow;
+                                _lastRemainBytes = remainBytes;
                             }
                             catch { }
 
@@ -3396,13 +3438,20 @@ namespace GeZi.Core.Download
                         if (!draining && (pause == null || !pause.IsPaused))
                         {
                             int remainForCrawl = 0;
+                            long remainBytesScan = 0;
                             try
                             {
                                 for (int pi = 0; pi < plan.Parts.Count; pi++)
                                     if (plan.Parts[pi].W < plan.Parts[pi].E - plan.Parts[pi].S + 1)
+                                    {
                                         remainForCrawl++;
+                                        remainBytesScan += plan.Parts[pi].E - plan.Parts[pi].S + 1 - plan.Parts[pi].W;
+                                    }
                             }
                             catch { remainForCrawl = int.MaxValue; }
+                            // 【2026-11-15】每秒刷新剩余字节 —— OnThrottled / 软闸门的
+                            // 「收尾豁免」判据读它（见 TailEndgameBytes）。
+                            Volatile.Write(ref remainBytesNow, remainBytesScan);
 
                             int wkForCrawl = Volatile.Read(ref workerCountBox);
                             int crawlEndgameLimit = Math.Min(PreemptEndgameInflightMax,
@@ -3444,10 +3493,13 @@ namespace GeZi.Core.Download
 
                                     Log?.Invoke(string.Format(
                                         "[诊断·收尾] 剩{0}片/{1} 速度={2}/s 活跃={3}/{4} "
-                                        + "stalled={5} | {6}",
+                                        + "stalled={5} | 挂片worker={6} 空闲等活={7} 剩余={8} | {9}",
                                         remainForCrawl, Fmt(remainBytes), Fmt((long)speed),
                                         Volatile.Read(ref activeConns), Volatile.Read(ref workerCountBox),
                                         Volatile.Read(ref stalledFlag),
+                                        Volatile.Read(ref claimedWorkers),
+                                        Volatile.Read(ref idleWorkers),
+                                        Fmt(Volatile.Read(ref remainBytesNow)),
                                         sb.ToString()));
                                 }
                             }
@@ -3778,6 +3830,13 @@ namespace GeZi.Core.Download
 
                 void OnThrottled()
                 {
+                    // 【2026-11-15】收尾阶段**不收窄**：剩余 ≤16MB 时即使被 429/503
+                    // 也不要减并发 —— 收尾的小 Range 请求本身就密集，被限流是常态；
+                    // 而收窄后剩余几 MB 磨不完任务就结束了，永远等不回 30 秒一档的
+                    // 恢复节奏（GateRecoverQuietMs）—— 用户实测换链后只有 1~2 路就是它。
+                    // 429 的正确应对在收尾是 worker 自身的退避重试，不是全局降并发。
+                    if (Volatile.Read(ref remainBytesNow) <= TailEndgameBytes) return;
+
                     lock (gateLock)
                     {
                         throttleHits++;
@@ -3940,6 +3999,11 @@ namespace GeZi.Core.Download
                                 // 绝不因为"这一小会儿没活"就遣散工人。
                                 int idleWaitMs = 0;
                                 bool gotWork = false;
+                                // 【2026-11-15 诊断】空闲等活的 worker 数 —— 收尾监控里
+                                // 「活跃=0/256」时最想知道的数字：多少人活着在等、多少人卡在片上。
+                                Interlocked.Increment(ref idleWorkers);
+                                try
+                                {
                                 while (true)
                                 {
                                     if (cancelToken.IsCancellationRequested) return;
@@ -3988,6 +4052,11 @@ namespace GeZi.Core.Download
                                     try { await Task.Delay(200, cancelToken).ConfigureAwait(false); }
                                     catch (OperationCanceledException) { return; }
                                 }
+                                }
+                                finally
+                                {
+                                    Interlocked.Decrement(ref idleWorkers);
+                                }
 
                                 if (!gotWork)
                                 {
@@ -4004,14 +4073,19 @@ namespace GeZi.Core.Download
                             // 限流缩缸只改 concurrencyTarget，真正"少开连接"靠这里：
                             // 在飞 worker 数已达目标时，本 worker 先等一下再领片。
                             // 好处：收放对称、不碰信号量、**不掐断正在跑的连接**。
+                            // 【2026-11-15】收尾（剩余 ≤16MB）直接放行：此时就算 CDN
+                            // 限流，也应该用满连接冲完最后一小段，而不是把 57 个片
+                            // 交给 1~2 路慢慢磨（用户实测的「换链后连接只有一两个」）。
                             while (true)
                             {
+                                if (Volatile.Read(ref remainBytesNow) <= TailEndgameBytes) break;
                                 int softTarget = Volatile.Read(ref concurrencyTarget);
                                 if (Volatile.Read(ref activeWorkers) < softTarget) break;
                                 try { await Task.Delay(50, cancelToken).ConfigureAwait(false); }
                                 catch (OperationCanceledException) { return; }
                             }
                             Interlocked.Increment(ref activeWorkers);
+                            Interlocked.Increment(ref claimedWorkers);   // 【2026-11-15 诊断】挂片 worker 数
 
                             await gate.WaitAsync(cancelToken).ConfigureAwait(false);
                             bool gateTaken = true;
@@ -4312,6 +4386,16 @@ namespace GeZi.Core.Download
                                                 // 分片进度全在 .qmeta 里，换链后从断点续传，一字节不重下。
                                                 if (IsSignatureExpired(lastErr))
                                                 {
+                                                    // 【2026-11-15】收兵日志带时间戳与现场：
+                                                    // "活跃=0 但换链耗时 70 秒"这类问题只有量化了
+                                                    // 收兵→全员退出→换链各段耗时才能定位。
+                                                    Log?.Invoke(string.Format(
+                                                        "[诊断·收兵] 直链签名过期，全体收兵 t={0:mm\\:ss\\.fff} "
+                                                        + "活跃={1} 挂片={2} 空闲={3}",
+                                                        DateTime.Now.TimeOfDay,
+                                                        Volatile.Read(ref activeConns),
+                                                        Volatile.Read(ref claimedWorkers),
+                                                        Volatile.Read(ref idleWorkers)));
                                                     try { watchdog.Cancel(); } catch { }
                                                 }
 
@@ -4729,6 +4813,7 @@ namespace GeZi.Core.Download
                                 // 软并发闸门的"在飞"计数必须在这里减 ——
                                 // 上面有 continue（分片已完整时），只有 finally 能保证一定执行。
                                 Interlocked.Decrement(ref activeWorkers);
+                                Interlocked.Decrement(ref claimedWorkers);   // 【2026-11-15 诊断】配对
                                 if (gateTaken)
                                     gate.Release();
                             }

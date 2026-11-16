@@ -122,3 +122,20 @@ shell-options.html
 # 结论已经落进代码（src/GeZi.Core/Upload/），文档不必跟着仓库走。
 夸克上传方案.html
 夸克上传机制参考.md
+
+# ---------- 根目录工作产物（2026-11-15 清理，不入库） ----------
+# 这些都是"过程性材料"：方案 / 评估 / 诊断 / 原型页、临时笔记、外部素材。
+# 结论都已经落进代码或记忆库，仓库只留源码与正式文档
+#（README / LICENSE / THIRD-PARTY-NOTICES / FLUTTER-PORT-PLAN）。
+# ⚠️ 只忽略**根目录**的 *.html（前置 / 锚定根）——
+#    src/GeZi/Resources/player.html 这类项目内页面不受影响。
+/*.html
+/demo-shots/
+/github-stars-collector/
+/*.user.js
+/xiaozhou.png
+/截图清单.md
+/制作脚本.md
+/发布清单.md
+/调试说明.md
+/运行说明.md
