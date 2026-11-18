@@ -1880,6 +1880,119 @@ namespace GeZi
             UpdatePathText();
         }
 
+        // ==================== 【2026-11-17 新增】重建多层祖先链 ====================
+        //
+        // 【问题·用户实测】链接 `https://pan.quark.cn/s/xxx#/list/share/<fid>` 指向
+        // 一个**深层目录**时，解析后面包屑只有一节（如「好书籍推荐 | ...」），
+        // 而真实层级是 `全部文件 / 2024年 / 每日荐书 | 0… / 好书籍推荐 | ...`。
+        //
+        // 【根因】解析流程里 `_curFid = info.StartFid; await LoadDirAsync(_curFid);`
+        // —— 直接把当前位置**瞬移**到深层 fid，但 `_fidStack`（祖先 fid）与
+        // `_pathList`（祖先文件夹名）都是空的。面包屑 BuildCrumbs 完全依赖这两条链，
+        // 于是只能画出一层。用户点"上一级"也会直接跳回根，中间的层全丢了。
+        //
+        // 【修法】解析时从**分享根**开始逐层下钻：每层列出目录、找哪个子文件夹包含
+        // 目标层，找到就把该层的 fid/名字压进两条链，直到抵达目标 fid。
+        // 这是一个 BFS（含剪枝与预算），因为链接只给了终点 fid，没给路径。
+
+        /// <summary>重建祖先链的目录请求预算（一次解析最多枚举这么多次目录）。</summary>
+        private const int AncestorScanBudget = 40;
+
+        /// <summary>重建祖先链时最多下钻的层数（防异常数据导致超深递归）。</summary>
+        private const int AncestorScanMaxDepth = 12;
+
+        /// <summary>
+        /// 从分享根出发，重建通往 <paramref name="targetFid"/> 的祖先链
+        /// （填 <see cref="_fidStack"/> 与 <see cref="_pathList"/>，**不含**目标层本身）。
+        ///
+        /// <para>返回 true = 找到了路径（两条链已就位）；false = 没找到（两条链清空，
+        /// 调用方按"只有当前一层"处理 —— 宁可少画几节，也不要画出错的路径）。</para>
+        ///
+        /// <para>⚠️ 只在**分享模式**下有意义：fid 属于分享快照，与个人网盘不通用。</para>
+        /// </summary>
+        private async Task<bool> RebuildShareAncestorChainAsync(
+            GeZi.Core.Pan.IPanProvider provider, string pwdId, string stoken, string targetFid)
+        {
+            _fidStack.Clear();
+            _pathList.Clear();
+            if (provider == null || string.IsNullOrEmpty(targetFid)) return false;
+            if (string.Equals(targetFid, "0", StringComparison.Ordinal)) return false;   // 目标就是根
+
+            // BFS 元素 = (该层的 fid, 该层的名字, 从根到**该层父级**的 (fid 列表, 名字列表))
+            // 结构化携带两条链，避免"先记名字再反推 fid"那种错位写法。
+            var queue = new Queue<AncestorNode>();
+            // 分享根：夸克用空串表示根 fid，UC 用其 first_fid。
+            queue.Enqueue(new AncestorNode
+            {
+                Fid = string.IsNullOrEmpty(_shareStartFid) || _shareStartFid == "0" ? "" : _shareStartFid,
+                Name = null,                      // 根没有名字（面包屑第一节用 _shareRootName）
+                Fids = new List<string>(),
+                Names = new List<string>(),
+            });
+
+            var visited = new HashSet<string>(StringComparer.Ordinal);
+            int budget = AncestorScanBudget;
+
+            while (queue.Count > 0 && budget-- > 0)
+            {
+                var cur = queue.Dequeue();
+                if (cur.Fids.Count >= AncestorScanMaxDepth) continue;
+                if (!string.IsNullOrEmpty(cur.Fid) && !visited.Add(cur.Fid)) continue;
+
+                List<QuarkFileEntry> kids;
+                try
+                {
+                    kids = await provider.ListShareAllAsync(pwdId, stoken, cur.Fid ?? "");
+                }
+                catch (Exception ex)
+                {
+                    Log("[诊断·祖先链] 列目录失败（fid=" + (cur.Fid ?? "(根)") + "）: " + ex.Message);
+                    continue;
+                }
+                if (kids == null) continue;
+
+                foreach (var k in kids)
+                {
+                    if (k == null || !k.IsDir) continue;
+
+                    if (string.Equals(k.Fid, targetFid, StringComparison.Ordinal))
+                    {
+                        // cur 就是目标的父级：cur.Fids / cur.Names 即祖先链（根→父）。
+                        for (int i = 0; i < cur.Fids.Count; i++)
+                            _fidStack.Push(cur.Fids[i]);
+                        _pathList.AddRange(cur.Names);
+                        Log(string.Format("[诊断·祖先链] 已重建 {0} 层祖先：{1}",
+                            cur.Names.Count,
+                            cur.Names.Count == 0 ? "(目标是根下第一层)" : string.Join(" / ", cur.Names.ToArray())));
+                        return true;
+                    }
+
+                    // 继续下钻：这一层成为下一轮的"父级路径"的最后一环
+                    var nf = new List<string>(cur.Fids) { k.Fid };
+                    var nn = new List<string>(cur.Names) { k.Name ?? "" };
+                    queue.Enqueue(new AncestorNode { Fid = k.Fid, Name = k.Name, Fids = nf, Names = nn });
+                }
+            }
+
+            Log("[诊断·祖先链] 未能在预算内找到目标目录的完整路径（仅显示当前层）。");
+            return false;
+        }
+
+        /// <summary>BFS 节点：携带"从根到本节点的父级"的两条链。</summary>
+        private sealed class AncestorNode
+        {
+            /// <summary>本层 fid（根为空串）。</summary>
+            public string Fid;
+            /// <summary>本层名字（根为 null）。</summary>
+            public string Name;
+            /// <summary>从根到**本层父级**的 fid 序列。</summary>
+            public List<string> Fids;
+            /// <summary>从根到**本层父级**的名字序列。</summary>
+            public List<string> Names;
+        }
+
+
+
         // ---------------- 下载页「上次浏览位置」持久化（2026-10-21） ----------------
         //
         // 【需求】用户反馈「每次重启启动应用，下载页都会重置，能否保留上次的浏览文件位置，
@@ -2730,6 +2843,23 @@ namespace GeZi
                 // _curFid 之后会随用户导航变化，不能当分享起点用。
                 _sharePasscode = passcode ?? "";
                 _shareStartFid = string.IsNullOrEmpty(info.StartFid) ? "0" : info.StartFid;
+
+                // 【2026-11-17 新增】链接指向**深层目录**时重建祖先链（面包屑/上一级需要）。
+                // 用户实测：`#/list/share/<fid>` 深层链接解析后只显示一节面包屑，
+                // 真实层级有 4 层。根因是这里直接把 _curFid 瞬移到深层 fid，
+                // 而 _fidStack / _pathList 是空的。详见 RebuildShareAncestorChainAsync。
+                if (!string.IsNullOrEmpty(info.StartFid) && info.StartFid != "0")
+                {
+                    try
+                    {
+                        await RebuildShareAncestorChainAsync(provider, info.PwdId, _stoken, info.StartFid);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("[诊断·祖先链] 重建失败（按单层显示）: " + ex.Message);
+                    }
+                }
+
                 // 分享的"父文件夹名"，供面包屑与任务分组显示。
                 //
                 // 【2026-10-24 第二次修：不再区分 StartFid 是否为 0】
