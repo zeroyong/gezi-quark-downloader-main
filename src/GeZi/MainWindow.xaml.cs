@@ -1937,28 +1937,41 @@ namespace GeZi
                 return false;
             }
 
-            // 接口返回的链**含目标层自己**（实测：3 层目录返回 3 项，最后一项即目标）。
-            // 祖先链要去掉最后一项（目标层由 _curFid 表示）。
-            int last = path.Count - 1;
-            bool tailIsTarget = string.Equals(
-                path[last].Fid, targetFid, StringComparison.Ordinal);
-            int ancestorCount = tailIsTarget ? last : path.Count;
-            if (ancestorCount <= 0)
-            {
-                Log("[诊断·祖先链] 目标是根下第一层，无需祖先。");
-                return true;   // 合法的"只有一层"
-            }
+            // 【2026-11-17 第三版·修正层级丢失】接口返回的链**含目标层自己**
+            //（实测 3 层目录返回 3 项，末项即 pdir_fid）。
+            //
+            // ★ 上一版错在哪：我把末项当成"目标层"排除了，只填祖先 —— 于是
+            // `_pathList` 里没有当前层，而 `BuildCrumbs` 的**当前层恰恰是 _pathList
+            // 的最后一项**。结果面包屑少一层（用户截图：真实 3 层只显示到「2024年」，
+            // 日志还理直气壮地说「已重建 1 层祖先」，因为 2024年 确实是唯一祖先）。
+            //
+            // ★ 正确语义对照 EnterFolder（正常进目录）：
+            //     _fidStack.Push(_curFid);   // 压**父级**的 fid
+            //     _curFid = dir.Fid;         // 当前层变子目录
+            //     _pathList.Add(dir.Name);   // 加**子目录名**（= 新的当前层名）
+            //   所以：_fidStack = [根, …, 父级]（不含当前层），
+            //         _pathList = [第1层名, …, 当前层名]（**含当前层**）。
+            //
+            // 接口的 path 是 [第1层, …, 当前层]。据此：
+            //   _pathList = path 全部名字（含目标）
+            //   _fidStack = 根 "0" + path 里除末项外的所有 fid（即祖先，含根）
+            var names = new List<string>(path.Count);
+            foreach (var n in path) names.Add(n.Name ?? "");
 
-            for (int i = 0; i < ancestorCount; i++)
-            {
-                // _fidStack 语义：Push 顺序 = 根→父，栈顶是最直接的上一层；
-                // BuildCrumbs 会 Reverse 成 [根, …, 父]。此处与它严格对齐。
+            int lastIdx = path.Count - 1;
+            bool tailIsTarget = string.Equals(path[lastIdx].Fid, targetFid, StringComparison.Ordinal);
+            // 祖先 fid = 根 + path[0..最后一项之前]
+            int ancestorEnd = tailIsTarget ? lastIdx : path.Count;   // 不含末项
+
+            _fidStack.Push("0");                    // 分享根
+            for (int i = 0; i < ancestorEnd; i++)
                 _fidStack.Push(path[i].Fid);
-                _pathList.Add(path[i].Name ?? "");
-            }
-            Log(string.Format("[诊断·祖先链] 已重建 {0} 层祖先：{1}",
-                ancestorCount, string.Join(" / ", _pathList.ToArray())));
-            return true;
+            _pathList.AddRange(names);
+
+            Log(string.Format("[诊断·祖先链] 已重建：{0}（共 {1} 层，当前层={2}）",
+                string.Join(" / ", _pathList.ToArray()), _pathList.Count,
+                tailIsTarget ? "接口末项匹配" : "接口末项不匹配（按全部当作祖先）"));
+            return _pathList.Count > 0;
         }
 
 
@@ -5863,6 +5876,64 @@ namespace GeZi
                     e.Handled = true;
                     FocusFileFilter();
                     break;
+                case Key.Space:   // 预览当前目录的第一张图片（2026-11-17 用户需求）
+                    e.Handled = true;
+                    PreviewFirstImageInList();
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 空格键：直接预览**当前目录的第一张图片**（2026-11-17 用户需求）。
+        ///
+        /// <para>【用户原话】「觉得可以添加一个快捷键 空格 直接打开当前目录的第一张图片
+        /// （jpg/png) 不用鼠标点 在设置里说明」——省掉"移动鼠标到行上再单击"这一步，
+        /// 看一串图片时按空格就能连看（预览窗内还有 A/D 前后切换）。</para>
+        ///
+        /// <para>【取哪一张】优先用**当前选中**的图片（若选中的就是可预览图片）；
+        /// 否则取列表里第一张可预览图片。都没有就在提示条说明，不静默。
+        /// 判据复用 <see cref="ShareFileItem.PreviewKindOf"/>，与单击预览完全一致。</para>
+        /// </summary>
+        private void PreviewFirstImageInList()
+        {
+            try
+            {
+                // ① 选中的是图片 → 直接预览它（尊重用户已经选中的那行）
+                ShareFileItem target = null;
+                if (FileList != null && FileList.SelectedItem is ShareFileItem sel
+                    && !sel.IsDir
+                    && ShareFileItem.PreviewKindOf(sel.Name) == ShareFileItem.PreviewKind.Image)
+                {
+                    target = sel;
+                }
+
+                // ② 否则取列表里第一张图片
+                if (target == null)
+                {
+                    foreach (var f in _files)
+                    {
+                        if (f == null || f.IsDir) continue;
+                        if (ShareFileItem.PreviewKindOf(f.Name) == ShareFileItem.PreviewKind.Image)
+                        {
+                            target = f;
+                            break;
+                        }
+                    }
+                }
+
+                if (target == null)
+                {
+                    ShowDownloadHint("当前目录里没有图片（jpg / png / gif / bmp）可预览。");
+                    Log("空格预览：当前目录没有可预览的图片。");
+                    return;
+                }
+
+                Log("空格预览：" + target.Name);
+                _ = OpenPreviewAsync(target);
+            }
+            catch (Exception ex)
+            {
+                Log("空格预览失败: " + ex.Message);
             }
         }
 
