@@ -3171,6 +3171,38 @@
                                               Style="{StaticResource AppCheckBox}"
                                               Click="OnSettingChanged"/>
 
+                                    <!-- ============ 【2026-11-17】下载完整性校验 ============
+                                         真实案例：217MB 文件大小完全正确、文件头正常，
+                                         尾部 17.9MB 全是 0x00，游戏一加载就崩 —— 原有的
+                                         「合并后大小校验」只比长度，对补零损坏完全无感。
+                                         方案见仓库根 GeZi-下载完整性校验方案.md。 -->
+                                    <TextBlock Text="完整性校验" Style="{StaticResource SectionLabel}"
+                                               Margin="0,16,0,8"/>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="150"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="校验等级" Style="{StaticResource FieldLabel}"
+                                                   VerticalAlignment="Center"/>
+                                        <ComboBox x:Name="IntegrityLevelBox" Grid.Column="1"
+                                                  MaxWidth="360" HorizontalAlignment="Left"
+                                                  SelectionChanged="OnIntegrityLevelChanged">
+                                            <ComboBoxItem Content="关闭（不推荐）"/>
+                                            <ComboBoxItem Content="快速 — 分片校验 + 尾零扫描 + zip CRC（默认）"/>
+                                            <ComboBoxItem Content="严格 — 快速 + 全文件零洞扫描（大文件慢 10~30 秒）"/>
+                                        </ComboBox>
+                                    </Grid>
+                                    <TextBlock Text="拦住「大小完全正常、内容却是空的」这种静默损坏。快速档开销约 +2~5 秒。"
+                                               Style="{StaticResource TertiaryText}" FontSize="11"
+                                               TextWrapping="Wrap" Margin="150,0,0,8"/>
+
+                                    <CheckBox x:Name="VerifyZipCheck"
+                                              Content="对下载完成的 .zip 逐条目校验 CRC32（零误报，能指出坏在哪个条目）"
+                                              Style="{StaticResource AppCheckBox}"
+                                              Click="OnVerifyZipChanged"
+                                              AutomationProperties.Name="zip 逐条目 CRC 校验"/>
+
                                     <!-- 【2026-10-24 新增】下载前询问是否转存。
                                          用户实测：「发现免转存速度甚至比转存快，所以在下载选中时，
                                          添加提示：是否转存文件后下载，这样不仅下载速度变慢、

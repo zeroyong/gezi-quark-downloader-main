@@ -304,6 +304,21 @@ namespace GeZi.Core.Download
         private const int MaxSegmentRetries = 4;
 
         /// <summary>
+        /// **单片**最多因"慢读"掐断重连的次数（2026-11-15 新增，对齐 YunX 的 PREEMPT_MAX=3）。
+        /// <para>【为什么必须限次】CDN 全局慢时（用户实测 4KB/10 秒 ≈ 400 B/s），
+        /// 重连换节点换不到好的 —— 无限掐断 = 把 MaxSegmentRetries 全耗在
+        /// "重连→还是慢"上，片永远下不完、worker 重试耗尽后退出。
+        /// 限次后：掐 3 次认命，用当前慢连接把片读完 —— 慢，但一定读得完。</para>
+        /// </summary>
+        private const int SlowReconnectMaxPerPart = 3;
+
+        /// <summary>
+        /// 剩余量低于此值就不再因慢读掐断重连（2026-11-15 新增，对齐 YunX
+        /// PREEMPT_MIN_REMAIN=128KB）：重连的握手+TLS 成本比"慢悠悠读完这一小段"更高。
+        /// </summary>
+        private const long SlowReconnectMinRemainBytes = 128 * 1024;
+
+        /// <summary>
         /// 真实并发天花板。用户选的档位可以很高，但物理上"同时开着的连接数"
         /// 必须有个上限，否则会把本机网络栈和家用路由器的 NAT 表一起打爆。
         ///
@@ -506,7 +521,25 @@ namespace GeZi.Core.Download
         /// 的连接必然是慢节点，重连换节点稳赚；原值 2KB/s 会让 3~11KB/s 的慢节点
         /// 长期占着片不撒手，收尾阶段正是它们拖死总速度。
         /// </summary>
-        private const long SlowReadBytesPerSec = 12 * 1024;
+        /// <summary>
+        /// 判定"连接真的慢"的**平均速率**下限（2026-11-15 二次修正：12KB/s → 2KB/s）。
+        ///
+        /// <para>【为什么调回 2KB/s】12KB/s 是 YunX 的**抢占**门槛（决定"要不要把活
+        /// 分给别的连接"），不是"要不要掐断这条连接"。掐断要付 TLS 握手 + 重新爬窗口
+        /// 的代价，判据必须严得多。用户实测：7.2KB/s 的连接被判"过慢"抛异常，
+        /// 重试耗尽后整个任务报失败（进度 72.7% 却显示"失败"）——纯属误伤。</para>
+        ///
+        /// <para>【配合累计窗口】单次 ReadAsync 常只回 4096 字节（TCP 分段），
+        /// 拿单次算速率会严重低估；现在用 attempt 的累计平均速率判定，见
+        /// <see cref="SlowReadWindowMs"/>。</para>
+        /// </summary>
+        private const long SlowReadBytesPerSec = 2 * 1024;
+
+        /// <summary>
+        /// 慢读判定的最小观察窗口（2026-11-15 新增）：attempt 跑够这么久才开始算平均速率，
+        /// 太短的窗口会被建连、TLS 握手、首个 4096 字节等启动开销淹没。
+        /// </summary>
+        private const long SlowReadWindowMs = 8000;
 
         /// <summary>
         /// 连续多少次"慢读"就掐断这条连接、重新建连。
@@ -619,6 +652,14 @@ namespace GeZi.Core.Download
         private const int HelpSlowIdleMs = 3000;
 
         /// <summary>
+        /// 互助判据的「预计还要磨多久」阈值（2026-11-15 学 Gopeed 的 tailTargetTime=3s）。
+        /// <para>按当前速率算，某片预计还要 &gt; 这个秒数才值得被接管。
+        /// 比"多久没写入"聪明的地方：**慢但在写**的连接（实测 4KB/10 秒）
+        /// 照样会被判为"值得帮"——旧的"无写入"判据抓不到它。</para>
+        /// </summary>
+        private const int HelpEtaSeconds = 3;
+
+        /// <summary>
         /// 把"长尾分片"切细，喂给空转的 worker（2026-11-09 新增）。
         ///
         /// <para>【它解决什么】用户日志的铁证：
@@ -683,7 +724,10 @@ namespace GeZi.Core.Download
             System.Collections.Concurrent.ConcurrentQueue<int> queue,
             object splitLock,
             int selfIdx, int workerCount, int partCapacity,
-            long[] partLastMs)
+            long[] partLastMs,
+            System.Collections.Concurrent.ConcurrentDictionary<int, byte> abandonedParts = null,
+            long[] partBytesAtSample = null,
+            long[] partSampleMs = null)
         {
             if (plan == null || workerCount <= 1) return false;
 
@@ -700,6 +744,8 @@ namespace GeZi.Core.Download
             for (int i = 0; i < plan.Parts.Count; i++)
             {
                 if (i == selfIdx) continue;
+                // 【2026-11-15】放弃的片不再接管（它是重试耗尽的，接了还是白搭）
+                if (abandonedParts != null && abandonedParts.ContainsKey(i)) continue;
                 var p = plan.Parts[i];
                 long sz = p.E - p.S + 1;
                 long left = sz - Volatile.Read(ref p.W);
@@ -708,12 +754,31 @@ namespace GeZi.Core.Download
 
                 // 剩余量够大 → 直接值得帮
                 bool worthHelping = left >= 2 * HelpMinRemainBytes;
-                if (!worthHelping && partLastMs != null)
+                if (!worthHelping)
                 {
-                    // 剩余不多，但这一路很久没写入 → 被卡住了，也值得帮
-                    long lastMs = 0;
-                    try { lastMs = Volatile.Read(ref partLastMs[i]); } catch { }
-                    if (lastMs > 0 && nowMs - lastMs >= HelpSlowIdleMs) worthHelping = true;
+                    // 【2026-11-15 学 Gopeed·判据升级】Gopeed 的 tailSample.slow() 判的是
+                    // 「按当前速率还要磨多久」（>3 秒就值得帮），而不是「多久没写入」。
+                    //
+                    // 【为什么必须换】用户实测日志里那批连接是「一次 ReadAsync 花 8~14 秒
+                    // 才返回 4096 字节」≈400 B/s —— 它**一直在写**，只是极慢。
+                    // 旧的「3 秒无写入」判据抓不到它（它每秒都在写一点点），
+                    // 于是这种连接就攥着片慢慢磨，整任务被它拖住。
+                    //
+                    // 新判据：剩余量 / 速率 > 3 秒 → 值得帮。同样 10KB/s，
+                    // 剩 4MB 要磨 400 秒（该帮），剩 20KB 只需 2 秒（不该管）。
+                    double bps = EstimatePartBps(plan, i, nowMs, partBytesAtSample, partSampleMs);
+                    if (bps >= 0)
+                    {
+                        double etaSec = bps > 1 ? left / bps : double.MaxValue;
+                        if (etaSec > HelpEtaSeconds) worthHelping = true;
+                    }
+                    else
+                    {
+                        // 还没攒够采样（刚接手）→ 退回旧的时间判据兜底
+                        long lastMs = 0;
+                        try { lastMs = Volatile.Read(ref partLastMs[i]); } catch { }
+                        if (lastMs > 0 && nowMs - lastMs >= HelpSlowIdleMs) worthHelping = true;
+                    }
                 }
                 if (!worthHelping) continue;
 
@@ -754,6 +819,120 @@ namespace GeZi.Core.Download
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// 估算某个分片的瞬时速率（B/s），供互助判据判断"这一路还要磨多久"
+        /// （2026-11-15 学 Gopeed 的 tailSample）。
+        ///
+        /// <para>【数据来源】reporter 每秒把"每片已写字节 + 采样时刻"记进
+        /// <paramref name="bytesAtSample"/> / <paramref name="sampleMs"/>，
+        /// 这里用「当前 W − 上次采样 W」/ 时间差 得到最近约 1 秒的速率。
+        /// 返回负数表示样本不足（刚接手、刚采样、或读不到），调用方退回旧判据。</para>
+        /// </summary>
+        private static double EstimatePartBps(DownloadPlan plan, int i, long nowMs,
+            long[] bytesAtSample, long[] sampleMs)
+        {
+            if (plan == null || bytesAtSample == null || sampleMs == null
+                || i < 0 || i >= plan.Parts.Count || i >= bytesAtSample.Length) return -1;
+            try
+            {
+                long t0 = Volatile.Read(ref sampleMs[i]);
+                long b0 = Volatile.Read(ref bytesAtSample[i]);
+                if (t0 <= 0 || nowMs <= t0) return -1;
+                long dtMs = nowMs - t0;
+                if (dtMs < 400) return -1;                 // 样本太新，等下一轮采样
+                long cur = Volatile.Read(ref plan.Parts[i].W);
+                long delta = cur - b0;
+                if (delta < 0) return -1;                  // 让片/重置等异常态，不参与判定
+                return delta * 1000.0 / dtMs;
+            }
+            catch { return -1; }
+        }
+
+        // ==================== 【2026-11-17 新增·防线一】分片重下对比 ====================
+
+        /// <summary>
+        /// 把分片 <paramref name="idx"/> 按当前 plan 区间**重下到 {part}.recheck**，
+        /// 与现有分片比 SHA1，择一保留。返回是否替换了内容。
+        ///
+        /// <para>【为什么是"重下对比"而不是"直接重下"】单凭"分片含大零段"不能定罪 ——
+        /// 合法文件也可能含零段（ISO padding、store 模式 zip 里的空数据）。
+        /// 同 Range 重下两次内容一致 ⇒ **源数据本来如此**，放行。这是零误报的关键。</para>
+        ///
+        /// <para>【为什么不改 done 计数】原地重下对比：只动 `{part}.recheck` 临时文件，
+        /// 比较后择一改名，完全不碰 `part.S/E/W` —— 与让片（TryYieldTailOfPart）、
+        /// 窃取（SplitLongestPartIfNeeded）零冲突，也不会让进度超过 100%。</para>
+        /// </summary>
+        private async Task<bool> ReDownloadPartForCompareAsync(
+            string url, Dictionary<string, string> headers, PartPlan part,
+            string partsDir, int idx, CancellationToken ct)
+        {
+            string pp = PartPath(partsDir, idx);
+            string tmp = pp + ".recheck";
+            try
+            {
+                var h = new Dictionary<string, string>(headers)
+                {
+                    ["Range"] = "bytes=" + part.S + "-" + part.E,
+                };
+                using (var req = BuildRequest(HttpMethod.Get, url, h))
+                using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false))
+                {
+                    int code = (int)resp.StatusCode;
+                    if (code != 200 && code != 206)
+                        throw new IOException("重下对比失败：HTTP " + code);
+                    using (var src = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                    using (var dst = new FileStream(tmp, FileMode.Create, FileAccess.Write,
+                               FileShare.None, 1024 * 1024, FileOptions.Asynchronous))
+                    {
+                        var buf = new byte[1024 * 1024];
+                        long remain = part.E - part.S + 1;
+                        while (remain > 0)
+                        {
+                            int n = await src.ReadAsync(buf, 0, (int)Math.Min(buf.Length, remain), ct).ConfigureAwait(false);
+                            if (n <= 0) throw new IOException("重下对比：源提前结束");
+                            await dst.WriteAsync(buf, 0, n, ct).ConfigureAwait(false);
+                            remain -= n;
+                        }
+                    }
+                }
+
+                string h1 = Sha1OfFile(pp), h2 = Sha1OfFile(tmp);
+                if (!string.Equals(h1, h2, StringComparison.Ordinal))
+                {
+                    // 两次内容不同 → 原分片确实坏了，采用新下的这份。
+                    try { File.Delete(pp); } catch { }
+                    File.Move(tmp, pp);
+                    Log?.Invoke("[完整性] 重下内容与原分片不同 → 原分片损坏，已替换为正确内容。");
+                    return true;
+                }
+                // 两次一致 → 源数据本来如此。
+                return false;
+            }
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            }
+        }
+
+        /// <summary>算文件 SHA1（分片 15~30MB，几十毫秒级）。</summary>
+        private static string Sha1OfFile(string path)
+        {
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                           FileShare.ReadWrite | FileShare.Delete, 1024 * 1024,
+                           FileOptions.SequentialScan))
+                using (var sha = System.Security.Cryptography.SHA1.Create())
+                {
+                    var hash = sha.ComputeHash(fs);
+                    var sb = new System.Text.StringBuilder(hash.Length * 2);
+                    foreach (var b in hash) sb.Append(b.ToString("x2"));
+                    return sb.ToString();
+                }
+            }
+            catch { return ""; }
         }
 
 
@@ -1993,12 +2172,10 @@ namespace GeZi.Core.Download
             // ⚠️ 别怕小文件被切碎：下面 seg 会被夹到 [MinSegBytes=512KB, maxSegBytes]，
             //    100MB 文件仍只切出 200 片，不会变成"每条连接跑不到一片"的碎渣。
             // 分档基础值让极小文件不会被切成碎渣。
-            long bySize;
-            if (total < 5L * 1024 * 1024)             bySize = 1;
-            else if (total < 32L * 1024 * 1024)       bySize = 4;
-            else if (total < 256L * 1024 * 1024)      bySize = 16;
-            else if (total < 2L * 1024 * 1024 * 1024) bySize = 32;
-            else                                       bySize = 64;
+            // 【2026-11-15】原来的 `bySize` 分档基础值（1/4/16/32/64）与
+            // `max(bySize, eff×8)` 一起删除：片数现在直接等于有效并发，
+            // 小文件由下面的 capByMinChunk（每片 ≥1MB 的预算）与
+            // minSegNow（≥256KB 下限）兜住，不再需要按大小分档。
             // 片数 = max(按大小算的基础值, 有效并发 × 8)，再用两部上限兜住：
             //   ① capByMinChunk —— 保证单片不低于 1MB；
             //   ② MaxSegments  —— 元数据硬上限。
@@ -2011,7 +2188,29 @@ namespace GeZi.Core.Download
             //     下完 0.5MB 要 2~4 分钟 —— 期间它一直"忙着"，但吞吐极低。
             //   · 6000+ 片 × 每片一次 Range 请求 = 建连/握手开销被放大数倍。
             // 原版用 `eff * 8` + capByMinChunk 兜住，宁可片大一点。
-            long wantParts = Math.Max(bySize, (long)eff * 8);
+            // ==================== 【2026-11-15 学 Gopeed：每连接一块】====================
+            // 用户实测要求（原话）：「不是让你移植全部，是让你学会人家的思路 然后移植过来。
+            // 现在手机实测 256 线程，人家是一次性就有，然后速度提升也很快」。
+            //
+            // 【Gopeed 怎么做】internal/protocol/http/fetcher.go 的 splitConnection()：
+            //     chunkSize = size / connections
+            //     connections[i].Chunk = [chunkSize*i, chunkSize*(i+1)-1]
+            // **一次性等分，每个连接拿一整块，一个 HTTP 请求从头流到尾**。
+            //
+            // 【GeZi 原来怎么做，为什么慢】这里原来是 `wantParts = max(bySize, eff*8)`：
+            // 片数 = 连接数的 8 倍（还要被"至少 4× 连接数"兜住）——
+            // 4.12GB / 512 连接会切成 4096 片 × 1MB，**每个 worker 要下 8 片**。
+            // 两个代价：
+            //   ① 每下完一片都要"回领片循环 → 认领 → 发新请求"，8 次空转间隙；
+            //   ② ★ 更要命的：1MB 的短请求**刚进入 TCP 拥塞窗口增长期就结束了**，
+            //      下一个 Range 请求又从较小的窗口重新爬 —— 连接永远在慢启动里打转，
+            //      吞吐自然上不去。Gopeed 的 8MB 长流能让窗口一路涨到链路极限。
+            //
+            // 【现在怎么改】片数 ≈ 有效并发（每连接一块），单片尽量大（由下面的
+            // maxSegBytes 分档与 minSegNow 兜底）。长尾不靠"切碎"来防 ——
+            // 靠互助（TryHelpOtherPart 切走别人剩余的一半）与让片（TryYieldTailOfPart），
+            // 这两套机制本来就是为"大片攥在少数连接手里"设计的，正好互补。
+            long wantParts = eff;
             if (wantParts < 1) wantParts = 1;
 
             // 片数上限①：单片不低于 MinSegBytes（1MB）。
@@ -2424,6 +2623,15 @@ namespace GeZi.Core.Download
             // 剩余量虽小、但已经 3 秒没动静 → 值得别的 worker 接管。
             // 与 partDone 一样按 partCapacity 留余量（动态追加新片会用到后面的槽位）。
             long[] partLastWriteMs = new long[partCapacity];
+            // 【2026-11-15 学 Gopeed·tailSample】每片的速率采样：
+            // reporter 每秒把 (该片已写字节, 采样时刻) 记一份，互助判据据此算
+            // "按当前速率还要磨多久"，从而抓住"慢但在写"的长尾连接。
+            long[] partBytesAtSample = new long[partCapacity];
+            long[] partSampleMs = new long[partCapacity];
+
+            // 【2026-11-17 新增·防线一】每片"可疑后自动重下对比"的次数。
+            // 存在内存数组即可：续传重启后清零是可接受的（新会话重新给机会，不会卡死）。
+            int[] extraDl = new int[partCapacity];
 
             if (mergeMode)
             {
@@ -2663,6 +2871,14 @@ namespace GeZi.Core.Download
             var boostQueue = new ConcurrentQueue<int>();
             // 【2026-10-24】claimed/boosted 同样要留出动态窃取追加的余量（见 partDone 的注释）。
             var claimed = new int[partCapacity];   // 0=未认领，1=已认领/已完成
+
+            // 【2026-11-15 新增】被放弃的分片。
+            // 【为什么需要】原来"片重试耗尽"直接让 worker `return` 永久退出 ——
+            // CDN 全局慢时（实测 4KB/10 秒），256 路 worker 会在几分钟内一批批
+            // 死光，连接数从 256 单调掉到个位数（用户实测截图 14/256）。
+            // 现在：片耗尽重试 → 记进这里（不再重试、不参与完成判定），
+            // **worker 继续领别的片**；任务收尾时若这里有内容，按"部分分片失败"上报。
+            var abandonedParts = new System.Collections.Concurrent.ConcurrentDictionary<int, byte>();
             var boosted = new int[partCapacity];   // 同一片只进一次优先队列
             var boostPreemptBox = new long[1];         // 上次为播放抢占的时间（节流）
 
@@ -3453,6 +3669,20 @@ namespace GeZi.Core.Download
                             // 「收尾豁免」判据读它（见 TailEndgameBytes）。
                             Volatile.Write(ref remainBytesNow, remainBytesScan);
 
+                            // 【2026-11-15 学 Gopeed·tailSample】同时刷新"每片速率采样"：
+                            // 记下此刻每片的 W 与时刻，互助判据下一次就能算出最近约 1 秒的
+                            // 速率（EstimatePartBps），从而救回"慢但在写"的长尾连接。
+                            try
+                            {
+                                long sampleNow = NowMs();
+                                for (int pi = 0; pi < plan.Parts.Count; pi++)
+                                {
+                                    Volatile.Write(ref partBytesAtSample[pi], Volatile.Read(ref plan.Parts[pi].W));
+                                    Volatile.Write(ref partSampleMs[pi], sampleNow);
+                                }
+                            }
+                            catch { }
+
                             int wkForCrawl = Volatile.Read(ref workerCountBox);
                             int crawlEndgameLimit = Math.Min(PreemptEndgameInflightMax,
                                 Math.Max(PreemptEndgameInflight, wkForCrawl / PreemptEndgameDivisor));
@@ -3830,36 +4060,28 @@ namespace GeZi.Core.Download
 
                 void OnThrottled()
                 {
-                    // 【2026-11-15】收尾阶段**不收窄**：剩余 ≤16MB 时即使被 429/503
-                    // 也不要减并发 —— 收尾的小 Range 请求本身就密集，被限流是常态；
-                    // 而收窄后剩余几 MB 磨不完任务就结束了，永远等不回 30 秒一档的
-                    // 恢复节奏（GateRecoverQuietMs）—— 用户实测换链后只有 1~2 路就是它。
-                    // 429 的正确应对在收尾是 worker 自身的退避重试，不是全局降并发。
-                    if (Volatile.Read(ref remainBytesNow) <= TailEndgameBytes) return;
-
+                    // 【2026-11-15 学 Gopeed·取消全局并发收窄】
+                    // 用户实测：「新任务还是没有跑满 256 连接，而且现在有时候连接数还会减小」。
+                    // 减小就是这里造成的：CDN 报一次 429/503 就把全局并发砍 30%，
+                    // 而恢复是 30 秒才 +1 路（GateRecoverQuietMs）—— 于是 256 会一路
+                    // 缩到 179 → 125 → …… 再也回不满。
+                    //
+                    // 【Gopeed 怎么做的】它的 effectiveConnections() 只按文件大小收敛
+                    //（每路至少 256KB / 夸克 64KB），**没有任何"被限流就全局降并发"的逻辑**；
+                    // 429/503 交给每条连接自己的重试（retries 参数）消化。
+                    // 对齐之后：连接数只由文件大小与用户设置决定，不会被限流悄悄吃掉。
+                    //
+                    // 保留计数与日志：用户仍能看到"服务端在限流"这一事实，
+                    // 但不再因此降并发（降并发只会让速度更差，风控该拒还是拒）。
                     lock (gateLock)
                     {
                         throttleHits++;
-                        long nowThrottleMs = Environment.TickCount;
-                        lastThrottleMs = nowThrottleMs;
-                        // 15 秒窗口内只收窄一次：一波风控只降一档，
-                        // 而不是被几百个 429 各降一档、直接砸到下限。
-                        if (lastNarrowMs != 0 && nowThrottleMs - lastNarrowMs < ThrottleNarrowDebounceMs)
-                            return;
-                        lastNarrowMs = nowThrottleMs;
-                        // 【2026-10-24 修】不再用 gate.Wait(0) 去"偷票"（理由见上方
-                        // concurrencyTarget 的注释）：只改软目标，由 worker 在领片前自查。
-                        // 好处是收放完全对称、不持锁阻塞、且只影响新开连接，
-                        // **不掐断正在跑的连接**。
-                        int cur = Volatile.Read(ref concurrencyTarget);
-                        int next = Math.Max(throttleFloor, (int)(cur * 0.7));   // 每次砍 30%
-                        if (next >= cur)
-                            return;
-                        Volatile.Write(ref concurrencyTarget, next);
-                        Log?.Invoke(string.Format(
-                            "检测到服务端限流（第 {0} 次），下载并发自动收窄到 {1} 路以避免触发更严格的风控。",
-                            throttleHits, next));
+                        lastThrottleMs = Environment.TickCount;
                     }
+                    Log?.Invoke(string.Format(
+                        "检测到服务端限流（第 {0} 次），已按 Gopeed 的做法交给各连接自行退避重试 —— "
+                        + "不再降低全局并发（保持 {1} 路），以免速度被自己砍掉。",
+                        throttleHits, Volatile.Read(ref concurrencyTarget)));
                 }
 
                 var workers = new Task[workerCount];
@@ -3879,6 +4101,9 @@ namespace GeZi.Core.Download
                     {
                         for (int i = 0; i < plan.Parts.Count; i++)
                         {
+                            // 【2026-11-15】放弃的片不参与完成判定 —— 否则它永远"没下完"，
+                            // worker 会一直等到 60 秒 idle 上限才退，任务也永远收不了尾。
+                            if (abandonedParts.ContainsKey(i)) continue;
                             var p = plan.Parts[i];
                             if (p.W < p.E - p.S + 1) return false;
                         }
@@ -3887,9 +4112,9 @@ namespace GeZi.Core.Download
                     catch { return true; }   // 读不到就认为完成，避免 worker 永久悬挂
                 }
 
-                // 分批开连接的闸门（Gopeed slowStartController 思路，2026-10-24 从原版补回）。
-                // 光靠时间错峰不保证前一批已建好连接 —— 见 SlowStartGate 的注释。
-                var slowStartGate = new SlowStartGate(workerCount);
+                // 【2026-11-15】分批闸门已按用户要求取消（见 worker 启动处注释）。
+                // SlowStartGate 类定义保留在文件里（历史实现，注释说明了它解决什么），
+                // 但不再实例化 —— 一次性拉起全部连接。
                 for (int w = 0; w < workerCount; w++)
                 {
                     int workerNo = w;
@@ -3912,25 +4137,21 @@ namespace GeZi.Core.Download
                         // 此时它们不该集体退出（见下面等待循环的长注释）。
                         long lastSeenDone = Interlocked.Read(ref done);
 
-                        // 冷启动错峰：多个 worker 同时发起首请求会挤在一起做 TLS 握手，
-                        // 不仅拖慢首个字节时间，还更容易触发服务端限流。
+                        // ==================== 【2026-11-15 用户实测要求：取消慢启动】====================
+                        // 用户原话：「一开始 线程数 没有展示 但是有下载速度；还有线程数是慢慢增加的
+                        // 但是原版 是可以一下子有512线程的 参考一下，修复」。
                         //
-                        // 这里按"占 workerCount 的比例"把一个固定总时长摊开，
-                        // 而不是固定每路递增多少毫秒：后者在几百路时会让后半数 worker
-                        // 全被夹到上限，反而聚成一堆同时爆发，等于没错峰。
+                        // 原先这里有两道"温柔起跑"：
+                        //   ① 冷启动错峰：512 路把首请求摊到 6 秒里陆续发起；
+                        //   ② SlowStartGate 分批闸门：每批等前一批一半连接就绪（或 3 秒超时）。
+                        // 它们的设计初衷是防"首连风暴"（几百个 TLS 握手挤在一起、更容易触发
+                        // 服务端限流）。但实测体验是"连接数慢慢爬"，用户明确要求对齐原版行为：
+                        // **一次性拉起全部连接**。
                         //
-                        // 总时长随并发量级走：512 路若仍压进 3 秒，等于每秒发起 170 次
-                        // 握手，仍然偏猛；延长到 6 秒让连接建立更平滑。
-                        if (workerNo > 0)
-                        {
-                            double rampMs = workerCount > 256 ? 6000.0 : 3000.0;
-                            double staggerMs = rampMs * workerNo / Math.Max(1, workerCount);
-                            await Task.Delay(TimeSpan.FromMilliseconds(staggerMs), cancelToken).ConfigureAwait(false);
-                        }
-
-                        // 时间错峰之后还要等"前一批真的建好连接"（见 SlowStartGate）。
-                        try { await slowStartGate.WaitTurnAsync(workerNo, cancelToken).ConfigureAwait(false); }
-                        catch (OperationCanceledException) { return; }
+                        // 现在直接满并发齐发。若日后真遇到路由器 NAT 表被打爆（表现为大量
+                        // 连接超时/失败），再按需加回一个**很轻**的错峰（每路 1~2ms 量级），
+                        // 而不是现在这种 6 秒铺开 + 分批等待。
+                        // ==========================================================================
 
                         while (true)
                         {
@@ -4025,7 +4246,8 @@ namespace GeZi.Core.Download
                                     try
                                     {
                                         if (TryHelpOtherPart(plan, queue, splitLock,
-                                                workerNo, workerCount, partCapacity, partLastWriteMs))
+                                                workerNo, workerCount, partCapacity, partLastWriteMs,
+                                                abandonedParts, partBytesAtSample, partSampleMs))
                                         {
                                             // 已接管一个新片并已入队 → 立刻回去领它
                                             continue;
@@ -4238,6 +4460,13 @@ namespace GeZi.Core.Download
                                 // 片内所有 I/O 走 partToken：看门狗抢占时只掐这一片，
                                 // 不影响其他 worker，也不污染全局取消语义。
                                 var partToken = pcts.Token;
+                                // 【2026-11-15 二次修正·作用域 bug】"本片已掐断重连次数"必须
+                                // **跨 attempt 累积**（声明在 attempt 循环之外）。
+                                // 原来它声明在循环体内 → 每次重试归零 → "每片最多掐断 3 次"
+                                // 完全失效，于是一条慢连接会反复掐断、把 MaxSegmentRetries
+                                // 的 4 次重试预算全耗尽 → 片被判失败 → 用户看到「下载失败」
+                                // 而进度明明已经 72.7%。
+                                int slowReconnects = 0;
                                 for (int attempt = 0; attempt <= MaxSegmentRetries; attempt++)
                                 {
                                     // 暂停中不要发起新请求：恢复后直接从这一行继续往下走。
@@ -4248,6 +4477,12 @@ namespace GeZi.Core.Download
                                     // 重试的意义就是"换一条连接"，新连接有自己的表现，
                                     // 不能把上一条的烂账记在它头上。
                                     int slowReadStrikes = 0;
+                                    // 【2026-11-15 二次修正】本次 attempt 的"累计速率窗口"起点。
+                                    // 慢读判据改成用 attempt 的平均速率（累计字节/累计耗时），
+                                    // 而不是单次 ReadAsync 的瞬时值 —— 后者会被 TCP 分段
+                                    //（一次只回 4096 字节）严重低估，导致 7KB/s 的正常连接被误判成慢。
+                                    long attemptStartMs = NowMs();
+                                    long attemptStartWritten = part.W;
 
                                     if (attempt > 0)
                                     {
@@ -4339,6 +4574,16 @@ namespace GeZi.Core.Download
 
                                     try
                                     {
+                                        // ==================== 【2026-11-15 统计口径修正】====================
+                                        // 「活跃连接」从**发请求之前**就开始计（含 TLS 握手、等响应头、
+                                        // 读数据），而不是只在"读响应体"时才算。
+                                        //
+                                        // 【为什么】用户实测截图「109/256 连接」以为没跑满 ——
+                                        // 其实 256 路都在工作，只是建连阶段（实测 1~4 秒）原来完全
+                                        // 不计入：老口径下 256 路同时建连时这个数字会掉到一半以下。
+                                        // 手机端 Gopeed 显示的是"已建立的连接数"，语义与此一致。
+                                        // Decrement 在本次 attempt 的 finally 里配对（见下方 finally）。
+                                        Interlocked.Increment(ref activeConns);
                                         // 【2026-10-25】从盒子取当前直链：
                                         // 后台预取任务换链后，这里自然读到新链。
                                         string curUrl = linkBox.Url;
@@ -4346,14 +4591,10 @@ namespace GeZi.Core.Download
                                         using (var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ioTok).ConfigureAwait(false))
                                         {
                                             int code = (int)resp.StatusCode;
-                                            // 首次拿到成功响应 = TCP+TLS 握手完成 → 放行下一批 worker。
-                                            // （2026-10-24 从原版补回：没有这一步，SlowStartGate 永远等不到
-                                            //  就绪信号，只能靠 3 秒超时兜底，等于错峰失效。）
+                                            // 【2026-11-15】分批闸门已取消，这里不再需要就绪信号。
+                                            // （firstResponseSeen 变量保留仅用于将来可能的轻量错峰改造）
                                             if (!firstResponseSeen && (code == 200 || code == 206))
-                                            {
                                                 firstResponseSeen = true;
-                                                slowStartGate.MarkReady();
-                                            }
                                             if (code == 200 && !(reqStart == 0 && part.E >= total - 1))
                                             {
                                                 // 服务器忽略 Range（且不是整文件单段）→ 交给单线程处理
@@ -4445,7 +4686,6 @@ namespace GeZi.Core.Download
 
                                                 using (wfs)
                                                 {
-                                                    Interlocked.Increment(ref activeConns);
                                                     try
                                                     {
                                                         // 【2026-11-02 新增】下载中途的"主动让片"。
@@ -4606,35 +4846,74 @@ namespace GeZi.Core.Download
                                             //
                                             // 【判据】连续 SlowReadStrikes 次读都慢于 SlowReadBytesPerSec
                                             // → 这条连接判定为"坏"，抛异常走重试路径（下次是全新连接）。
-                                            // 用"连续 N 次"而不是单次：偶发抖动不该被误杀。
-                                            if (readCostMs >= 500 && n > 0)
+                                            //
+                                            // ============ 【2026-11-15 二次修正·用户实测报错】============
+                                            // 用户截图：「失败: IOException: 连接持续过慢（3 次慢读，
+                                            // 最后一次 7344 B/s），主动重连换节点」progress 72.7%。
+                                            // 7344 B/s = 7.2KB/s —— **这根本不是慢连接**，却被判死。
+                                            //
+                                            // 【根因：用单次 ReadAsync 的耗时当速率】上次把门槛提到 12KB/s
+                                            // 后更暴露了这个问题：一次 read 只返回 4096 字节是**正常现象**
+                                            //（TCP 分段、64KB 缓冲区尚未填满），拿 n*1000/readCostMs
+                                            // 算出来的是"这一次 read 的瞬时值"，不是连接的真实吞吐。
+                                            //
+                                            // 【改法·对齐 Gopeed 的 tailSample 思路】用**本次 attempt 的
+                                            // 累计窗口**算平均速率：attempt 已跑够 SlowReadWindowMs，
+                                            // 且「累计字节 / 累计耗时」仍低于门槛，才算这条连接真的慢。
+                                            // 这样 7KB/s 的连接不会被误杀（它累计下来就是 7KB/s > 2KB/s）。
+                                            // 门槛同时降回 2KB/s（12KB/s 是 YunX 的"抢占"门槛，
+                                            // 用于决定"要不要把活分给别人"，不是"要不要掐断连接"——
+                                            // 掐断要付 TLS 握手成本，判据必须严得多）。
+                                            long remainHere = Math.Max(0, (part.E - part.S + 1) - written);
+                                            if (readCostMs >= 500 && n > 0
+                                                && slowReconnects < SlowReconnectMaxPerPart
+                                                && remainHere >= SlowReconnectMinRemainBytes)
                                             {
-                                                long instBps = n * 1000L / Math.Max(1, readCostMs);
-                                                if (instBps < SlowReadBytesPerSec)
+                                                // 累计窗口速率：本次 attempt 从开始到现在
+                                                long attemptElapsedMs = NowMs() - attemptStartMs;
+                                                long attemptBytes = written - attemptStartWritten;
+                                                if (attemptElapsedMs >= SlowReadWindowMs && attemptBytes > 0)
                                                 {
-                                                    slowReadStrikes++;
-                                                    if (slowReadStrikes >= SlowReadStrikes)
+                                                    long avgBps = attemptBytes * 1000L / Math.Max(1, attemptElapsedMs);
+                                                    if (avgBps < SlowReadBytesPerSec)
                                                     {
-                                                        Log?.Invoke(string.Format(
-                                                            "[慢连接重连] 片{0} 连续 {1} 次慢读"
-                                                            + "（本次 {2} B/s，{3}s 才回 {4} 字节）→ 掐断重连换节点",
-                                                            idx, slowReadStrikes, instBps,
-                                                            readCostMs / 1000.0, n));
-                                                        // 抛 IOException 而非 OperationCanceledException：
-                                                        // 前者会走"失败重试"路径（重试 = 新建连接 = 换节点），
-                                                        // 后者会被上层当成"被抢占"处理、原样退回队列，
-                                                        // 那样就变成"同一条烂连接反复领同一片"的死循环。
-                                                        // ⚠️ 已写入的字节都在 part.W 里，重连后从这里续传，不丢数据。
-                                                        throw new IOException(string.Format(
-                                                            "连接持续过慢（{0} 次慢读，最后一次 {1} B/s），主动重连换节点",
-                                                            slowReadStrikes, instBps));
+                                                        slowReadStrikes++;
+                                                        if (slowReadStrikes >= SlowReadStrikes)
+                                                        {
+                                                            slowReconnects++;
+                                                            Log?.Invoke(string.Format(
+                                                                "[慢连接重连] 片{0} 连接平均速率仅 {1} B/s"
+                                                                + "（{2} 秒内 {3}，已连续 {4} 次采样偏低）"
+                                                                + " → 掐断重连换节点（第 {5}/{6} 次）",
+                                                                idx, avgBps, attemptElapsedMs / 1000,
+                                                                Fmt(attemptBytes), slowReadStrikes,
+                                                                slowReconnects, SlowReconnectMaxPerPart));
+                                                            // 抛 IOException 而非 OperationCanceledException：
+                                                            // 前者会走"失败重试"路径（重试 = 新建连接 = 换节点），
+                                                            // 后者会被上层当成"被抢占"处理、原样退回队列，
+                                                            // 那样就变成"同一条烂连接反复领同一片"的死循环。
+                                                            // ⚠️ 已写入的字节都在 part.W 里，重连后从这里续传，不丢数据。
+                                                            throw new IOException(string.Format(
+                                                                "连接平均速率过低（{0} B/s），主动重连换节点", avgBps));
+                                                        }
+                                                    }
+                                                    else
+                                                    {
+                                                        // 恢复正常 → 把连续计数清零，避免"间隔性慢"被累积成故障
+                                                        slowReadStrikes = 0;
                                                     }
                                                 }
-                                                else
-                                                {
-                                                    // 恢复正常 → 把连续计数清零，避免"间隔性慢"被累积成故障
-                                                    slowReadStrikes = 0;
-                                                }
+                                            }
+                                            else if (slowReconnects >= SlowReconnectMaxPerPart
+                                                     && slowReadStrikes >= SlowReadStrikes)
+                                            {
+                                                // 掐断次数用尽：认了这条慢路，把计数清掉继续读 ——
+                                                // 关键是**别再抛异常**，否则就是"重连→慢→重连"的死循环。
+                                                slowReadStrikes = 0;
+                                                Log?.Invoke(string.Format(
+                                                    "[诊断·慢读] 片{0} 已掐断重连 {1} 次仍慢，接受当前连接继续读"
+                                                    + "（本片剩 {2}，慢也比反复重连强）",
+                                                    idx, slowReconnects, Fmt(remainHere)));
                                             }
 
                                             // 🚨🚨【2026-11-09 修·数据正确性】按**实时**右边界截断。
@@ -4688,7 +4967,8 @@ namespace GeZi.Core.Download
                                                     }
                                                     finally
                                                     {
-                                                        Interlocked.Decrement(ref activeConns);
+                                                        // 【2026-11-15】Decrement 已移到 attempt 级 finally
+                                                        //（与"发请求前"的 Increment 配对），这里不再处理。
                                                     }
                                                 }
 
@@ -4705,6 +4985,77 @@ namespace GeZi.Core.Download
                                                     continue;
                                                 }
                                             }
+
+                                            // ==================== 【2026-11-17 新增·防线一】====================
+                                            // 分片写满、流已关闭，但**还没通知合并线程**——这是唯一能
+                                            // "在坏数据进入目标文件之前拦下它"的时机。
+                                            // 可疑判据：最长连续零段 ≥1MB，或零占比 ≥95% 且片 ≥4MB。
+                                            // 判为可疑后**重下对比**裁决（两次一致 = 源数据本来如此 → 放行）。
+                                            if (mergeMode && IntegrityChecker.Level != IntegrityChecker.VerifyLevel.Off)
+                                            {
+                                                try
+                                                {
+                                                    string partFile = PartPath(partsDir, idx);
+                                                    long expectBytes = part.E - part.S + 1;
+                                                    IntegrityChecker.ZeroScan scan;
+                                                    if (IntegrityChecker.IsPartSuspicious(partFile, expectBytes, out scan))
+                                                    {
+                                                        int extra = ++extraDl[idx];
+                                                        if (extra <= IntegrityChecker.ReDownloadMaxPerPart)
+                                                        {
+                                                            Log?.Invoke(string.Format(
+                                                                "[完整性] 分片 {0} 可疑（最长零段 {1}，零占比 {2:P1}），"
+                                                                + "自动重下对比（第 {3}/{4} 次）。",
+                                                                idx, IntegrityChecker.FmtBytes(scan.MaxZeroRun),
+                                                                scan.ZeroRatio, extra,
+                                                                IntegrityChecker.ReDownloadMaxPerPart));
+
+                                                            bool replaced = await ReDownloadPartForCompareAsync(
+                                                                linkBox.Url, h, part, partsDir, idx, partToken)
+                                                                .ConfigureAwait(false);
+
+                                                            // 对本片所在文件重扫，看换完之后是否还有零段
+                                                            IntegrityChecker.ZeroScan scan2;
+                                                            IntegrityChecker.IsPartSuspicious(partFile, expectBytes, out scan2);
+                                                            if (!scan2.Suspicious)
+                                                            {
+                                                                Log?.Invoke("[完整性] 分片校验通过（"
+                                                                    + (replaced ? "已替换为正确内容" : "重下内容一致，源数据本身如此")
+                                                                    + "），继续。");
+                                                            }
+                                                            else if (!replaced)
+                                                            {
+                                                                // 重下两次内容完全一致且仍含零段 → 源文件本来如此。
+                                                                Log?.Invoke(string.Format(
+                                                                    "[完整性] 分片 {0} 重下 {1} 次内容一致且仍含大零段 "
+                                                                    + "→ 判定为源数据本身如此，放行。", idx, extra));
+                                                            }
+                                                        }
+                                                        else
+                                                        {
+                                                            // 重试耗尽：不再无限重下（与 MaxSegmentRetries 同义）。
+                                                            Log?.Invoke(string.Format(
+                                                                "[完整性] 分片 {0} 内容校验反复未通过"
+                                                                + "（最长零段 {1}），已重下 {2} 次。保留分片与进度，"
+                                                                + "可稍后重试；若始终复现建议更换下载源。",
+                                                                idx, IntegrityChecker.FmtBytes(scan.MaxZeroRun), extra));
+                                                            AddError(string.Format(
+                                                                "分片 {0} 内容校验反复未通过（最长零段 {1}）",
+                                                                idx, IntegrityChecker.FmtBytes(scan.MaxZeroRun)));
+                                                        }
+                                                    }
+                                                }
+                                                catch (OperationCanceledException)
+                                                {
+                                                    throw;
+                                                }
+                                                catch (Exception ex)
+                                                {
+                                                    // 校验器自身出错绝不阻断下载
+                                                    Log?.Invoke("[完整性] 分片校验出错（已跳过）: " + ex.Message);
+                                                }
+                                            }
+                                            // ==================== 防线一结束 ====================
 
                                             // 本分片完整落盘、且文件流已关闭 → 通知合并线程可以取走了。
                                             // 必须在 using 之外置位：提前置位会让合并线程
@@ -4787,6 +5138,9 @@ namespace GeZi.Core.Download
                                     }
                                     finally
                                     {
+                                        // 【2026-11-15】与 attempt 开头"发请求前"的 Increment 配对：
+                                        // 一次 attempt（建连 + 读响应体）整体算作"这条连接在工作"。
+                                        Interlocked.Decrement(ref activeConns);
                                         if (ioCts != null)
                                         {
                                             try { ioCts.Dispose(); } catch { }
@@ -4796,8 +5150,19 @@ namespace GeZi.Core.Download
 
                                 if (lastErr != null)
                                 {
-                                    AddError(lastErr);
-                                    return;
+                                    // 【2026-11-15 关键修复·回归】这里原来调 AddError(lastErr) ——
+                                    // **整个任务会被判失败**，用户截图就是这样：
+                                    //   「失败: IOException: 连接持续过慢（3 次慢读，最后一次 7344 B/s）…」
+                                    //   进度 830.28MB / 1.11GB（72.7%），实际数据好端端在盘上。
+                                    // AddError 的语义是"任务级致命错误"，而这里只是**单片**重试耗尽 ——
+                                    // 片放弃了就去下别的片，剩下的收尾再统一处置（见下方 abandoned 分支）。
+                                    // 现在只记日志，不进 errors。
+                                    abandonedParts.TryAdd(idx, 0);
+                                    Interlocked.Exchange(ref claimed[idx], 0);
+                                    Log?.Invoke(string.Format(
+                                        "[诊断·放弃] 片{0} 重试耗尽（{1}），标记放弃；worker 继续领其他片（并发不塌）",
+                                        idx, Trim(lastErr, 120)));
+                                    continue;
                                 }
                             }
                             finally
@@ -4912,6 +5277,35 @@ namespace GeZi.Core.Download
                         ClearPartial(dest);
                         return (false, "已取消");
                     }
+                    // ==================== 【2026-11-15 新增·收尾诊断】====================
+                    // 放弃过哪些片、总共多少字节没下、错误原文是什么 —— 这三条能直接
+                    // 回答"为什么报失败/为什么进度卡在某处"。
+                    if (abandonedParts.Count > 0)
+                    {
+                        long abandonedBytes = 0;
+                        var idxList = new System.Text.StringBuilder();
+                        foreach (var kv in abandonedParts)
+                        {
+                            try
+                            {
+                                var pp = plan.Parts[kv.Key];
+                                abandonedBytes += pp.E - pp.S + 1 - pp.W;
+                            }
+                            catch { }
+                            if (idxList.Length < 200)
+                                idxList.Append(kv.Key).Append(' ');
+                        }
+                        Log?.Invoke(string.Format(
+                            "[诊断·放弃汇总] 放弃 {0} 片 / 未下 {1}（总 {2}）| 片号: {3}",
+                            abandonedParts.Count, Fmt(abandonedBytes), Fmt(total), idxList));
+                    }
+                    if (errors.Count > 0)
+                    {
+                        Log?.Invoke(string.Format(
+                            "[诊断·错误汇总] 共 {0} 条，前 3 条: {1}",
+                            errors.Count, string.Join(" | ", errors.Take(3))));
+                    }
+
                     string msg = string.Join("; ", errors.Take(3));
                     if (msg.Contains("range-not-supported"))
                     {
@@ -4966,6 +5360,42 @@ namespace GeZi.Core.Download
                         return (false, string.Format(
                             "合并后目标文件大小不符：期望 {0}，实际 {1}。分片与进度已保留，可重试续传。",
                             total, finalLen));
+                    }
+                }
+
+                // ==================== 【2026-11-17 新增·防线二+三】====================
+                // 长度校验只拦得住"缺字节"，拦不住"长度正确、内容是零"的静默损坏
+                //（真实案例：217MB 文件尾部 17.9MB 全 0x00，大小与文件头全部正常，
+                //  游戏一加载就崩）。这里在删 .qmeta 之前做内容校验：
+                //   防线二：尾部零填充扫描（<0.5s，只读尾部 ≤64MB）
+                //   防线三：zip 逐条目 CRC32（.zip 自动启用，零误报）
+                // ⚠️ 走到这里分片已合并删光 —— 校验失败**不能**再写"可重试续传"。
+                if (mergeMode && IntegrityChecker.Level != IntegrityChecker.VerifyLevel.Off)
+                {
+                    try
+                    {
+                        var verdict = await IntegrityChecker.VerifyFinalFileAsync(
+                            dest, total, IntegrityChecker.Level, m => Log?.Invoke(m), cancelToken)
+                            .ConfigureAwait(false);
+                        if (!verdict.Ok)
+                        {
+                            // 落盘证据（零洞区间 / 坏条目清单），供用户反馈与定位
+                            IntegrityChecker.WriteReport(dest, verdict);
+                            return (false, verdict.UserMessage);
+                        }
+                        if (verdict.PassedAsSource)
+                        {
+                            Log?.Invoke("[完整性] 已放行：尾部零段属于源文件本身的内容（zip CRC 全通过）。");
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        // 校验器自身故障绝不能反过来判下载失败 —— 只记日志放行。
+                        Log?.Invoke("[完整性] 校验过程出错（已跳过，不影响下载结果）: " + ex.Message);
                     }
                 }
 

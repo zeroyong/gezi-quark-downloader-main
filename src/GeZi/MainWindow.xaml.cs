@@ -236,6 +236,85 @@ namespace GeZi
         private const int ClipboardDedupWindowMs = 2000;
 
         /// <summary>
+        /// 程序自己写剪贴板的抑制标记（UtcNow 毫秒）（2026-11-17 新增）。
+        ///
+        /// <para>【为什么需要】解析失败时我们**故意**把链接写回剪贴板，方便用户粘贴到
+        /// 浏览器核对"到底是链接过期还是解析有问题"。但本程序有剪贴板监听 ——
+        /// 不抑制的话会立刻触发一次自动解析，又失败、又写剪贴板……形成自我循环。
+        /// 写入前记下这次写入的时刻与内容哈希，监听端在窗口期内看到同一内容就跳过。</para>
+        /// </summary>
+        private long _selfClipboardAtMs;
+        private string _selfClipboardHash;
+
+        /// <summary>
+        /// 自写剪贴板的抑制窗口。
+        ///
+        /// <para>【为什么取 2 秒而不是更长】取长了会误伤真实操作：用户看到"解析失败"
+        /// 后**很可能立刻重新复制同一条链接**想再试一次 —— 那正是他该被允许的动作。
+        /// WM_CLIPBOARDUPDATE 的连发与延迟投递都在毫秒级，2 秒足够覆盖，
+        /// 又不会把用户的重试也挡掉（与 <see cref="ClipboardDedupWindowMs"/> 同档）。</para>
+        /// </summary>
+        private const int SelfClipboardSuppressMs = 2000;
+
+        /// <summary>
+        /// 解析/打开失败时，把**当前链接**写回剪贴板并说明原因（2026-11-17 新增）。
+        ///
+        /// <para>【用户需求】原话：「处理这种链接时，自动把分享链接复制到剪贴板，
+        /// 这样好看到底是链接过期了，还是解析的问题」——场景是在**解析历史**里
+        /// 点一条旧记录，结果提示「[获取分享凭证] 分享不存在」。此时用户无法判断
+        /// 到底是（a）这条分享早就被分享者删除/过期，还是（b）程序解析逻辑有问题。
+        /// 把实际请求用的 URL 交到剪贴板，粘到浏览器一开就能自证。</para>
+        ///
+        /// <para>⚠️ 只在**分享链接**类失败时调用；调用方负责传入真实请求的 URL。</para>
+        /// </summary>
+        private void CopyFailedUrlForDiagnosis(string url, string reason)
+        {
+            if (string.IsNullOrEmpty(url)) return;
+            try
+            {
+                // 先记抑制标记，再写 —— 顺序不能反（写完可能立刻收到剪贴板通知）。
+                string hash = UrlHashOf(url);
+                _selfClipboardHash = hash;
+                _selfClipboardAtMs = Environment.TickCount;
+
+                // SetDataObject(copy:true) 而不是 SetText：某些剪贴板管理器会持有引用，
+                // 程序稍后清理会导致内容失效。
+                System.Windows.Clipboard.SetDataObject(url, true);
+
+                Log("[诊断·复制失败链接] 已把本次请求的链接复制到剪贴板：" + url);
+                Log("[诊断·复制失败链接] 原因：" + (reason ?? ""));
+                ShowDownloadHint(
+                    "解析失败，已把链接复制到剪贴板 —— 粘到浏览器打开就能确认"
+                    + "是分享已失效，还是本程序的解析问题。");
+            }
+            catch (Exception ex)
+            {
+                Log("[诊断·复制失败链接] 复制到剪贴板失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>URL 的稳定哈希（自写剪贴板抑制用；FNV-1a 足够，无需加密强度）。</summary>
+        private static string UrlHashOf(string s)
+        {
+            if (s == null) return "";
+            uint h = 2166136261u;
+            foreach (char c in s)
+            {
+                h ^= c;
+                h *= 16777619u;
+            }
+            return h.ToString("x8");
+        }
+
+        /// <summary>这次剪贴板变化是不是程序自己刚写的（是 → 监听端应跳过）。</summary>
+        private bool IsSelfClipboardWrite(string text)
+        {
+            if (string.IsNullOrEmpty(_selfClipboardHash)) return false;
+            if (Environment.TickCount - _selfClipboardAtMs > SelfClipboardSuppressMs) return false;
+            return string.Equals(UrlHashOf(text ?? ""), _selfClipboardHash, StringComparison.Ordinal);
+        }
+
+        /// <summary>
         /// 从剪贴板文本里圈出候选 URL 的正则。
         ///
         /// 只负责"把看起来像 URL 的片段切出来"，**不判断是不是夸克** ——
@@ -840,11 +919,29 @@ namespace GeZi
             // 下载内核的日志整体算「专业级」：分片规划、连接分配、直链刷新等
             // 每秒可能几十行，默认藏起来，点「详细」才看。
             //
-            // 【2026-10-22】例外：以 "[诊断·" 开头的行是排查用的关键结论
-            // （探测失败码、请求头构成等），数量少且只在异常时出现 ——
-            // 若也藏进「详细」，用户按普通模式根本看不到，等于白加。
-            bool detail = !(msg != null && msg.StartsWith("[诊断·", StringComparison.Ordinal));
-            EnqueueLog(msg, detail);
+            // 【2026-11-15 用户反馈·取消原例外】原先以 "[诊断·" 开头的行**强制常显**
+            //（2026-10-22 加的，理由是"数量少且只在异常时出现"）。但尾部掉速排查期间
+            // 诊断行变成每秒好几行（[诊断·慢读] 刷屏），用户原话：
+            //   「把这些日志打包时 记得都隐藏 用户其实不需要那么多，调试时 才打印」。
+            // 现在诊断行与内核日志同归「详细」级 —— 需要排查时点日志框的「详细」按钮，
+            // 普通用户看到的日志框保持干净。
+            //
+            // 例外保留：少数**低频、且解释"进度为什么停了"**的行仍常显（换链自愈、
+            // 停滞判定、限流收窄）。这些不给用户看会让人以为程序卡死。
+            bool userFacing = msg != null && (
+                msg.StartsWith("直链已失效", StringComparison.Ordinal)
+                || msg.StartsWith("已换用新直链", StringComparison.Ordinal)
+                || msg.StartsWith("未能取到新的直链", StringComparison.Ordinal)
+                || msg.StartsWith("收尾阶段停滞", StringComparison.Ordinal)
+                || msg.StartsWith("下载停滞", StringComparison.Ordinal)
+                || msg.StartsWith("检测到服务端限流", StringComparison.Ordinal)
+                || msg.StartsWith("限流已平息", StringComparison.Ordinal)
+                // 【2026-11-15】这三条解释"任务为什么自动重连/放弃了哪些片"，
+                // 频率低（每片最多几次）且直接关系用户看到的成败，必须常显。
+                || msg.StartsWith("[慢连接重连]", StringComparison.Ordinal)
+                || msg.StartsWith("[诊断·放弃汇总]", StringComparison.Ordinal)
+                || msg.StartsWith("[诊断·错误汇总]", StringComparison.Ordinal));
+            EnqueueLog(msg, detail: !userFacing);
         }
 
         /// <summary>LogBox 保留的最大行数（超出后从头砍）。</summary>
@@ -2673,6 +2770,12 @@ namespace GeZi
             {
                 Log("解析失败: " + ex.Message);
                 ShowDownloadHint("解析失败：" + ex.Message);
+                // 【2026-11-17 用户需求】解析失败时把**本次实际请求的链接**复制到剪贴板：
+                // 用户原话「处理这种链接时，自动把分享链接复制到剪贴板，这样好看到底是
+                // 链接过期了，还是解析的问题」。典型场景是在解析历史里点旧记录 →
+                // 「[获取分享凭证] 分享不存在」，此时光看提示无法判断是分享失效还是程序 bug。
+                // 把 URL 交到剪贴板，粘到浏览器一开就自证。
+                CopyFailedUrlForDiagnosis(LinkBox != null ? LinkBox.Text : null, ex.Message);
                 NotifyIfHidden("自动解析失败", ex.Message);
             }
             finally
@@ -2868,6 +2971,65 @@ namespace GeZi
             }
         }
 
+        // ==================== 下载完整性校验（2026-11-17 新增） ====================
+
+        /// <summary>把设置里的校验等级/zip 开关同步到 <see cref="GeZi.Core.Download.IntegrityChecker"/> 的静态字段。</summary>
+        private void ApplyIntegritySettings()
+        {
+            try
+            {
+                int lv = _settings.IntegrityLevel;
+                if (lv < 0) lv = 0;
+                if (lv > 2) lv = 2;
+                GeZi.Core.Download.IntegrityChecker.Level =
+                    (GeZi.Core.Download.IntegrityChecker.VerifyLevel)lv;
+                GeZi.Core.Download.IntegrityChecker.VerifyZip = _settings.VerifyZip;
+            }
+            catch { }
+        }
+
+        /// <summary>校验等级下拉框变更：写设置 + 同步检测器 + 告知用户开销差异。</summary>
+        private void OnIntegrityLevelChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_applyingSettings || IntegrityLevelBox == null) return;
+            try
+            {
+                int lv = Math.Max(0, Math.Min(2, IntegrityLevelBox.SelectedIndex));
+                _settings.IntegrityLevel = lv;
+                SettingsStore.Save(_settings);
+                ApplyIntegritySettings();
+                Log(lv == 0
+                    ? "已关闭下载完整性校验（不推荐：拦不住「大小正常但内容为零」的静默损坏）"
+                    : lv == 1
+                        ? "校验等级：快速（分片零段校验 + 合并后尾零扫描 + zip CRC；开销约 +2~5 秒）"
+                        : "校验等级：严格（快速 + 全文件零洞扫描；大文件会多花 10~30 秒）");
+            }
+            catch (Exception ex)
+            {
+                Log("校验等级保存失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>zip 逐条目 CRC 校验开关。</summary>
+        private void OnVerifyZipChanged(object sender, RoutedEventArgs e)
+        {
+            if (_applyingSettings) return;
+            try
+            {
+                bool on = VerifyZipCheck.IsChecked == true;
+                _settings.VerifyZip = on;
+                SettingsStore.Save(_settings);
+                ApplyIntegritySettings();
+                Log(on
+                    ? "已开启：下载 .zip 完成后逐条目校验 CRC32（零误报，能精确指出坏在哪个条目）"
+                    : "已关闭：不再校验 zip 条目 CRC（尾零扫描仍生效）");
+            }
+            catch (Exception ex)
+            {
+                Log("zip 校验设置保存失败: " + ex.Message);
+            }
+        }
+
         private void OnTaskUnfinishedFirstChanged(object sender, RoutedEventArgs e)
         {
             // 回填控件时也会触发 Click（走 _applyingSettings 保护，同其它设置项）
@@ -3046,6 +3208,14 @@ namespace GeZi
 
                 string text = TryReadClipboardText();
                 if (string.IsNullOrEmpty(text)) return;
+
+                // 【2026-11-17 新增】解析失败时我们会**故意**把链接写回剪贴板供用户核对，
+                // 这里必须跳过那种自写内容，否则会立刻触发又一轮自动解析（自我循环）。
+                if (IsSelfClipboardWrite(text))
+                {
+                    Log("[诊断·剪贴板] 检测到程序自己刚写入的诊断链接，跳过自动解析。");
+                    return;
+                }
 
                 string url = FindShareUrl(text);
                 if (string.IsNullOrEmpty(url))
@@ -6163,6 +6333,31 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 任务创建瞬间的「连接上限」预估值（2026-11-15 新增）。
+        ///
+        /// <para>【为什么需要】WorkerCount 原先只由每秒一次的诊断快照喂入
+        ///（<see cref="ApplyDiagnosticsToTask"/>），任务刚起来的头一两秒它是 0 ——
+        /// 而 <see cref="TaskItem.LaneText"/> 在 workerCount=0 时走兜底分支，
+        /// 要么只显示「12 连接」（没分母）、要么空白；此时**速度已经先上报了**，
+        /// 用户看到的就是「一开始线程数没有展示，但是有下载速度」。</para>
+        ///
+        /// <para>【口径】与 <see cref="AllocateThreads"/> 同一套上限：批内单文件并发
+        ///（自动调度算出的优先）夹到真实并发天花板上。多任务并发时这是一个近似值，
+        /// 第一次诊断快照到达后会纠正为真实分配值 —— 只影响启动那一两秒的显示。</para>
+        /// </summary>
+        private int EstimateWorkerCount()
+        {
+            try
+            {
+                int cap = _perBatchThreads > 0
+                    ? _perBatchThreads
+                    : (_settings != null ? _settings.Threads : 64);
+                return Math.Max(1, Math.Min(cap, GeZi.Core.Download.SegmentedDownloader.MaxRealConcurrency));
+            }
+            catch { return 64; }
+        }
+
+        /// <summary>
         /// 自动调度为**当前批次**算出的单文件并发数（0 = 没有，退回设置里的值）。
         ///
         /// <para>【2026-10-25 新增】刻意**不落盘**：AutoTuner 是按"本次提交几个文件"
@@ -6603,7 +6798,7 @@ namespace GeZi
 
             LogAllocation(alloc);
             foreach (var job in jobs)
-                AddTaskItem(new TaskItem(job, job.Name));
+                AddTaskItem(new TaskItem(job, job.Name) { WorkerCount = EstimateWorkerCount() });
             ClearFileSelection();   // 同上：入队即撤掉列表里的高亮
             Log("已加入下载队列: " + jobs.Count + " 个文件（复用已取链接）"
                 + (skipped > 0 ? "（另有 " + skipped + " 个已在下载，已跳过）" : ""));
@@ -6857,7 +7052,7 @@ namespace GeZi
 
                 LogAllocation(alloc);
                 foreach (var job in jobs)
-                    AddTaskItem(new TaskItem(job, job.Name));
+                    AddTaskItem(new TaskItem(job, job.Name) { WorkerCount = EstimateWorkerCount() });
                 ClearFileSelection();   // 已提交 → 撤掉高亮，避免误触重复入队
                 Log("已加入下载队列: " + jobs.Count + " 个文件"
                     + (skipped > 0 ? "（另有 " + skipped + " 个已在下载，已跳过）" : ""));
@@ -9046,6 +9241,8 @@ namespace GeZi
                         string.IsNullOrEmpty(s.Name) ? Path.GetFileName(s.Dest) : s.Name)
                     {
                         Dormant = true,
+                        // 【2026-11-15】预填连接上限，恢复的任务行一开始就有分母
+                        WorkerCount = EstimateWorkerCount(),
                     };
                     t.Total = s.Size;
                     t.Done = s.Done;
@@ -12551,6 +12748,9 @@ namespace GeZi
                         }
                         AddTaskItem(new TaskItem(job, job.Name)
                         {
+                            // 【2026-11-15】预填连接上限：一开始就显示"0/512 连接"，
+                            // 而不是等第一次诊断快照（那时速度已经先上报了）。
+                            WorkerCount = EstimateWorkerCount(),
                             // 【2026-10-22 修】续传入队时**预填磁盘上的真实进度**。
                             //
                             // 【用户实测】续传本身是成功的（分片确实在续），但
@@ -13299,6 +13499,10 @@ namespace GeZi
                 // 回填勾选 + 同步 ShareFileItem 的静态开关（列表行 DateLine 读写它）。
                 ShowFileDateCheck.IsChecked = _settings.ShowFileDate;
                 ShareFileItem.ShowDatesInList = _settings.ShowFileDate;
+                // 【2026-11-17】完整性校验等级 + zip 开关 → 同步到 IntegrityChecker 静态字段
+                IntegrityLevelBox.SelectedIndex = Math.Max(0, Math.Min(2, _settings.IntegrityLevel));
+                VerifyZipCheck.IsChecked = _settings.VerifyZip;
+                ApplyIntegritySettings();
                 // 【2026-10-24】网盘文件列表排序方向（默认倒序）→ 回填到工具栏按钮
                 _fileSortDescending = _settings.FileSortDescending;
                 try

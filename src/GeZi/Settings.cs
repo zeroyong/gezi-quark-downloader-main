@@ -65,6 +65,22 @@ namespace GeZi
         /// </summary>
         public bool ShowFileDate { get; set; } = true;
 
+        /// <summary>
+        /// 下载完整性校验等级（2026-11-17 新增）。
+        /// <para>0 = 关闭（不推荐）；1 = fast（分片校验 + 尾零扫描，**默认**）；
+        /// 2 = strict（fast + 全文件零洞扫描，读全文件，大文件慢几十秒）。</para>
+        /// <para>【为什么需要】真实案例：217MB 文件大小完全正确、尾部 17.9MB 全是
+        /// 0x00，原有的长度校验完全无感，游戏一加载就崩。</para>
+        /// </summary>
+        public int IntegrityLevel { get; set; } = 1;
+
+        /// <summary>
+        /// .zip 是否做逐条目 CRC32 校验（2026-11-17 新增，默认开）。
+        /// <para>fast 及以上生效。zip 每条目自带 CRC32，是**唯一零误报**的校验；
+        /// net48 的 ZipArchive 读到底就自动校验。</para>
+        /// </summary>
+        public bool VerifyZip { get; set; } = true;
+
         public string OutDir { get; set; } = "";
         public bool AutoClean { get; set; } = true;
 
