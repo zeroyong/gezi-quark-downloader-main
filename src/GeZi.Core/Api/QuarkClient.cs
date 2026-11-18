@@ -546,7 +546,61 @@ namespace GeZi.Core.Api
         }
 
         /// <summary>
-        /// 在分享里**按文件名**定位一个源文件（拿它的 fid + share_fid_token）。
+        /// 取某个分享目录**从根到它自己**的完整路径（2026-11-17 新增）。
+        ///
+        /// <para>【为什么需要】分享链接带 <c>#/list/share/&lt;fid&gt;</c> 时会直接空降到
+        /// 深层目录，而面包屑依赖两条祖先链 —— 空降时它们是空的，于是只显示一层。</para>
+        ///
+        /// <para>【怎么拿到】接口的 <c>fetch_share_full_path=1</c> 参数会让
+        /// <c>data</c> 里多出 <c>full_path</c> 数组，**一次请求**返回整条路径
+        ///（实测：3 层目录返回 3 项，顺序为根下第一层 → 目标层）。
+        /// 这比"从根 BFS 逐层下钻找目标"可靠得多 —— 后者在宽层分享里会因预算耗尽而失败。</para>
+        ///
+        /// <para>返回的列表**含目标层自己**（最后一项），调用方自己决定怎么切。</para>
+        /// </summary>
+        public async Task<List<GeZi.Core.Pan.PanPathNode>> ShareFullPathAsync(string pwdId, string stoken, string pdirFid)
+        {
+            var result = new List<GeZi.Core.Pan.PanPathNode>();
+            if (string.IsNullOrEmpty(pwdId) || string.IsNullOrEmpty(stoken)) return result;
+
+            var query = new Dictionary<string, string>
+            {
+                { "pr", "ucpro" }, { "fr", "pc" },
+                { "pwd_id", pwdId }, { "stoken", stoken },
+                { "pdir_fid", string.IsNullOrEmpty(pdirFid) ? "0" : pdirFid },
+                { "force", "0" }, { "_page", "1" }, { "_size", "10" },
+                { "_fetch_banner", "0" }, { "_fetch_share", "0" }, { "_fetch_total", "1" },
+                { "_sort", "file_type:asc,updated_at:desc" },
+                { "ver", "2" },
+                { "fetch_share_full_path", "1" },     // ★ 关键：让接口带上完整路径
+            };
+            try
+            {
+                var res = await RequestAsync(HttpMethod.Get,
+                    QuarkConstants.ApiBase + "/1/clouddrive/share/sharepage/detail", query);
+                Check(res, "读取分享路径");
+                var fp = AsArray(Get(AsDict(Get(AsDict(res), "data")), "full_path"));
+                if (fp == null) return result;
+
+                foreach (var it in fp)
+                {
+                    var d = AsDict(it);
+                    if (d == null) continue;
+                    string fid = AsString(Get(d, "fid")) ?? "";
+                    string name = AsString(Get(d, "file_name")) ?? "";
+                    if (string.IsNullOrEmpty(fid)) continue;
+                    result.Add(new GeZi.Core.Pan.PanPathNode { Fid = fid, Name = name });
+                }
+            }
+            catch
+            {
+                // 拿不到就当不支持 —— 调用方按"只有一层"显示，绝不让它影响解析主流程。
+                result.Clear();
+            }
+            return result;
+        }
+
+
         ///
         /// <para>【为什么需要】2026-10-22 用户实测反馈：转存路径下载的文件，
         /// 一旦把网盘里的**中转副本**删掉，续传就再也拿不到直链

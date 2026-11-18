@@ -120,6 +120,11 @@ namespace GeZi.Core.Pan
             string pdirFid, CancellationToken ct = default)
             => _client.ShareDetailAsync(pwdId, stoken, pdirFid);
 
+        /// <summary>取分享目录的完整祖先路径（2026-11-17）：走 fetch_share_full_path=1，一次请求拿到整条链。</summary>
+        public Task<List<PanPathNode>> GetSharePathAsync(string pwdId, string stoken,
+            string pdirFid, CancellationToken ct = default)
+            => _client.ShareFullPathAsync(pwdId, stoken, pdirFid);
+
         // ==================== 取直链 ====================
 
         public Task<List<DownloadLink>> LinkFromShareAsync(IList<QuarkFileEntry> refs,

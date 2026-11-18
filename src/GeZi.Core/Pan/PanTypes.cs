@@ -116,4 +116,20 @@ namespace GeZi.Core.Pan
         public string Stoken { get; set; }
         public string Title { get; set; }
     }
+
+    /// <summary>
+    /// 分享目录路径上的一节（2026-11-17 新增，供面包屑重建祖先链）。
+    ///
+    /// <para>由 <c>IPanProvider.GetSharePathAsync</c> 返回：一次请求就拿到
+    /// 「从根到目标目录」的完整层级，不必逐层 BFS 猜（大分享里那样会烧光请求预算 ——
+    /// 用户那个分享第 2 层就有几十个「每日荐书丨MM月DD日」目录）。</para>
+    /// </summary>
+    public sealed class PanPathNode
+    {
+        /// <summary>该层目录的 fid。</summary>
+        public string Fid { get; set; }
+
+        /// <summary>该层目录的名字（面包屑上显示的文字）。</summary>
+        public string Name { get; set; }
+    }
 }

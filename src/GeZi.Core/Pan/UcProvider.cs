@@ -166,6 +166,18 @@ namespace GeZi.Core.Pan
             return merged;
         }
 
+        /// <summary>
+        /// 取分享目录的完整祖先路径（2026-11-17 新增）。
+        ///
+        /// <para>【为什么 UC 返回空】UC 的分享列表接口目前没有验证过等价于夸克
+        /// <c>fetch_share_full_path</c> 的参数；与其猜一个可能不存在的字段（猜错就是
+        /// 静默失效，比不实现更糟），这里**如实返回空**——调用方会按"只有一层"显示，
+        /// 面包屑行为与现在的单层表现一致，不会更糟。将来若确认 UC 支持，在此实现即可。</para>
+        /// </summary>
+        public Task<List<PanPathNode>> GetSharePathAsync(string pwdId, string stoken,
+            string pdirFid, CancellationToken ct = default)
+            => Task.FromResult(new List<PanPathNode>());
+
         // ==================== 分享：取直链 ====================
 
         /// <summary>

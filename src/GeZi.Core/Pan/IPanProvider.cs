@@ -91,6 +91,27 @@ namespace GeZi.Core.Pan
         Task<List<QuarkFileEntry>> ListShareAllAsync(string pwdId, string stoken, string pdirFid,
             CancellationToken ct = default);
 
+        // ==================== ④-b 分享目录的祖先路径（2026-11-17 新增） ====================
+
+        /// <summary>
+        /// 取某个分享目录**从根到它自己**的完整路径（最后一项就是 <paramref name="pdirFid"/> 本身）。
+        ///
+        /// <para>【解决什么】分享链接形如 <c>.../s/&lt;pwd&gt;#/list/share/&lt;fid&gt;</c> 时，
+        /// 解析会直接把位置瞬移到那个深层 fid，而 GeZi 的面包屑依赖
+        /// <c>_fidStack</c>/<c>_pathList</c> 两条链 —— 它们当然是空的，于是只画得出一层，
+        /// 「上一级」也直接跳回根。用户实测真实层级有 4 层却只显示 1 层。</para>
+        ///
+        /// <para>【为什么不用 BFS 逐层下钻】第一版试过：从根 BFS 找目标，但用户那个分享
+        /// 第 2 层就有几十个「每日荐书丨MM月DD日」目录，40 次请求的预算瞬间烧光还没到目标层
+        /// （日志原话：「未能在预算内找到目标目录的完整路径」）。而夸克接口本来就提供
+        /// <c>fetch_share_full_path=1</c>，**一次请求**直接返回整条路径 —— 快、准、无猜测。</para>
+        ///
+        /// <para>返回空列表 = 该网盘/该场景不支持（调用方按"只有一层"显示，不报错）。
+        /// 支持的实现应返回<b>不含根节点</b>的链（第一项 = 根下的第一层文件夹）。</para>
+        /// </summary>
+        Task<List<PanPathNode>> GetSharePathAsync(string pwdId, string stoken, string pdirFid,
+            CancellationToken ct = default);
+
         // ==================== ⑤ 取直链 ====================
 
         /// <summary>
