@@ -3187,6 +3187,8 @@
                                                    VerticalAlignment="Center"/>
                                         <ComboBox x:Name="IntegrityLevelBox" Grid.Column="1"
                                                   MaxWidth="360" HorizontalAlignment="Left"
+                                                  Style="{StaticResource AppComboBox}"
+                                                  ItemContainerStyle="{StaticResource AppComboBoxItem}"
                                                   SelectionChanged="OnIntegrityLevelChanged">
                                             <ComboBoxItem Content="关闭（不推荐）"/>
                                             <ComboBoxItem Content="快速 — 分片校验 + 尾零扫描 + zip CRC（默认）"/>
@@ -3441,6 +3443,7 @@
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
                                             <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
                                         </Grid.RowDefinitions>
 
                                         <!-- 1 / 2 / 3：三个数字键共用一行说明（分开写三行太占地方） -->
@@ -3559,10 +3562,20 @@
                                                    VerticalAlignment="Center" TextWrapping="Wrap"
                                                    Style="{StaticResource SecondaryText}"
                                                    Text="预览当前目录的第一张图片（jpg / png / gif / bmp），不用鼠标点；若已选中某张图片则预览它。预览窗内可用 A / D 切换前后图片、滚轮缩放、按住左键拖动"/>
+
+                                        <!-- 【2026-11-17 新增】e 前进：回到刚刚按 a 后退掉的目录。
+                                             用户需求原话：「添加e 前进 可以返回到刚刚按a后退掉的页面」 -->
+                                        <Border Grid.Row="13" Style="{StaticResource KeyCap}" Margin="0,10,0,0">
+                                            <TextBlock Text="e" Style="{StaticResource KeyCapText}"/>
+                                        </Border>
+                                        <TextBlock Grid.Row="13" Grid.Column="1" Margin="12,10,0,0"
+                                                   VerticalAlignment="Center" TextWrapping="Wrap"
+                                                   Style="{StaticResource SecondaryText}"
+                                                   Text="前进：回到刚刚按 a 后退掉的目录（只有后退过才可用；进入子目录、跳转面包屑或重新解析后，前进记录会清空）"/>
                                     </Grid>
 
                                     <TextBlock Style="{StaticResource ProseText}" Margin="0,14,0,0"
-                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史、全屏在任何页面都可用；a / d / s / r / x / g / i / 空格 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件有两种方式：按 s 进入粘滞多选（再按 s 或 Esc 退出，全程不用按键）、r 刷新当前目录，或按住 Shift 临时多选（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
+                                               Text="都是单键，不需要按 Ctrl/Alt。切页、关于、解析历史、全屏在任何页面都可用；a / d / e / s / r / x / g / i / 空格 作用于文件列表，只在「下载」页生效；z / Enter 作用于任务列表，只在「任务」页生效。光标停在输入框里时，按这些字符就是正常打字，不会触发快捷键。多选文件有两种方式：按 s 进入粘滞多选（再按 s 或 Esc 退出，全程不用按键）、r 刷新当前目录，或按住 Shift 临时多选（Ctrl+点击文件夹 = 只选中、不进目录）。"/>
                                 </StackPanel>
                             </Border>
                         </StackPanel>

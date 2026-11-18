@@ -85,6 +85,23 @@ namespace GeZi
         private readonly Stack<string> _fidStack = new Stack<string>();
 
         /// <summary>
+        /// **前进栈**（2026-11-17 新增，配合 e 键）：按 a 后退时把当前位置压进来，
+        /// 按 e 就能回到刚才退掉的那一层。
+        ///
+        /// <para>只记录 fid 与名字，不记整页列表（列表本来就按 fid 重新拉）。
+        /// 任何**新导航**（进入子目录 / 面包屑跳转 / 重新解析）都必须清空它 ——
+        /// 否则"后退再前进"会走到与当前浏览路径无关的旧分支上（浏览器的前进栈同理）。</para>
+        /// </summary>
+        private readonly Stack<NavPoint> _forwardStack = new Stack<NavPoint>();
+
+        /// <summary>前进栈里的一层：fid + 该层名字（名字用于 _pathList 复原）。</summary>
+        private sealed class NavPoint
+        {
+            public string Fid;
+            public string Name;
+        }
+
+        /// <summary>
         /// 分享链接带子目录（<c>#/list/share/&lt;fid&gt;</c>）时，**那个目录本身的名字**。
         /// 解析时从分享凭证的 title 推断（分享标题默认就是被分享文件夹的名字），
         /// 只用于任务页的「文件夹分组」显示，不参与目标路径拼接。
@@ -1875,6 +1892,8 @@ namespace GeZi
             _files.Clear();
             _fidStack.Clear();
             _pathList.Clear();
+            // 【2026-11-17】重新解析 / 切平台 / 切模式 = 全新浏览上下文 → 前进栈作废
+            _forwardStack.Clear();
             _shareRootName = "";
             _curFid = "0";
             UpdatePathText();
@@ -4054,6 +4073,9 @@ namespace GeZi
             _fidStack.Push(_curFid);
             _curFid = dir.Fid;
             _pathList.Add(dir.Name);
+            // 【2026-11-17】新的导航动作 → 前进栈作废（浏览器前进栈语义）。
+            // 不清的话按 e 会跳到与当前浏览路径无关的旧分支上。
+            _forwardStack.Clear();
             UpdatePathText();
             await LoadDirAsync(dir.Fid);
         }
@@ -5219,6 +5241,15 @@ namespace GeZi
             bool atShareRoot = _fidStack.Count == 0
                 && (string.IsNullOrEmpty(_shareStartFid) || _shareStartFid == "0");
 
+            // 【2026-11-17 诊断·用户反馈「按 a 无法返回上一层级」】
+            // 把三样东西打出来：栈内容、路径链、当前 fid。
+            // 用户日志里能看到"到底栈是空的（被当成根）"还是"pop 了但加载失败"。
+            Log(string.Format(
+                "[诊断·上一级] 栈=[{0}] 路径=[{1}] 当前fid={2} atRoot={3}",
+                string.Join(",", _fidStack.ToArray()),
+                string.Join("/", _pathList.ToArray()),
+                _curFid, atShareRoot));
+
             if (atShareRoot)
             {
                 Log("已在根目录");
@@ -5230,6 +5261,16 @@ namespace GeZi
             if (!BeginBusy(DriveUpBtn, "返回中")) return;
             try
             {
+                // 【2026-11-17】后退前把"当前层"记进前进栈（供 e 键回来）。
+                // 名字取 _pathList 的最后一项；若为空说明当前就是根，无需记录（上面已 return）。
+                try
+                {
+                    string curtName = _pathList.Count > 0 ? _pathList[_pathList.Count - 1] : "";
+                    if (!string.IsNullOrEmpty(_curFid) && _curFid != "0")
+                        _forwardStack.Push(new NavPoint { Fid = _curFid, Name = curtName });
+                }
+                catch { }
+
                 if (_fidStack.Count > 0)
                 {
                     // 正常路径：回到栈里的上一层
@@ -5251,6 +5292,55 @@ namespace GeZi
             finally
             {
                 await EndBusyAsync(DriveUpBtn, t0);
+            }
+        }
+
+        /// <summary>
+        /// **e：前进**——回到刚刚按 a（或点「上一级」）退掉的那一层（2026-11-17 用户需求）。
+        ///
+        /// <para>【用户原话】「添加 e 前进 可以返回到刚刚按 a 后退掉的页面」。</para>
+        ///
+        /// <para>【实现要点】浏览器的前进栈语义：① 后退时把当前位置压进 <see cref="_forwardStack"/>；
+        /// ② 前进时弹出它、把它压回 `_fidStack`（因为它成了"上一层"）、并把名字补回 `_pathList`；
+        /// ③ **任何新导航都要清空前进栈**（进子目录/面包屑跳转/重新解析），否则会走到
+        /// 与当前路径无关的旧分支上。④ 栈空时明确提示，不静默。</para>
+        /// </summary>
+        private async void GoForward()
+        {
+            try
+            {
+                if (_loadingDir) return;
+
+                if (_forwardStack.Count == 0)
+                {
+                    ShowDownloadHint("没有可前进的目录（前进只在按过 a 后退之后才可用）。");
+                    Log("e 前进：前进栈为空。");
+                    return;
+                }
+
+                long t0 = BusyClock();
+                if (!BeginBusy(DriveUpBtn, "前进中")) return;
+                try
+                {
+                    var target = _forwardStack.Pop();
+
+                    // 当前层成为"上一层"：压回 _fidStack 并把当前名字留在 _pathList 里
+                    _fidStack.Push(_curFid);
+                    _pathList.Add(target.Name ?? "");
+
+                    _curFid = target.Fid;
+                    UpdatePathText();
+                    Log("[诊断·前进] 回到：" + (target.Name ?? target.Fid));
+                    await LoadDirAsync(_curFid);
+                }
+                finally
+                {
+                    await EndBusyAsync(DriveUpBtn, t0);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("前进失败: " + ex.Message);
             }
         }
 
@@ -5663,6 +5753,8 @@ namespace GeZi
             for (int i = 1; i <= level; i++)
                 _pathList.Add(crumbs[i].Name);
             _curFid = crumbs[level].Fid;
+            // 【2026-11-17】面包屑跳转是新的导航动作 → 前进栈作废
+            _forwardStack.Clear();
 
             UpdatePathText();
             Log("已跳到目录：" + string.Join(" / ", _pathList));
@@ -5859,6 +5951,10 @@ namespace GeZi
                 case Key.A:   // 后退（上一级）—— 分享链接 / 我的网盘 是同一套实现
                     e.Handled = true;
                     OnUp(null, null);
+                    break;
+                case Key.E:   // 前进：回到刚刚按 a 后退掉的那一层（2026-11-17）
+                    e.Handled = true;
+                    GoForward();
                     break;
                 case Key.D:   // 免转存下载
                     e.Handled = true;
