@@ -105,6 +105,31 @@ namespace GeZi
             };
             Closed += (_, __) => _cts.Cancel();
             PreviewKeyDown += OnPreviewKeyDown;
+
+            // 【2026-11-17】窗口级左键抬起 = 拖动兜底复位。
+            // 只在这里挂一次（AttachDragToPan 会随 A/D 切换重复调用，挂里面会累积订阅）。
+            // 覆盖"鼠标拖出窗口外才松手"的情况：此时 ScrollViewer 的 Up 收不到。
+            PreviewMouseLeftButtonUp += (s, e) =>
+            {
+                if (!_imgDragging || _dragScroll == null) return;
+                EndImageDrag();
+            };
+        }
+
+        // ---------- 图片拖动状态（窗口级，供上面的兜底回调读） ----------
+        private bool _imgDragging;
+        private ScrollViewer _dragScroll;
+
+        /// <summary>结束拖动并复位光标/捕获（可被多个出口重复调用，内部幂等）。</summary>
+        private void EndImageDrag()
+        {
+            _imgDragging = false;
+            var sc = _dragScroll;
+            if (sc != null)
+            {
+                try { sc.ReleaseMouseCapture(); } catch { }
+                sc.Cursor = Cursors.SizeAll;
+            }
         }
 
         // ====================================================================
@@ -130,6 +155,10 @@ namespace GeZi
             _zoom = 1.0;
             _fitW = _fitH = 0;
             _img = null;
+            // 【2026-11-17】换文件时内容区会被整个重建（ScrollViewer 是新的），
+            // 旧的拖动状态必须清掉，否则下次进来鼠标一动就"飘"。
+            EndImageDrag();
+            _dragScroll = null;
 
             Title = "预览 — " + name;
             UpdateHead();
@@ -448,7 +477,19 @@ namespace GeZi
                 e.Handled = true;
             };
 
-            // 双击复位
+            // ==================== 【2026-11-17 新增·鼠标拖动平移】====================
+            // 用户需求：「添加图片预览时 鼠标按住可以拖动，现在只能滚轮放大缩小」。
+            //
+            // 【为什么不用 ScrollViewer 自带的 PanningMode】PanningMode 是**触摸**惯性与
+            // 拖拽滚动（为触屏设计的），鼠标左键按住并不会滚动内容 —— 桌面用户看到
+            // 光标一直是 SizeAll 却拖不动，正是用户报的这个现象。
+            //
+            // 【实现】自己接管左键拖动：记住起点与当时的滚动偏移，移动时反向设置
+            // ScrollViewer 的 ScrollToHorizontalOffset/VerticalOffset。
+            // 只在"图片比视口大"时才真正有位移（否则滚动范围是 0，拖了也不动，符合直觉）。
+            AttachDragToPan(scroll);
+
+            // 双击复位（左键双击 = 回到适配尺寸）
             _img.MouseLeftButtonDown += (s, e) =>
             {
                 if (e.ClickCount == 2) ApplyZoom(1.0);
@@ -456,6 +497,60 @@ namespace GeZi
 
             // 容器此刻可能还没走完布局 —— 有尺寸先算，没有等 SizeChanged 回来算
             TryFitImage();
+        }
+
+        /// <summary>
+        /// 给图片预览挂**鼠标按住拖动平移**（2026-11-17）。
+        ///
+        /// <para>【要点】① 用 <see cref="Mouse.Capture"/> 抓住鼠标，保证拖出图片边界
+        /// 也继续跟随（否则一移出 Image 就丢事件，手感是"拖两下就断"）；
+        /// ② 位移 = 起点偏移 − 鼠标移动量，符号方向必须与实际滚动方向一致；
+        /// ③ 拖动期间把光标换成 <see cref="Cursors.ScrollAll"/>（四向箭头），
+        /// 松手恢复 <see cref="Cursors.SizeAll"/>，让用户知道"现在能拖"。</para>
+        /// </summary>
+        private void AttachDragToPan(ScrollViewer scroll)
+        {
+            if (scroll == null) return;
+            _dragScroll = scroll;
+
+            Point dragStart = default(Point);
+            double startH = 0, startV = 0;
+
+            scroll.PreviewMouseLeftButtonDown += (s, e) =>
+            {
+                if (e.ClickCount >= 2) return;          // 双击留给"复位缩放"
+                dragStart = e.GetPosition(scroll);
+                startH = scroll.HorizontalOffset;
+                startV = scroll.VerticalOffset;
+                _imgDragging = true;
+                try { scroll.CaptureMouse(); } catch { }
+                scroll.Cursor = Cursors.ScrollAll;
+                e.Handled = true;
+            };
+
+            scroll.PreviewMouseMove += (s, e) =>
+            {
+                if (!_imgDragging) return;
+                var p = e.GetPosition(scroll);
+                // 反向：鼠标往右拖 → 内容跟着往右走 → 视口偏移减小
+                scroll.ScrollToHorizontalOffset(startH - (p.X - dragStart.X));
+                scroll.ScrollToVerticalOffset(startV - (p.Y - dragStart.Y));
+                e.Handled = true;
+            };
+
+            // 松手 / 丢失捕获都要复位（否则拖动状态会卡住，之后鼠标一动图就飘）
+            scroll.PreviewMouseLeftButtonUp += (s, e) =>
+            {
+                if (!_imgDragging) return;
+                EndImageDrag();
+                e.Handled = true;
+            };
+            scroll.LostMouseCapture += (s, e) =>
+            {
+                if (!_imgDragging) return;
+                _imgDragging = false;
+                scroll.Cursor = Cursors.SizeAll;
+            };
         }
 
         /// <summary>视口尺寸变化（首帧渲染 / 用户拉窗口）→ 重算 fit。</summary>
