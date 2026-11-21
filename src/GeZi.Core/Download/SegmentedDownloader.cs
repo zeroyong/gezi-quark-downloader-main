@@ -642,6 +642,26 @@ namespace GeZi.Core.Download
         private const long HelpMinRemainBytes = 64 * 1024;
 
         /// <summary>
+        /// 「互助」的**绝对下限**：低于这个剩余量连 ETA 判据都不必算（2026-11-21 新增）。
+        ///
+        /// <para>【为什么必须有第二个门槛】<see cref="HelpMinRemainBytes"/> 原来是**唯一**门槛，
+        /// 且写在判据最前面 `if (left &lt; HelpMinRemainBytes) continue;` ——
+        /// 于是收尾末期大量「各剩 30~60KB」的分片在那里就被跳过，
+        /// 后面更聪明的 ETA 判据**一次都执行不到**，互助整体失效：
+        /// worker 无片可接只能空转（activeConns 掉到 0），
+        /// 那几片几十 KB 的活被慢连接攥着慢慢磨 —— 正是用户看到的
+        /// 「最后阶段连接数断崖下降 + 速度掉」。</para>
+        ///
+        /// <para>【怎么对齐 Gopeed】它的 helpOtherConnection 里判据是**并列**的：
+        /// <c>remain &gt; minimum(1MB) || adaptive &amp;&amp; tail.slow(remain, now)</c>，
+        /// 而 <c>slow()</c> 自己的下限只有 <c>2 * tailMinRangeSize = 32KB</c>。
+        /// 也就是说"剩余小但很慢"照样值得帮，不会被大门槛提前否掉。
+        /// 这里取同样的 16KB（= Gopeed 的 tailMinRangeSize），
+        /// 低于它才真的不值得切（切出来的两半各 8KB，请求开销大于收益）。</para>
+        /// </summary>
+        private const long HelpAbsoluteMinBytes = 16 * 1024;
+
+        /// <summary>
         /// 一个分片超过这么久没有新字节落盘，就认为"这一路被卡住了"，值得别的 worker 接管
         /// （2026-11-10 新增）。
         /// <para>对齐 Gopeed 的 <c>tailWarmup = 750ms</c> + <c>tailTargetTime = 3s</c> 思路：
@@ -750,7 +770,13 @@ namespace GeZi.Core.Download
                 long sz = p.E - p.S + 1;
                 long left = sz - Volatile.Read(ref p.W);
                 if (left <= 0) continue;                      // 已完成
-                if (left < HelpMinRemainBytes) continue;      // 太小，切了没意义
+                // 【2026-11-21 修·关键】这里原来用 HelpMinRemainBytes(64KB) 做**硬过滤**，
+                // 把收尾期大量「各剩 30~60KB」的分片提前跳过 → 下面更聪明的 ETA 判据
+                // 永远执行不到 → 互助整体失效 → worker 空转（activeConns=0）、
+                // 剩几片被慢连接磨着，正是"最后阶段连接数断崖 + 速度掉"的成形机制。
+                // 改用绝对下限 16KB（对齐 Gopeed 的 tailMinRangeSize），
+                // 让"剩余小但很慢"的片也能被接管；是否值得帮交给下面的并列判据。
+                if (left < HelpAbsoluteMinBytes) continue;    // 太小，切了纯亏
 
                 // 剩余量够大 → 直接值得帮
                 bool worthHelping = left >= 2 * HelpMinRemainBytes;
@@ -795,10 +821,13 @@ namespace GeZi.Core.Download
                 var p = plan.Parts[target];
                 long w = Volatile.Read(ref p.W);
                 long remain = (p.E - p.S + 1) - w;
-                if (remain < HelpMinRemainBytes) return false;   // 期间被别人下完了
+                // 【2026-11-21】复核门槛同步降到绝对下限：第一遍已经按 ETA 判过"值得帮"，
+                // 这里若还用 64KB，收尾期那批 30~60KB 的慢片会在这里被二次否掉（白判一遍）。
+                if (remain < HelpAbsoluteMinBytes) return false;   // 期间被别人下完了
 
                 long takeBytes = remain / 2;                     // ★ 拿走一半
-                if (takeBytes < HelpMinRemainBytes) return false;
+                // 切出来的两份各剩多少：低于 8KB 时代价大于收益
+                if (takeBytes < HelpAbsoluteMinBytes / 2) return false;
 
                 long oldEnd = p.E;
                 long newS = oldEnd - takeBytes + 1;              // 新片接管后半段
@@ -990,7 +1019,10 @@ namespace GeZi.Core.Download
                 // ② 本片还剩多少
                 long have = Volatile.Read(ref part.W);
                 long remainHere = (part.E - part.S + 1) - have;
-                if (remainHere < YieldMinRemainBytes) return false;
+                // 【2026-11-21】门槛与互助对齐到 16KB：收尾末期本片常只剩几十 KB，
+                // 用 64KB 判会直接 return false → 让片在最后阶段完全失效，
+                // 空转连接无活可领（activeConns 掉到 0），只剩慢连接磨最后几片。
+                if (remainHere < HelpAbsoluteMinBytes) return false;
 
                 // ---- 对齐 YunX：不修改已发出请求的边界，而是"交出剩余部分 + 掐断自己" ----
                 //
@@ -1008,9 +1040,12 @@ namespace GeZi.Core.Download
                 long tailBytes = part.E - cutAt + 1;
                 int wantSlices = idleWorkers;
                 long sliceBytes = tailBytes / Math.Max(1, wantSlices);
-                if (sliceBytes < TailShrinkMinBytes)
+                // 【2026-11-21】切片下限从 64KB 降到 16KB（对齐 Gopeed 的 tailMinRangeSize）：
+                // 收尾末期本片常只剩 20~60KB，64KB 下限会让 wantSlices 算成 0 → 直接 return false，
+                // 于是"剩最后几片、空转连接一大堆"这个最需要让片的时刻反而让不出去。
+                if (sliceBytes < HelpAbsoluteMinBytes)
                 {
-                    sliceBytes = TailShrinkMinBytes;
+                    sliceBytes = HelpAbsoluteMinBytes;
                     wantSlices = (int)Math.Min(idleWorkers, tailBytes / sliceBytes);
                     if (wantSlices < 1) return false;
                 }
@@ -4388,7 +4423,13 @@ namespace GeZi.Core.Download
                                         // 用剩余字节 / 期望片大小估算，至少切 2 份。
                                         long wantSlice = Math.Max(TailShrinkMinBytes,
                                                                   remainTotal / inflightNow);
-                                        int slices = (int)Math.Min(64, Math.Max(2, remainHere / wantSlice));
+                                        // 【2026-11-21 修·关键】切片数上限原来硬编码 64 —— 对 256 连接
+                                        // 意味着最多只有 64 条能被喂到活，其余 192 条继续空转，
+                                        // 连接数在这里**结构性**掉到 1/4，正是"断档下降"的一处来源。
+                                        // 改成跟随在飞连接数（对齐 YunX 的"平分给全部连接"与
+                                        // Gopeed 的"每条连接各拿一块"），只保留一个防爆上限。
+                                        int maxSlices = Math.Min(inflightNow, 512);
+                                        int slices = (int)Math.Min(maxSlices, Math.Max(2, remainHere / wantSlice));
                                         long sliceBytes = remainHere / slices;
 
                                         if (sliceBytes >= TailShrinkMinBytes)
