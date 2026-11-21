@@ -89,6 +89,19 @@ namespace GeZi
         public string Stoken;
 
         /// <summary>
+        /// 文件在分享里所在**父目录的完整 fid 链**（2026-11-21 新增，治本「重解析找不到目录段」）。
+        ///
+        /// <para>格式：用 '/' 连接的真实目录 fid，从分享根之后的第一层到文件父目录
+        ///（不含文件本身）。下载时由当前浏览状态 <c>_fidStack</c> + <c>_curFid</c> 采集，
+        /// stoken 过期重解析时直接按这些 fid 逐级列目录定位，不再按目录名下钻 ——
+        /// 名字会被 SanitizeFileName 规范化，与接口原名不一致就会「目录段没找到」，
+        /// 然后掉进全分享 BFS 搜索卡几十秒。</para>
+        ///
+        /// <para>老任务没有该字段（null）→ 自动降级走原有 ShareRelDir/RelDir 名字下钻 + BFS。</para>
+        /// </summary>
+        public string ShareFidChain;
+
+        /// <summary>
         /// 这条任务属于哪个网盘（"quark" / "uc"），2026-11-09 新增。
         ///
         /// <para>【为什么必须有】换链回调 <c>RefreshLinkAsync(item, ct)</c> 原来用

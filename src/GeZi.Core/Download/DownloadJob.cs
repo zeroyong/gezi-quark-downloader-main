@@ -152,6 +152,13 @@ namespace GeZi.Core.Download
         public bool FromShare { get; set; }
 
         /// <summary>
+        /// 文件在分享里所在父目录的完整 fid 链（'/'+fid 连接，2026-11-21 新增）。
+        /// <para>stoken 过期重解析时按 fid 逐级定位，替代按目录名下钻（规范化后匹配不上
+        /// 会掉进全分享 BFS 卡几十秒）。老任务为 null → 降级走旧逻辑。</para>
+        /// </summary>
+        public string ShareFidChain { get; set; }
+
+        /// <summary>
         /// 这条任务属于哪个网盘（"quark" / "uc"）。
         ///
         /// <para>【2026-11-02 新增，网盘抽象 P0】续传时必须靠它选回**正确的**客户端。

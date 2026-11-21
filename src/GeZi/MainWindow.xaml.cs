@@ -7110,6 +7110,9 @@ namespace GeZi
                         // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                         SourceFid = item.SourceFid,
                         SourceName = item.SourceName,
+                        // 【2026-11-21】父目录 fid 链：重解析时按 fid 定位文件的新 token
+                        StartFid = item.StartFid, ShareRelDir = item.ShareRelDir,
+                        ShareFidChain = item.ShareFidChain,
                         // 【P0】记下平台，续传时才能选回正确的客户端
                         ProviderId = CurrentProviderId(),
                     },
@@ -7365,6 +7368,9 @@ namespace GeZi
                             // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                             SourceFid = item.SourceFid,
                             SourceName = item.SourceName,
+                            // 【2026-11-21】父目录 fid 链：重解析时按 fid 定位文件的新 token
+                            StartFid = item.StartFid, ShareRelDir = item.ShareRelDir,
+                            ShareFidChain = item.ShareFidChain,
                             // 【P0】记下平台，续传时才能选回正确的客户端
                             ProviderId = CurrentProviderId(),
                         },
@@ -7399,6 +7405,20 @@ namespace GeZi
         private async Task<List<ShareFileItem>> CollectFilesAsync(IEnumerable<ShareFileItem> items, string relPrefix, int depth,
             CancellationToken ct = default(CancellationToken))
         {
+            return await CollectFilesAsync(items, relPrefix, depth, CaptureShareFidChain(), ct)
+                .ConfigureAwait(true);
+        }
+
+        /// <summary>
+        /// <see cref="CollectFilesAsync"/> 的实现：带 fid 链累积（2026-11-21 新增）。
+        ///
+        /// <para>勾选文件夹时会**深度展开**，里面的文件可能比当前浏览层深好几层。
+        /// 若只记当前浏览层的 fid 链，深层文件的链就不对 —— 重解析时在错误的父目录里
+        /// 找不到它，又退化成 BFS。这里每下钻一层就把该层 fid 追加到链尾。</para>
+        /// </summary>
+        private async Task<List<ShareFileItem>> CollectFilesAsync(IEnumerable<ShareFileItem> items, string relPrefix,
+            int depth, string fidChainPrefix, CancellationToken ct)
+        {
             var result = new List<ShareFileItem>();
             foreach (var it in items)
             {
@@ -7429,7 +7449,13 @@ namespace GeZi
                     {
                         Fid = c.Fid, Name = c.Name, Size = c.Size, IsDir = c.IsDir, Token = c.Token,
                     }).ToList();
-                    var sub = await CollectFilesAsync(kids, Path.Combine(relPrefix, PathUtil.SanitizeFileName(it.Name)), depth + 1, ct);
+                    // 【2026-11-21】把进入的这层目录 fid 追加到链尾，深层文件才有自己的完整链
+                    string subChain = string.IsNullOrEmpty(fidChainPrefix)
+                        ? it.Fid
+                        : fidChainPrefix + "/" + it.Fid;
+                    var sub = await CollectFilesAsync(kids,
+                        Path.Combine(relPrefix, PathUtil.SanitizeFileName(it.Name)),
+                        depth + 1, subChain, ct).ConfigureAwait(true);
                     result.AddRange(sub);
                 }
                 else
@@ -7438,6 +7464,8 @@ namespace GeZi
                     {
                         Fid = it.Fid, Name = it.Name, Size = it.Size, IsDir = false,
                         Token = it.Token, RelDir = relPrefix,
+                        // 文件自己的父目录链（= 递归传下来的那一层）
+                        ShareFidChain = fidChainPrefix,
                     });
                 }
             }
@@ -7549,11 +7577,63 @@ namespace GeZi
             public CapacityDowngradeException() : base("网盘容量不足") { }
         }
 
+        /// <summary>
+        /// 采集「文件所在父目录」的完整 fid 链（2026-11-21 新增）。
+        ///
+        /// <para>【为什么要它】用户实测：stoken 过期后重解析，按目录名逐段下钻报
+        /// 「目录段「丰子恺集·1-10卷」没找到」，然后掉进「全分享按 fid 搜索」卡几十秒。
+        /// 根因是按**名字**匹配 —— <c>RelDir</c> 系列字段是 SanitizeFileName 规范化过的，
+        /// 接口返回的是目录原名，两者不一致就必然找不到。fid 在分享内恒定，
+        /// 用 fid 定位天然免疫改名/特殊字符。</para>
+        ///
+        /// <para>【怎么算】<c>_fidStack</c> 的栈顶是「上一层」、栈底是分享根 "0"
+        /// （见 EnterFolder 与 RebuildShareAncestorChainAsync）。所以：
+        /// 祖先链 = 反转后去掉开头的 "0"；文件父目录 = <c>_curFid</c>；
+        /// 两者拼起来就是「分享根后第一层 → 文件父目录」。</para>
+        ///
+        /// <para>返回 null 表示无从采集（非分享模式 / 就在根目录）—— 调用方写入 null，
+        /// 重解析时自动降级走原有的名字下钻 + BFS 兜底。</para>
+        /// </summary>
+        private string CaptureShareFidChain()
+        {
+            try
+            {
+                if (!ShareMode) return null;
+
+                var chain = new List<string>();
+                // _fidStack.ToList() 是"栈顶在前" = [上一层, …, 根]，反转成 [根, …, 上一层]
+                var ancestors = _fidStack.ToList();
+                for (int i = ancestors.Count - 1; i >= 0; i--)
+                {
+                    string fid = ancestors[i];
+                    if (string.IsNullOrEmpty(fid)) continue;
+                    // 根 "0" 本身不进链：重解析时 pdir_fid="0" 就是起点
+                    if (fid == "0") continue;
+                    chain.Add(fid);
+                }
+
+                // 当前目录（文件就挂在它下面）
+                if (!string.IsNullOrEmpty(_curFid) && _curFid != "0")
+                    chain.Add(_curFid);
+
+                if (chain.Count == 0) return null;   // 文件就在分享根目录：无需链
+                return string.Join("/", chain.ToArray());
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         private async Task<List<DownloadItem>> NoSaveGetItemsAsync(List<ShareFileItem> files)
         {
             var targets = files.Select(f => new LinkTarget { Fid = f.Fid, Token = f.Token, Name = f.Name }).ToList();
             var urlOf = await FetchUrlsWithRetryAsync(targets, fromShare: true);
             var items = new List<DownloadItem>();
+            // 【2026-11-21】父目录 fid 链：优先用文件自带的（勾选文件夹深度展开时，
+            // 深层文件比当前浏览层深好几层，界面上的 _fidStack 采不到），
+            // 退回"当前浏览层"的链（普通单层勾选走这条）。
+            string browseChain = CaptureShareFidChain();
             foreach (var f in files)
             {
                 if (urlOf.TryGetValue(f.Fid, out string url))
@@ -7572,6 +7652,10 @@ namespace GeZi
                         ProviderId = CurrentProviderId(),
                         PwdId = _pwdId,
                         Stoken = _stoken,
+                        // 【2026-11-21】父目录 fid 链（重解析时按 fid 定位，不再按名字下钻）。
+                        // 优先文件自带（深度展开的深层文件），否则用当前浏览层的链。
+                        ShareFidChain = !string.IsNullOrEmpty(f.ShareFidChain)
+                            ? f.ShareFidChain : browseChain,
                     });
                 else
                     Log("跳过（无直链）: " + f.Name);
@@ -7669,6 +7753,9 @@ namespace GeZi
                                 ProviderId = CurrentProviderId(),
                                 PwdId = _pwdId,
                                 Stoken = _stoken,
+                                // 【2026-11-21】源文件在分享里的父目录 fid 链（回退免转存时用）
+                                ShareFidChain = !string.IsNullOrEmpty(batch[j].ShareFidChain)
+                                    ? batch[j].ShareFidChain : CaptureShareFidChain(),
                             });
                         else
                             Log("无直链: " + batch[j].Name);
@@ -7943,7 +8030,9 @@ namespace GeZi
                             _stoken = freshStoken;      // 回填会话级
                             item.Stoken = freshStoken;  // 回填任务级（下次换链用新的）
                             item.Token = freshToken;
-                        }, ct).ConfigureAwait(false);
+                        }, ct,
+                        // 【2026-11-21】父目录 fid 链：有它就不走名字下钻（避免全分享 BFS 卡住）
+                        item.ShareFidChain).ConfigureAwait(false);
                 }
             }
             else
@@ -7997,7 +8086,8 @@ namespace GeZi
             QuarkClient client, string fid, string token, string pwdId, string stoken,
             string passcode, string startFid, string shareRelDir,
             string fallbackRelDir, string fileName,
-            Action<string, string> onReResolved, CancellationToken ct)
+            Action<string, string> onReResolved, CancellationToken ct,
+            string shareFidChain = null)
         {
             if (client == null || string.IsNullOrEmpty(fid) || string.IsNullOrEmpty(pwdId))
                 return null;
@@ -8013,7 +8103,7 @@ namespace GeZi
             //    （async 方法不能用 out 参数，用 Tuple 回传：Item1 = 新 stoken，Item2 = 新 token）
             var fresh = await TryReResolveShareTokenAsync(
                 client, pwdId, passcode, startFid, shareRelDir, fid,
-                fallbackRelDir, fileName, ct).ConfigureAwait(false);
+                fallbackRelDir, fileName, ct, shareFidChain).ConfigureAwait(false);
             if (fresh == null)
             {
                 Log("分享直链获取失败，自动重新解析分享也没有成功（分享可能已被取消、删除或改了提取码）。");
@@ -8127,7 +8217,7 @@ namespace GeZi
         private async Task<Tuple<string, string>> TryReResolveShareTokenAsync(
             QuarkClient client, string pwdId, string passcode, string startFid,
             string shareRelDir, string fid, string fallbackRelDir, string fileName,
-            CancellationToken ct)
+            CancellationToken ct, string shareFidChain = null)
         {
             try
             {
@@ -8148,7 +8238,50 @@ namespace GeZi
 
                 string pdirFid = string.IsNullOrEmpty(startFid) ? "0" : startFid;
 
-                // ② 逐级下钻：先按记录下来的 ShareRelDir，再退回 GroupName/RelDir 推断。
+                // ② ★【2026-11-21 新增·快速通道】有 fid 链就**按 fid 逐级列目录**，不按名字下钻。
+                //
+                // 【为什么这是治本】用户实测日志：
+                //     [诊断·重解析] 目录段「丰子恺集·1-10卷」没找到（在 pdirFid=0 下）
+                //     [诊断·重解析] 路径都失败 → 开始全分享按 fid 搜索（可能要几十秒）…
+                // 名字下钻的天然弱点：RelDir 系列字段是 SanitizeFileName 规范化过的，
+                // 接口返回的是目录**原名**，含全角中点「·」这类字符时两者不一致就必然失败；
+                // 失败后掉进全分享 BFS，宽层分享上要扫几十秒甚至更久。
+                // fid 在分享内恒定不变，按 fid 走既准又快（每层一次列表请求）。
+                if (!string.IsNullOrEmpty(shareFidChain))
+                {
+                    try
+                    {
+                        // 只取最后一层（文件所在父目录）：中间层不需要验证 ——
+                        // 我们的目标只是"文件在不在这个父目录 fid 下"。
+                        // 若分享者删改导致该 fid 失效，列目录会拿不到结果，自然降级到下面的路径下钻。
+                        string parentFid = null;
+                        foreach (string seg in shareFidChain.Split('/'))
+                            if (!string.IsNullOrEmpty(seg) && seg != "0")
+                                parentFid = seg;
+
+                        if (!string.IsNullOrEmpty(parentFid))
+                        {
+                            Log("[诊断·重解析] 走 fid 链快速定位（父目录 fid=" + Short(parentFid) + "）");
+
+                            var byChain = await FindShareEntryAsync(client, pwdId, stoken, parentFid,
+                                e => !e.IsDir && e.Fid == fid, ct).ConfigureAwait(false);
+                            if (byChain != null && !string.IsNullOrEmpty(byChain.Token))
+                            {
+                                Log("[诊断·重解析] fid 链命中，新 token=" + Short(byChain.Token));
+                                return Tuple.Create(stoken, byChain.Token);
+                            }
+                            Log("[诊断·重解析] fid 链父目录里没有该文件（分享内容可能已变动），改用路径下钻");
+                        }
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        // 快速通道自身出错绝不能拦住后续兜底
+                        Log("[诊断·重解析] fid 链定位出错，改用路径下钻: " + ex.Message);
+                    }
+                }
+
+                // ③ 逐级下钻：先按记录下来的 ShareRelDir，再退回 GroupName/RelDir 推断。
                 //    ⚠️ 两次尝试都要走，不能因为第一次下钻失败就直接放弃 ——
                 //    老任务的 ShareRelDir 是 null，正好走第二次。
                 string[] candidates = { shareRelDir, fallbackRelDir };
@@ -8204,9 +8337,15 @@ namespace GeZi
                 // ④ 最后兜底：路径信息全都不可用 → 在**整个分享里按 fid 广度优先搜索**。
                 //    fid 在分享内不变，所以不需要知道它在哪一层。
                 //    这比按名字可靠（名字可能被改），但请求数多，只在前面都失败时才走。
+                //    【2026-11-21】上限 400 个目录（QuarkClient.FindShareFileByFidAsync 内置），
+                //    宽层分享上可能要几十秒 —— 记一下耗时，让用户知道究竟卡在哪。
                 Log("[诊断·重解析] 路径都失败 → 开始全分享按 fid 搜索（可能要几十秒）…");
+                var swBfs = System.Diagnostics.Stopwatch.StartNew();
                 var byFid = await client.FindShareFileByFidAsync(pwdId, stoken, fid)
                     .ConfigureAwait(false);
+                swBfs.Stop();
+                Log("[诊断·重解析] 全分享搜索结束，耗时 " + swBfs.ElapsedMilliseconds + " ms，"
+                    + (byFid != null ? "命中" : "未命中"));
                 if (byFid != null && !string.IsNullOrEmpty(byFid.Token))
                 {
                     Log("已通过全分享搜索重新定位到源文件（路径信息缺失，按 fid 找到）。");
@@ -9380,6 +9519,8 @@ namespace GeZi
                         // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                         SourceFid = pi == null ? null : pi.SourceFid,
                         SourceName = pi == null ? null : pi.SourceName,
+                        // 【2026-11-21】父目录 fid 链（重启后重取链靠它按 fid 定位）
+                        ShareFidChain = pi == null ? null : pi.ShareFidChain,
                         // 【P0】记下平台，重启续传时才能选回正确的客户端
                         ProviderId = pi == null ? CurrentProviderId() : pi.ProviderId,
                         Segmented = true,   // 落盘方式唯一化：恒为独立分片
@@ -9553,6 +9694,11 @@ namespace GeZi
                             // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                             SourceFid = s.SourceFid,
                             SourceName = s.SourceName,
+                            // 【2026-11-21】分享起点 + 父目录 fid 链（重启后重取链按 fid 定位，
+                            // 不走名字下钻 → 不会掉进全分享 BFS 卡几十秒）
+                            StartFid = s.StartFid,
+                            ShareRelDir = s.ShareRelDir,
+                            ShareFidChain = s.ShareFidChain,
                         },
                     };
                     job.LinkRefresher = ct => RefreshLinkAsyncForPending(job, ct);
@@ -9732,6 +9878,11 @@ namespace GeZi
                             // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                             SourceFid = pi?.SourceFid,
                             SourceName = pi?.SourceName,
+                            // 【2026-11-21】父目录 fid 链 + 分享起点（重启后重解析按 fid 定位）
+                            StartFid = pi?.StartFid,
+                            ShareRelDir = pi?.ShareRelDir,
+                            ShareFidChain = pi?.ShareFidChain,
+                            ProviderId = pi?.ProviderId,
                         });
                     }
                 }
@@ -11397,6 +11548,10 @@ namespace GeZi
                 // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                 SourceFid = p.SourceFid,
                 SourceName = p.SourceName,
+                // 【2026-11-21】父目录 fid 链 + 分享起点（重取链按 fid 定位，不走名字下钻）
+                StartFid = p.StartFid,
+                ShareRelDir = p.ShareRelDir,
+                ShareFidChain = p.ShareFidChain,
                 // 🚨【2026-11-03 关键修复】必须把平台带过去！
                 //   漏了这一行 → 后面 ResumePendingBatchAsync 里
                 //   `taskPid = p.ProviderId ?? "quark"` 永远兜底成夸克，
@@ -12908,7 +13063,9 @@ namespace GeZi
                                     {
                                         p.Stoken = freshStoken;   // 回填到续传记录，后续 job.Pending 用的就是新值
                                         p.Token = freshToken;
-                                    }, CancellationToken.None).ConfigureAwait(true);
+                                    }, CancellationToken.None,
+                                    // 【2026-11-21】父目录 fid 链：按 fid 定位，避免名字下钻失败后的全分享 BFS
+                                    p.ShareFidChain).ConfigureAwait(true);
                             }
                             // 🚨 【2026-10-22】必须是 true（回到 UI 线程）。
                             // 这里原来写的是 false —— 于是 await 之后的代码
@@ -13002,6 +13159,7 @@ namespace GeZi
                                 RelDir = p.RelDir ?? "", Dest = dest, Size = p.Size,
                                 GroupName = p.GroupName ?? "",
                                 StartFid = p.StartFid, ShareRelDir = p.ShareRelDir,
+                                ShareFidChain = p.ShareFidChain,
                                 ProviderId = string.IsNullOrEmpty(p.ProviderId) ? "quark" : p.ProviderId,
                                 // 【2026-10-22】源文件定位信息（转存副本没了时可回退免转存）
                                 SourceFid = p.SourceFid,
@@ -13333,6 +13491,7 @@ namespace GeZi
                 Dest = p.Dest, Size = p.Size,
                 SourceFid = p.SourceFid, SourceName = p.SourceName,
                 StartFid = p.StartFid, ShareRelDir = p.ShareRelDir,
+                ShareFidChain = p.ShareFidChain,
             };
             string url = await TryFallbackToShareSourceAsync(client, info, ct).ConfigureAwait(false);
             // 把回填结果同步回 PendingTask，调用方后续用得到

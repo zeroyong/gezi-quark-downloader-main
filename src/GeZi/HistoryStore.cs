@@ -595,6 +595,12 @@ namespace GeZi
         /// </summary>
         [DataMember(Order = 22)] public string ProviderId { get; set; }
 
+        /// <summary>
+        /// 文件在分享里的父目录 fid 链（'/'+fid，2026-11-21 新增）。
+        /// <para>重解析 stoken 时按 fid 直接定位；老快照缺字段 → null → 降级旧逻辑。</para>
+        /// </summary>
+        [DataMember(Order = 23)] public string ShareFidChain { get; set; }
+
         /// <summary>能不能"点一下就续传"——规则与 <see cref="PendingTask.CanResume"/> 一致。</summary>
         public bool CanResume
         {
@@ -632,6 +638,7 @@ namespace GeZi
                 SourceFid = SourceFid,
                 SourceName = SourceName,
                 ProviderId = ProviderId,
+                ShareFidChain = ShareFidChain,
             };
         }
     }
@@ -704,6 +711,13 @@ namespace GeZi
         /// <para>续传时靠它选回正确的客户端；空值按夸克处理（兼容老记录）。</para>
         /// </summary>
         [DataMember(Order = 20)] public string ProviderId { get; set; }
+
+        /// <summary>
+        /// 文件在分享里的父目录 fid 链（'/'+fid，2026-11-21 新增）。
+        /// <para>重取链时按 fid 直接定位，避免按名字下钻失败后全分享 BFS 卡几十秒。
+        /// 老记录缺字段 → null → 降级走旧逻辑。</para>
+        /// </summary>
+        [DataMember(Order = 21)] public string ShareFidChain { get; set; }
 
         /// <summary>
         /// 是否具备"可自动重取链"的完整信息。

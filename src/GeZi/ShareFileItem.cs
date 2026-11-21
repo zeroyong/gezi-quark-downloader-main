@@ -37,6 +37,19 @@ namespace GeZi
         public bool IsDir { get; set; }
 
         /// <summary>
+        /// 该文件在分享里的**父目录 fid 链**（'/'+fid，2026-11-21 新增）。
+        ///
+        /// <para>勾选文件夹深度展开时，里面的文件比当前浏览层深好几层，
+        /// 光靠界面的 <c>_fidStack</c> 采不到 —— 所以让每个文件自带自己的链
+        /// （由 <c>CollectFilesAsync</c> 逐层累积）。下载入队时直接取它，
+        /// stoken 过期重解析就能按 fid 一步定位，不必按名字下钻（那条路会因为
+        /// SanitizeFileName 改名而失败，再掉进全分享 BFS 卡几十秒）。</para>
+        ///
+        /// <para>null / 空 = 无链（就在分享根目录或非分享模式）→ 重解析降级走旧逻辑。</para>
+        /// </summary>
+        public string ShareFidChain { get; set; }
+
+        /// <summary>
         /// 网盘返回的缩略图 URL（2026-11-15，图片/视频类才有；<c>//</c> 开头要补 https:）。
         /// 由 MainWindow.Preview 的缩略图服务异步拉取后填进 <see cref="Thumbnail"/>。
         /// </summary>
