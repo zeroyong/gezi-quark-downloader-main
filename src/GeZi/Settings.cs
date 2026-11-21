@@ -66,6 +66,14 @@ namespace GeZi
         public bool ShowFileDate { get; set; } = true;
 
         /// <summary>
+        /// 是否展示「资源」页签（2026-11-21 新增，用户要求：默认关闭，开启才显示）。
+        /// <para>默认 false：XmlSerializer 反序列化不执行字段初始化器，老配置里没有
+        /// 该节点时就是 default(bool) = false —— 正好等于"默认关闭"，无需额外 Set 标记。
+        /// 关闭时侧栏入口与 TabItem 都 Collapsed，页签索引保持不变（避免错位）。</para>
+        /// </summary>
+        public bool ShowResourcesPage { get; set; }
+
+        /// <summary>
         /// 下载完整性校验等级（2026-11-17 新增）。
         /// <para>0 = 关闭（不推荐）；1 = fast（分片校验 + 尾零扫描，**默认**）；
         /// 2 = strict（fast + 全文件零洞扫描，读全文件，大文件慢几十秒）。</para>

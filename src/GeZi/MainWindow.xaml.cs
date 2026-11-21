@@ -3103,6 +3103,54 @@ namespace GeZi
             }
         }
 
+        /// <summary>
+        /// 【2026-11-21】按设置显示/隐藏「资源」页签（默认关闭）。
+        ///
+        /// <para>⚠️ 用 Visibility 折叠而**不是**从 NavList.Items / Tabs.Items 里物理移除：
+        /// 两侧 SelectedIndex 双向同步 + Tab* 索引常量 + 数字键 1~4 都依赖「列表位置恒定」。
+        /// 物理移除会让「设置」从第 5 项前移到第 4 项，历史上就出过
+        /// 「导航高亮 A、内容显示 B」的错位事故。折叠则索引完全不动。</para>
+        ///
+        /// <para>隐藏时若当前正停在资源页，自动退回下载页（否则用户会卡在一个看不见的页签上）。</para>
+        /// </summary>
+        private void ApplyResourcesPageVisibility()
+        {
+            try
+            {
+                bool show = _settings != null && _settings.ShowResourcesPage;
+                Visibility v = show ? Visibility.Visible : Visibility.Collapsed;
+                if (NavResourcesItem != null) NavResourcesItem.Visibility = v;
+                if (TabResourcesItem != null) TabResourcesItem.Visibility = v;
+
+                // 从"可见"切到"隐藏"时，若正停在资源页，退回下载页。
+                // 注意顺序：先改 SelectedIndex 再折叠，避免 WPF 把 Collapsed 的 TabItem
+                // 当作选中项而触发奇怪的布局状态。
+                if (!show && Tabs != null && Tabs.SelectedIndex == TabResources)
+                    Tabs.SelectedIndex = TabDownload;
+            }
+            catch { }
+        }
+
+        /// <summary>设置页「显示资源页签」开关：写设置 + 即时折叠侧栏入口与 TabItem。</summary>
+        private void OnShowResourcesPageChanged(object sender, RoutedEventArgs e)
+        {
+            if (_applyingSettings) return;
+            try
+            {
+                bool on = ShowResourcesPageCheck.IsChecked == true;
+                _settings.ShowResourcesPage = on;
+                SettingsStore.Save(_settings);
+                ApplyResourcesPageVisibility();
+                Log(on
+                    ? "已开启：侧栏显示「资源」页签（资源搜索，当前为演示数据）"
+                    : "已关闭：已隐藏「资源」页签");
+            }
+            catch (Exception ex)
+            {
+                Log("资源页签显隐设置保存失败: " + ex.Message);
+            }
+        }
+
         // ==================== 下载完整性校验（2026-11-17 新增） ====================
 
         /// <summary>把设置里的校验等级/zip 开关同步到 <see cref="GeZi.Core.Download.IntegrityChecker"/> 的静态字段。</summary>
@@ -5924,11 +5972,27 @@ namespace GeZi
                     e.Handled = true;
                     Tabs.SelectedIndex = TabLogin;
                     return;
-                // 4 = 资源（与侧栏第 4 项一致）
+                // 4 = 资源（默认关闭，需在设置 → 个性化里开启才显示）
                 case Key.D4:
                 case Key.NumPad4:
                     e.Handled = true;
-                    Tabs.SelectedIndex = TabResources;
+                    // 【2026-11-21】开关关闭时不跳页（跳过去会落到折叠的 TabItem 上，
+                    // 出现"导航高亮 A、内容显示 B"的错位）；明确告诉用户为什么按了没反应。
+                    if (_settings != null && _settings.ShowResourcesPage)
+                    {
+                        Tabs.SelectedIndex = TabResources;
+                    }
+                    else
+                    {
+                        // 提示条在「下载」页，若用户正停在别的页（尤其是设置页本身）
+                        // 用弹窗兜底，否则他只会看到"按了 4 没反应"。
+                        const string tip = "「资源」页签已关闭。\n可在 设置 → 个性化 中开启「显示资源页签」。";
+                        if (Tabs.SelectedIndex == TabDownload)
+                            ShowDownloadHint(tip.Replace("\n", " "));
+                        else
+                            AppDialog.Show(this, "资源页未开启", tip,
+                                MessageBoxButton.OK, MessageBoxImage.Information);
+                    }
                     return;
                 // 设置页：q（用户指定，给数字键留出 1-4 的连续区间）
                 case Key.Q:
@@ -13766,6 +13830,10 @@ namespace GeZi
                 // 回填勾选 + 同步 ShareFileItem 的静态开关（列表行 DateLine 读写它）。
                 ShowFileDateCheck.IsChecked = _settings.ShowFileDate;
                 ShareFileItem.ShowDatesInList = _settings.ShowFileDate;
+                // 【2026-11-21】「显示资源页签」（默认关闭）→ 回填勾选 + 立即折叠入口。
+                // 放在 _applyingSettings 保护区间内，回填 IsChecked 不会触发 Click 保存。
+                ShowResourcesPageCheck.IsChecked = _settings.ShowResourcesPage;
+                ApplyResourcesPageVisibility();
                 // 【2026-11-17】完整性校验等级 + zip 开关 → 同步到 IntegrityChecker 静态字段
                 IntegrityLevelBox.SelectedIndex = Math.Max(0, Math.Min(2, _settings.IntegrityLevel));
                 VerifyZipCheck.IsChecked = _settings.VerifyZip;

@@ -192,7 +192,11 @@
                                     <TextBlock Text="登录" Style="{StaticResource NavItemText}"/>
                                 </StackPanel>
                             </ListBoxItem>
-                            <ListBoxItem>
+                            <!-- 资源入口：由设置页「显示资源页签」开关控制显隐（默认关闭）。
+                                 ⚠️ 用 Visibility 而不是从 Items 里移除 —— Tab* 索引常量与
+                                 NavList/Tabs 的 SelectedIndex 双向同步依赖「两处列表长度恒定」，
+                                 折叠能让索引保持不变，避免导航高亮与内容错位。 -->
+                            <ListBoxItem x:Name="NavResourcesItem">
                                 <StackPanel Orientation="Horizontal">
                                     <Path Data="{StaticResource IconSearch}"
                                           Style="{StaticResource NavItemIcon}"/>
@@ -2545,7 +2549,7 @@
                      ⚠️ 数据来源：目前是**本地 mock**（ResourcesMock 里的样例）。
                      真实搜源需要后端或公开源，属于独立议题 —— 这一版只把
                      「界面 + 交互 + 与下载流程的衔接」做通，见 ResourcesPage 的注释。 -->
-                <TabItem Style="{StaticResource HeadlessTabItem}">
+                <TabItem x:Name="TabResourcesItem" Style="{StaticResource HeadlessTabItem}">
                     <Grid Margin="20,18,20,18">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
@@ -2886,6 +2890,15 @@
                                               Margin="0,14,0,0"
                                               Click="OnShowFileDateChanged"
                                               AutomationProperties.Name="文件列表显示修改日期"/>
+
+                                    <!-- 【2026-11-21】资源页签显隐开关（默认关闭，开启才显示）。
+                                         关闭时侧栏入口和资源 TabItem 一起折叠；即时生效。 -->
+                                    <CheckBox x:Name="ShowResourcesPageCheck"
+                                              Content="显示「资源」页签（资源搜索，当前为演示数据）"
+                                              Style="{StaticResource AppCheckBox}"
+                                              Margin="0,10,0,0"
+                                              Click="OnShowResourcesPageChanged"
+                                              AutomationProperties.Name="显示资源页签"/>
                                 </StackPanel>
                             </Border>
 
